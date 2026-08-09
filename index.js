@@ -48,6 +48,7 @@ const recurringInvoiceRoutes = require("./routes/recurringInvoices");
 
 /* ================= PRODUCTS ================= */
 const productRoutes = require("./routes/productRoutes");
+const barcodeRoutes = require("./routes/barcodeRoutes");
 
 /* ================= VENDORS ================= */
 const vendorRoutes = require("./routes/vendorRoutes");
@@ -276,6 +277,16 @@ app.use(
     readOnlyRoles: ["auditor"],
   }),
   productRoutes
+);
+
+app.use(
+  "/api/barcodes",
+  authMiddleware,
+  allowAccess(["sales", "purchase", "accountant"], {
+    moduleKey: "products",
+    readOnlyRoles: ["auditor"],
+  }),
+  barcodeRoutes
 );
 
 /* =========================================================

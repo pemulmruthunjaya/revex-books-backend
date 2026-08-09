@@ -1,0 +1,62 @@
+CREATE TABLE IF NOT EXISTS barcode_settings (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  company_id BIGINT UNSIGNED NOT NULL,
+  default_barcode_type VARCHAR(20) NOT NULL DEFAULT 'CODE128',
+  show_barcode_text TINYINT(1) NOT NULL DEFAULT 1,
+  barcode_height_mm DECIMAL(8,2) NOT NULL DEFAULT 12,
+  barcode_scale DECIMAL(8,2) NOT NULL DEFAULT 2,
+  barcode_rotation SMALLINT NOT NULL DEFAULT 0,
+  default_label_width_mm DECIMAL(8,2) NOT NULL DEFAULT 50,
+  default_label_height_mm DECIMAL(8,2) NOT NULL DEFAULT 25,
+  labels_per_row INT NOT NULL DEFAULT 1,
+  horizontal_gap_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  vertical_gap_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  margin_top_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  margin_bottom_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  margin_left_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  margin_right_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  paper_type VARCHAR(30) NOT NULL DEFAULT 'thermal_roll',
+  default_dpi INT NOT NULL DEFAULT 203,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_barcode_settings_company (company_id)
+);
+
+CREATE TABLE IF NOT EXISTS printer_profiles (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  company_id BIGINT UNSIGNED NOT NULL,
+  name VARCHAR(150) NOT NULL,
+  label_width_mm DECIMAL(8,2) NOT NULL,
+  label_height_mm DECIMAL(8,2) NOT NULL,
+  dpi INT NOT NULL DEFAULT 203,
+  labels_per_row INT NOT NULL DEFAULT 1,
+  horizontal_gap_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  vertical_gap_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  margin_top_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  margin_bottom_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  margin_left_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  margin_right_mm DECIMAL(8,2) NOT NULL DEFAULT 0,
+  paper_type VARCHAR(30) NOT NULL DEFAULT 'thermal_roll',
+  is_default TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_printer_profiles_company (company_id),
+  UNIQUE KEY uq_printer_profile_company_name (company_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS barcode_templates (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  company_id BIGINT UNSIGNED NOT NULL,
+  name VARCHAR(150) NOT NULL,
+  label_width_mm DECIMAL(8,2) NOT NULL,
+  label_height_mm DECIMAL(8,2) NOT NULL,
+  template_json JSON NOT NULL,
+  is_default TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_barcode_templates_company (company_id),
+  UNIQUE KEY uq_barcode_template_company_name (company_id, name)
+);
