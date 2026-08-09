@@ -46,16 +46,16 @@ const appUrl = () =>
 const sendStaffInvitation = ({ name, email, temporaryPassword }) =>
   sendMail({
     to: email,
-    subject: "Your Billing SaaS staff account",
-    text: `Hello ${name},\n\nYour Billing SaaS account is ready.\nApp: ${appUrl()}\nEmail: ${email}\nTemporary password: ${temporaryPassword}\n\nYou must choose a new password when you first sign in.`,
-    html: `<p>Hello ${name},</p><p>Your Billing SaaS account is ready.</p><p><strong>App:</strong> <a href="${appUrl()}">${appUrl()}</a><br><strong>Email:</strong> ${email}<br><strong>Temporary password:</strong> ${temporaryPassword}</p><p>You must choose a new password when you first sign in.</p>`,
+    subject: "Your RevEx Books staff account",
+    text: `Hello ${name},\n\nYour RevEx Books account is ready.\nApp: ${appUrl()}\nEmail: ${email}\nTemporary password: ${temporaryPassword}\n\nYou must choose a new password when you first sign in.`,
+    html: `<p>Hello ${name},</p><p>Your RevEx Books account is ready.</p><p><strong>App:</strong> <a href="${appUrl()}">${appUrl()}</a><br><strong>Email:</strong> ${email}<br><strong>Temporary password:</strong> ${temporaryPassword}</p><p>You must choose a new password when you first sign in.</p>`,
   });
 
 const sendPasswordReset = ({ name, email, token }) => {
   const resetUrl = `${appUrl()}/reset-password?token=${encodeURIComponent(token)}`;
   return sendMail({
     to: email,
-    subject: "Reset your Billing SaaS password",
+    subject: "Reset your RevEx Books password",
     text: `Hello ${name},\n\nReset your password using this link (valid for 30 minutes):\n${resetUrl}\n\nIf you did not request this, ignore this email.`,
     html: `<p>Hello ${name},</p><p><a href="${resetUrl}">Reset your password</a>. This link is valid for 30 minutes and can be used once.</p><p>If you did not request this, ignore this email.</p>`,
   });

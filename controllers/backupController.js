@@ -1563,7 +1563,7 @@ exports.exportCompanyBackup = async (req, res) => {
 
     const backup = {
       metadata: {
-        app: "Billing SaaS",
+        app: "RevEx Books",
         backup_type: "company_full_backup",
         company_id: companyId,
         exported_at: new Date().toISOString(),

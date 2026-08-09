@@ -163,7 +163,7 @@ app.get("/", (req, res) => {
     success: true,
 
     message:
-      "Billing SaaS ERP Backend Running 🚀",
+      "RevEx Books Backend Running 🚀",
 
     environment:
       process.env.NODE_ENV || "development"
