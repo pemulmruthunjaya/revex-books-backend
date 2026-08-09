@@ -73,16 +73,32 @@ exports.listTemplates = async (req, res) => {
 
 const saveTemplate = async (req, res, id) => {
   const { name, label_width_mm, label_height_mm, template_json, is_default = 0 } = req.body;
+  const companyId = req.user?.company_id;
+  const normalizedName = String(name || "").trim();
+  const width = Number(label_width_mm);
+  const height = Number(label_height_mm);
+  if (!companyId) return res.status(401).json({ message: "Invalid authentication context" });
+  if (!normalizedName || !Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+    return res.status(400).json({ message: "Template name, label width, and label height are required" });
+  }
+  if (!template_json || typeof template_json !== "object" || Array.isArray(template_json)) {
+    return res.status(400).json({ message: "A valid template design is required" });
+  }
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
-    if (is_default) await connection.query("UPDATE barcode_templates SET is_default=0 WHERE company_id=?", [req.user.company_id]);
+    if (is_default) await connection.query("UPDATE barcode_templates SET is_default=0 WHERE company_id=?", [companyId]);
     let result;
-    if (id) [result] = await connection.query("UPDATE barcode_templates SET name=?,label_width_mm=?,label_height_mm=?,template_json=?,is_default=? WHERE id=? AND company_id=?", [name, label_width_mm, label_height_mm, JSON.stringify(template_json), is_default, id, req.user.company_id]);
-    else [result] = await connection.query("INSERT INTO barcode_templates (company_id,name,label_width_mm,label_height_mm,template_json,is_default) VALUES (?,?,?,?,?,?)", [req.user.company_id, name, label_width_mm, label_height_mm, JSON.stringify(template_json), is_default]);
+    if (id) [result] = await connection.query("UPDATE barcode_templates SET name=?,label_width_mm=?,label_height_mm=?,template_json=?,is_default=? WHERE id=? AND company_id=?", [normalizedName, width, height, JSON.stringify(template_json), is_default ? 1 : 0, id, companyId]);
+    else [result] = await connection.query("INSERT INTO barcode_templates (company_id,name,label_width_mm,label_height_mm,template_json,is_default) VALUES (?,?,?,?,?,?)", [companyId, normalizedName, width, height, JSON.stringify(template_json), is_default ? 1 : 0]);
     if (id && !result.affectedRows) { await connection.rollback(); return res.status(404).json({ message: "Template not found" }); }
     await connection.commit(); res.status(id ? 200 : 201).json({ id: id || result.insertId, message: `Template ${id ? "updated" : "created"}` });
-  } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+  } catch (error) {
+    await connection.rollback();
+    console.error("Barcode template save failed", { companyId, templateId: id || null, errorCode: error.code, sqlState: error.sqlState, message: error.message });
+    if (error.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "A barcode template with this name already exists" });
+    return res.status(500).json({ message: "Unable to save the barcode template" });
+  } finally { connection.release(); }
 };
 exports.createTemplate = (req, res) => saveTemplate(req, res);
 exports.updateTemplate = (req, res) => saveTemplate(req, res, req.params.id);
