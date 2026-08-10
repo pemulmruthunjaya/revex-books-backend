@@ -7,11 +7,13 @@ const {
   deletePurchaseOrder,
   getPurchaseOrderById,
   getPurchaseOrders,
+  getNextPurchaseOrderNumber,
   updatePurchaseOrder,
   updatePurchaseOrderStatus,
 } = require("../controllers/purchaseOrderController");
 
 router.post("/", authMiddleware, createPurchaseOrder);
+router.get("/next-number", authMiddleware, getNextPurchaseOrderNumber);
 router.get("/", authMiddleware, getPurchaseOrders);
 router.get("/:id", authMiddleware, getPurchaseOrderById);
 router.put("/:id", authMiddleware, updatePurchaseOrder);

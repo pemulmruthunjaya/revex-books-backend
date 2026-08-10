@@ -50,7 +50,32 @@ const ensurePurchaseOrderTables = async () => {
   purchaseOrderTablesReady = true;
 };
 
-const allowedStatuses = ["Draft", "Sent", "Approved", "Cancelled", "Converted"];
+const allowedStatuses = ["Draft", "Sent", "Approved", "Cancelled", "Closed", "Converted"];
+
+const generatePurchaseOrderNumber = async (connection, companyId) => {
+  const [rows] = await connection.query(
+    "SELECT po_number FROM purchase_orders WHERE company_id=? AND po_number LIKE 'PO-%' ORDER BY id DESC LIMIT 100 FOR UPDATE",
+    [companyId]
+  );
+  const max = rows.reduce((value, row) => {
+    const match = String(row.po_number || "").match(/^PO-(\d+)$/i);
+    return match ? Math.max(value, Number(match[1])) : value;
+  }, 0);
+  return `PO-${String(max + 1).padStart(6, "0")}`;
+};
+
+exports.getNextPurchaseOrderNumber = async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    await ensurePurchaseOrderTables();
+    await connection.beginTransaction();
+    const po_number = await generatePurchaseOrderNumber(connection, req.user.company_id);
+    await connection.rollback();
+    res.json({ po_number });
+  } finally {
+    connection.release();
+  }
+};
 
 const ensureBillConversionColumns = async (connection) => {
   const [billColumns] = await connection.query("SHOW COLUMNS FROM bills");
@@ -160,8 +185,8 @@ exports.createPurchaseOrder = async (req, res) => {
       items,
     } = req.body;
 
-    if (!vendor_id || !po_number || !po_date) {
-      return res.status(400).json({ message: "Vendor, PO number, and PO date are required" });
+    if (!vendor_id || !po_date) {
+      return res.status(400).json({ message: "Vendor and PO date are required" });
     }
 
     await connection.beginTransaction();
@@ -178,6 +203,9 @@ exports.createPurchaseOrder = async (req, res) => {
 
     const processed = await processItems(connection, companyId, items);
 
+    const purchaseOrderNumber = String(
+      po_number || (await generatePurchaseOrderNumber(connection, companyId))
+    ).trim();
     const [result] = await connection.query(
       `INSERT INTO purchase_orders
         (company_id, vendor_id, po_number, po_date, expected_date, status, notes,
@@ -186,7 +214,7 @@ exports.createPurchaseOrder = async (req, res) => {
       [
         companyId,
         vendor_id,
-        String(po_number).trim(),
+        purchaseOrderNumber,
         po_date,
         expected_date || null,
         notes || null,
@@ -200,10 +228,11 @@ exports.createPurchaseOrder = async (req, res) => {
     for (const item of processed.items) {
       await connection.query(
         `INSERT INTO purchase_order_items
-          (purchase_order_id, product_id, product_name, mrp, quantity, price,
+          (company_id, purchase_order_id, product_id, product_name, mrp, quantity, price,
            gst_percent, cgst, sgst, total)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
+          companyId,
           result.insertId,
           item.product_id,
           item.product_name,
@@ -243,9 +272,23 @@ exports.getPurchaseOrders = async (req, res) => {
 
     const companyId = req.user.company_id;
     const [rows] = await db.query(
-      `SELECT po.*, v.name AS vendor_name
+      `SELECT po.*, v.name AS vendor_name,
+              COALESCE(progress.ordered_qty,0) ordered_qty,
+              COALESCE(progress.received_qty,0) received_qty
        FROM purchase_orders po
        LEFT JOIN vendors v ON v.id = po.vendor_id AND v.company_id = po.company_id
+       LEFT JOIN (
+         SELECT poi.purchase_order_id,SUM(poi.quantity) ordered_qty,
+                SUM(COALESCE(received.accepted_qty,0)) received_qty
+         FROM purchase_order_items poi
+         LEFT JOIN (
+           SELECT gri.purchase_order_item_id,SUM(gri.accepted_qty) accepted_qty
+           FROM goods_receipt_items gri
+           INNER JOIN goods_receipts gr ON gr.id=gri.goods_receipt_id AND gr.company_id=gri.company_id
+           WHERE gr.status='Posted' GROUP BY gri.purchase_order_item_id
+         ) received ON received.purchase_order_item_id=poi.id
+         GROUP BY poi.purchase_order_id
+       ) progress ON progress.purchase_order_id=po.id
        WHERE po.company_id = ?
        ORDER BY po.id DESC`,
       [companyId]
@@ -281,11 +324,24 @@ exports.getPurchaseOrderById = async (req, res) => {
     }
 
     const [items] = await db.query(
-      "SELECT * FROM purchase_order_items WHERE purchase_order_id = ? ORDER BY id ASC",
-      [id]
+      `SELECT poi.*,COALESCE(received.accepted_qty,0) received_qty,
+              poi.quantity-COALESCE(received.accepted_qty,0) pending_qty
+       FROM purchase_order_items poi
+       LEFT JOIN (
+         SELECT gri.purchase_order_item_id,SUM(gri.accepted_qty) accepted_qty
+         FROM goods_receipt_items gri
+         INNER JOIN goods_receipts gr ON gr.id=gri.goods_receipt_id AND gr.company_id=gri.company_id
+         WHERE gr.company_id=? AND gr.status='Posted' GROUP BY gri.purchase_order_item_id
+       ) received ON received.purchase_order_item_id=poi.id
+       WHERE poi.purchase_order_id=? ORDER BY poi.id ASC`,
+      [companyId, id]
+    );
+    const [grns] = await db.query(
+      "SELECT id,grn_number,grn_date,status FROM goods_receipts WHERE purchase_order_id=? AND company_id=? ORDER BY id",
+      [id, companyId]
     );
 
-    res.json({ ...orders[0], items });
+    res.json({ ...orders[0], items, grns });
   } catch (error) {
     console.error("Get purchase order error:", error);
     res.status(500).json({ message: "Server error" });
@@ -316,13 +372,25 @@ exports.updatePurchaseOrder = async (req, res) => {
     await connection.beginTransaction();
 
     const [existing] = await connection.query(
-      "SELECT id FROM purchase_orders WHERE id = ? AND company_id = ? LIMIT 1",
+      "SELECT id,status FROM purchase_orders WHERE id = ? AND company_id = ? LIMIT 1",
       [id, companyId]
     );
 
     if (!existing.length) {
       await connection.rollback();
       return res.status(404).json({ message: "Purchase order not found" });
+    }
+    if (!["Draft", "Sent", "Approved"].includes(existing[0].status)) {
+      await connection.rollback();
+      return res.status(409).json({ message: "Received, cancelled, closed, or converted purchase orders cannot be edited" });
+    }
+    const [receiptRows] = await connection.query(
+      "SELECT id FROM goods_receipts WHERE company_id=? AND purchase_order_id=? LIMIT 1",
+      [companyId, id]
+    );
+    if (receiptRows.length) {
+      await connection.rollback();
+      return res.status(409).json({ message: "Purchase order cannot be edited after a GRN has been created" });
     }
 
     const processed = await processItems(connection, companyId, items);
@@ -351,10 +419,11 @@ exports.updatePurchaseOrder = async (req, res) => {
     for (const item of processed.items) {
       await connection.query(
         `INSERT INTO purchase_order_items
-          (purchase_order_id, product_id, product_name, mrp, quantity, price,
+          (company_id, purchase_order_id, product_id, product_name, mrp, quantity, price,
            gst_percent, cgst, sgst, total)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
+          companyId,
           id,
           item.product_id,
           item.product_name,
@@ -397,6 +466,14 @@ exports.updatePurchaseOrderStatus = async (req, res) => {
       return res.status(400).json({ message: "Invalid purchase order status" });
     }
 
+    const [orders] = await db.query(
+      "SELECT status FROM purchase_orders WHERE id=? AND company_id=?",
+      [id, companyId]
+    );
+    if (!orders.length) return res.status(404).json({ message: "Purchase order not found" });
+    if (["Partially Received", "Fully Received"].includes(orders[0].status) && status !== "Closed") {
+      return res.status(409).json({ message: "Receipt-controlled purchase order status cannot be changed manually" });
+    }
     const [result] = await db.query(
       "UPDATE purchase_orders SET status = ? WHERE id = ? AND company_id = ?",
       [status, id, companyId]
@@ -445,6 +522,17 @@ exports.convertPurchaseOrderToBill = async (req, res) => {
     }
 
     const order = orders[0];
+
+    const [postedReceipts] = await connection.query(
+      "SELECT id, grn_number FROM goods_receipts WHERE company_id = ? AND purchase_order_id = ? AND status = 'Posted' LIMIT 1",
+      [companyId, id]
+    );
+    if (postedReceipts.length) {
+      await connection.rollback();
+      return res.status(409).json({
+        message: "This PO has posted receipts. Create bills from its GRNs to avoid posting stock twice.",
+      });
+    }
 
     if (order.status === "Cancelled") {
       await connection.rollback();
@@ -575,13 +663,25 @@ exports.deletePurchaseOrder = async (req, res) => {
     await connection.beginTransaction();
 
     const [existing] = await connection.query(
-      "SELECT id FROM purchase_orders WHERE id = ? AND company_id = ? LIMIT 1",
+      "SELECT id,status FROM purchase_orders WHERE id = ? AND company_id = ? LIMIT 1",
       [id, companyId]
     );
 
     if (!existing.length) {
       await connection.rollback();
       return res.status(404).json({ message: "Purchase order not found" });
+    }
+    if (existing[0].status !== "Draft") {
+      await connection.rollback();
+      return res.status(409).json({ message: "Only draft purchase orders can be deleted" });
+    }
+    const [receiptRows] = await connection.query(
+      "SELECT id FROM goods_receipts WHERE company_id=? AND purchase_order_id=? LIMIT 1",
+      [companyId, id]
+    );
+    if (receiptRows.length) {
+      await connection.rollback();
+      return res.status(409).json({ message: "Purchase order with GRN history cannot be deleted" });
     }
 
     await connection.query("DELETE FROM purchase_order_items WHERE purchase_order_id = ?", [id]);

@@ -56,6 +56,7 @@ const vendorPaymentRoutes = require("./routes/vendorPaymentRoutes");
 
 /* ================= PURCHASES ================= */
 const purchaseOrderRoutes = require("./routes/purchaseOrderRoutes");
+const goodsReceiptRoutes = require("./routes/goodsReceiptRoutes");
 const billRoutes = require("./routes/billRoutes");
 
 /* ================= DELIVERY CHALLANS ================= */
@@ -331,6 +332,16 @@ app.use(
     readOnlyRoles: ["sales", "auditor"],
   }),
   billRoutes
+);
+
+app.use(
+  "/api/goods-receipts",
+  authMiddleware,
+  allowAccess(["purchase", "accountant"], {
+    moduleKey: "purchase_orders",
+    readOnlyRoles: ["auditor"],
+  }),
+  goodsReceiptRoutes
 );
 
 app.use(

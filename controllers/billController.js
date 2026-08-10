@@ -327,7 +327,7 @@ exports.updateBill = async (req, res) => {
     await connection.beginTransaction();
 
     const [billRows] = await connection.query(
-      "SELECT id, status FROM bills WHERE id = ? AND company_id = ?",
+      "SELECT id, status, stock_posted, source_grn_id FROM bills WHERE id = ? AND company_id = ?",
       [id, company_id]
     );
 
@@ -344,7 +344,7 @@ exports.updateBill = async (req, res) => {
       [id, company_id]
     );
 
-    for (const item of oldItems) {
+    for (const item of Number(billRows[0].stock_posted) === 1 ? oldItems : []) {
       const quantity = Number(item.quantity || 0);
 
       if (item.product_id && quantity > 0) {
@@ -468,10 +468,12 @@ exports.updateBill = async (req, res) => {
         ]
       );
 
-      await connection.query(
-        "UPDATE products SET stock = stock + ?, mrp = ?, purchase_price = ?, gst = ? WHERE id = ? AND company_id = ?",
-        [item.quantity, item.mrp, item.price, item.gst, item.product_id, company_id]
-      );
+      if (Number(billRows[0].stock_posted) === 1) {
+        await connection.query(
+          "UPDATE products SET stock = stock + ?, mrp = ?, purchase_price = ?, gst = ? WHERE id = ? AND company_id = ?",
+          [item.quantity, item.mrp, item.price, item.gst, item.product_id, company_id]
+        );
+      }
     }
 
     await connection.commit();
@@ -503,7 +505,7 @@ exports.deleteBill = async (req, res) => {
     const company_id = req.user.company_id;
 
     const [bill] = await db.query(
-      "SELECT id FROM bills WHERE id = ? AND company_id = ?",
+      "SELECT id, stock_posted FROM bills WHERE id = ? AND company_id = ?",
       [id, company_id]
     );
 
@@ -516,7 +518,7 @@ exports.deleteBill = async (req, res) => {
       [id]
     );
 
-    for (const item of items) {
+    for (const item of Number(bill[0].stock_posted) === 1 ? items : []) {
       const quantity = Number(item.quantity || 0);
 
       if (item.product_id && quantity > 0) {
