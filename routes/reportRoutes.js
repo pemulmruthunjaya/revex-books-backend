@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const authMiddleware = require("../middleware/authMiddleware");
+const purchaseReports = require("../controllers/purchaseReportController");
 
 const {
   getProfit,
@@ -19,7 +20,7 @@ const {
   getOutputGstReport,
   getHsnReport,
   getGstFilingReadiness,
-  getPayrollReport
+  getPayrollReport,
 } = require("../controllers/reportController");
 
 router.get("/profit", authMiddleware, getProfit);
@@ -40,5 +41,35 @@ router.get("/output-gst", authMiddleware, getOutputGstReport);
 router.get("/hsn", authMiddleware, getHsnReport);
 router.get("/gst-readiness", authMiddleware, getGstFilingReadiness);
 router.get("/payroll", authMiddleware, getPayrollReport);
+router.get(
+  "/purchases/register",
+  authMiddleware,
+  purchaseReports.purchaseRegister,
+);
+router.get(
+  "/purchases/purchase-orders",
+  authMiddleware,
+  purchaseReports.purchaseOrders,
+);
+router.get(
+  "/purchases/pending-purchase-orders",
+  authMiddleware,
+  purchaseReports.pendingPurchaseOrders,
+);
+router.get(
+  "/purchases/grn-register",
+  authMiddleware,
+  purchaseReports.grnRegister,
+);
+router.get(
+  "/purchases/grn-bill-reconciliation",
+  authMiddleware,
+  purchaseReports.grnBillReconciliation,
+);
+router.get(
+  "/purchases/unbilled-grns",
+  authMiddleware,
+  purchaseReports.unbilledGrns,
+);
 
 module.exports = router;
