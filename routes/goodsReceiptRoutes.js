@@ -1,11 +1,12 @@
 const router = require("express").Router();
 const controller = require("../controllers/goodsReceiptController");
 router.get("/next-number", controller.nextNumber);
+router.get("/billable", controller.listBillable);
 router.get("/purchase-orders/:id/pending", controller.getPurchaseOrderPending);
 router.get("/", controller.list);
 router.post("/", controller.create);
+router.get("/:id/billable", controller.getBillable);
 router.get("/:id", controller.getById);
 router.post("/:id/post", controller.post);
-router.post("/:id/create-bill", controller.createBill);
 router.delete("/:id", controller.deleteDraft);
 module.exports = router;

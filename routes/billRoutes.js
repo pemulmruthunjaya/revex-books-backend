@@ -6,16 +6,18 @@ const authMiddleware = require("../middleware/authMiddleware");
 // ✅ ONLY import functions that actually exist
 const {
   createBill,
+  createBillFromGrn,
   getBills,
   getBillById,
   updateBill,
   deleteBill,
   getLastPurchasePrices,
-  updateBillStatus
+  updateBillStatus,
 } = require("../controllers/billController");
 
 /* ================= CREATE ================= */
 router.post("/", authMiddleware, createBill);
+router.post("/from-grn", authMiddleware, createBillFromGrn);
 
 /* ================= GET ALL ================= */
 router.get("/", authMiddleware, getBills);

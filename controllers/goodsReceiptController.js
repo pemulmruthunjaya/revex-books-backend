@@ -147,13 +147,11 @@ exports.getPurchaseOrderPending = async (req, res) => {
       await loadPoForReceipt(connection, req.user.company_id, req.params.id),
     );
   } catch (error) {
-    res
-      .status(error.status || 500)
-      .json({
-        message: error.status
-          ? error.message
-          : "Unable to load pending quantities",
-      });
+    res.status(error.status || 500).json({
+      message: error.status
+        ? error.message
+        : "Unable to load pending quantities",
+    });
   } finally {
     connection.release();
   }
@@ -180,6 +178,90 @@ exports.getById = async (req, res) => {
     [req.user.company_id, req.params.id],
   );
   res.json({ ...rows[0], items, bills });
+};
+exports.listBillable = async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const vendorId = Number(req.query.vendor_id || 0);
+    if (!vendorId)
+      return res.status(400).json({ message: "Vendor is required" });
+    const branchId = req.user.branch_id || null;
+    const params = [companyId, vendorId];
+    const branchFilter = branchId ? " AND gr.branch_id=?" : "";
+    if (branchId) params.push(branchId);
+    const [rows] = await db.query(
+      `SELECT gr.id,gr.grn_number,gr.grn_date,gr.vendor_id,gr.purchase_order_id,po.po_number,
+        SUM(gri.accepted_qty) accepted_quantity,
+        COALESCE(SUM(billed.billed_quantity),0) billed_quantity,
+        SUM(gri.accepted_qty)-COALESCE(SUM(billed.billed_quantity),0) remaining_billable_quantity
+       FROM goods_receipts gr
+       INNER JOIN purchase_orders po ON po.id=gr.purchase_order_id AND po.company_id=gr.company_id
+       INNER JOIN goods_receipt_items gri ON gri.goods_receipt_id=gr.id AND gri.company_id=gr.company_id
+       LEFT JOIN (
+         SELECT bi.source_grn_item_id,SUM(bi.quantity) billed_quantity
+         FROM bill_items bi INNER JOIN bills b ON b.id=bi.bill_id
+         WHERE b.company_id=? AND b.source_grn_id IS NOT NULL
+         GROUP BY bi.source_grn_item_id
+       ) billed ON billed.source_grn_item_id=gri.id
+       WHERE gr.company_id=? AND gr.vendor_id=? AND gr.status='Posted'${branchFilter}
+       GROUP BY gr.id
+       HAVING remaining_billable_quantity>0
+       ORDER BY gr.grn_date DESC,gr.id DESC`,
+      [companyId, ...params],
+    );
+    res.json(rows);
+  } catch (error) {
+    console.error("List billable GRNs error", {
+      companyId: req.user.company_id,
+      code: error.code,
+      message: error.message,
+    });
+    res.status(500).json({ message: "Unable to load billable GRNs" });
+  }
+};
+exports.getBillable = async (req, res) => {
+  try {
+    const companyId = req.user.company_id;
+    const branchId = req.user.branch_id || null;
+    const params = [req.params.id, companyId];
+    const branchFilter = branchId ? " AND gr.branch_id=?" : "";
+    if (branchId) params.push(branchId);
+    const [receipts] = await db.query(
+      `SELECT gr.id,gr.grn_number,gr.grn_date,gr.vendor_id,gr.purchase_order_id,po.po_number,v.name vendor_name
+       FROM goods_receipts gr
+       INNER JOIN purchase_orders po ON po.id=gr.purchase_order_id AND po.company_id=gr.company_id
+       INNER JOIN vendors v ON v.id=gr.vendor_id AND v.company_id=gr.company_id
+       WHERE gr.id=? AND gr.company_id=? AND gr.status='Posted'${branchFilter}`,
+      params,
+    );
+    if (!receipts.length)
+      return res.status(404).json({ message: "Posted GRN not found" });
+    const [items] = await db.query(
+      `SELECT gri.id source_grn_item_id,gri.product_id,poi.product_name,p.sku,
+        gri.accepted_qty accepted_quantity,COALESCE(SUM(CASE WHEN b.id IS NOT NULL THEN bi.quantity ELSE 0 END),0) already_billed_quantity,
+        gri.accepted_qty-COALESCE(SUM(CASE WHEN b.id IS NOT NULL THEN bi.quantity ELSE 0 END),0) remaining_billable_quantity,
+        poi.price,poi.mrp,poi.gst_percent,poi.cgst,poi.sgst
+       FROM goods_receipt_items gri
+       INNER JOIN purchase_order_items poi ON poi.id=gri.purchase_order_item_id AND poi.company_id=gri.company_id
+       INNER JOIN products p ON p.id=gri.product_id AND p.company_id=gri.company_id
+       LEFT JOIN bill_items bi ON bi.source_grn_item_id=gri.id
+       LEFT JOIN bills b ON b.id=bi.bill_id AND b.company_id=gri.company_id AND b.source_grn_id=gri.goods_receipt_id
+       WHERE gri.goods_receipt_id=? AND gri.company_id=?
+       GROUP BY gri.id
+       HAVING remaining_billable_quantity>0
+       ORDER BY gri.id`,
+      [req.params.id, companyId],
+    );
+    res.json({ ...receipts[0], items });
+  } catch (error) {
+    console.error("Get billable GRN error", {
+      companyId: req.user.company_id,
+      grnId: req.params.id,
+      code: error.code,
+      message: error.message,
+    });
+    res.status(500).json({ message: "Unable to load billable GRN" });
+  }
 };
 exports.create = async (req, res) => {
   const connection = await db.getConnection();
@@ -259,16 +341,14 @@ exports.create = async (req, res) => {
     if (status === "Posted")
       await postReceipt(connection, req, result.insertId);
     await connection.commit();
-    res
-      .status(201)
-      .json({
-        message:
-          status === "Posted"
-            ? "GRN posted and stock increased"
-            : "Draft GRN created",
-        grn_id: result.insertId,
-        grn_number: grnNumber,
-      });
+    res.status(201).json({
+      message:
+        status === "Posted"
+          ? "GRN posted and stock increased"
+          : "Draft GRN created",
+      grn_id: result.insertId,
+      grn_number: grnNumber,
+    });
   } catch (error) {
     await connection.rollback();
     console.error("Create GRN error", {
@@ -276,16 +356,14 @@ exports.create = async (req, res) => {
       code: error.code,
       message: error.message,
     });
-    res
-      .status(error.code === "ER_DUP_ENTRY" ? 409 : error.status || 500)
-      .json({
-        message:
-          error.code === "ER_DUP_ENTRY"
-            ? "GRN number already exists"
-            : error.status
-              ? error.message
-              : "Unable to create GRN",
-      });
+    res.status(error.code === "ER_DUP_ENTRY" ? 409 : error.status || 500).json({
+      message:
+        error.code === "ER_DUP_ENTRY"
+          ? "GRN number already exists"
+          : error.status
+            ? error.message
+            : "Unable to create GRN",
+    });
   } finally {
     connection.release();
   }
@@ -417,13 +495,11 @@ exports.createBill = async (req, res) => {
       );
     }
     await connection.commit();
-    res
-      .status(201)
-      .json({
-        message: "Bill created from GRN without reposting stock",
-        bill_id: bill.insertId,
-        bill_number: billNumber,
-      });
+    res.status(201).json({
+      message: "Bill created from GRN without reposting stock",
+      bill_id: bill.insertId,
+      bill_number: billNumber,
+    });
   } catch (error) {
     await connection.rollback();
     console.error("GRN bill error", {
@@ -432,13 +508,9 @@ exports.createBill = async (req, res) => {
       code: error.code,
       message: error.message,
     });
-    res
-      .status(error.status || 500)
-      .json({
-        message: error.status
-          ? error.message
-          : "Unable to create bill from GRN",
-      });
+    res.status(error.status || 500).json({
+      message: error.status ? error.message : "Unable to create bill from GRN",
+    });
   } finally {
     connection.release();
   }
