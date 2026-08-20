@@ -12,6 +12,9 @@ const {
   getDefaultPermissions,
 } = require("../services/userAccessService");
 const { sendPasswordReset } = require("../services/emailService");
+const {
+  provisionCompanyTrial,
+} = require("../services/companyTrialProvisioningService");
 
 const RESET_TOKEN_MINUTES = 30;
 const hashResetToken = (token) =>
@@ -128,6 +131,12 @@ exports.register = async (req, res) => {
       "INSERT INTO company_business_settings (company_id) VALUES (?)",
       [companyId]
     );
+    await provisionCompanyTrial({
+      companyId,
+      actorUserId: userId,
+      source: "owner_registration",
+      connection,
+    });
     await connection.commit();
     transactionStarted = false;
 
