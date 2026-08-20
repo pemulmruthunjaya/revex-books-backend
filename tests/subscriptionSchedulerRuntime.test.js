@@ -97,12 +97,15 @@ test("recurring scheduler initialization remains present and independent", () =>
   );
 });
 
-test("runtime wiring does not enable commercial enforcement", () => {
+test("scheduler wiring remains independent from centralized commercial enforcement", () => {
   const root = path.resolve(__dirname, "..");
   const indexSource = fs.readFileSync(path.join(root, "index.js"), "utf8");
   const routeFiles = fs.readdirSync(path.join(root, "routes"))
     .filter((name) => name.endsWith(".js"));
-  assert.doesNotMatch(indexSource, /requireValidSubscription|subscriptionMiddleware/);
+  assert.match(
+    indexSource,
+    /if \(isSubscriptionEnforcementEnabled\(\)\)[\s\S]*app\.use\(tenantErpRoutePrefixes, authMiddleware, requireValidSubscription\)/
+  );
   for (const file of routeFiles) {
     const source = fs.readFileSync(path.join(root, "routes", file), "utf8");
     assert.doesNotMatch(source, /requireValidSubscription|subscriptionMiddleware/);

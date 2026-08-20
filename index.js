@@ -9,10 +9,16 @@ const {
 } = require("./middleware/securityMiddleware");
 const authMiddleware = require("./middleware/authMiddleware");
 const {
+  requireValidSubscription,
+} = require("./middleware/subscriptionMiddleware");
+const {
   allowAccess,
   ownerOnly,
 } = require("./middleware/permissionMiddleware");
 const auditLogMiddleware = require("./middleware/auditLogMiddleware");
+const {
+  isSubscriptionEnforcementEnabled,
+} = require("./utils/subscriptionEnforcementConfig");
 
 const app = express();
 app.disable("x-powered-by");
@@ -191,6 +197,51 @@ app.get("/", (req, res) => {
 app.use("/api/auth", authRateLimiter, authRoutes);
 
 app.use("/api/subscription", subscriptionRoutes);
+
+const tenantErpRoutePrefixes = [
+  "/api/users",
+  "/api/staff",
+  "/api/audit-logs",
+  "/api/customers",
+  "/api/invoices",
+  "/api/recurring-invoices",
+  "/api/invoice-settings",
+  "/api/quotations",
+  "/api/products",
+  "/api/barcodes",
+  "/api/vendors",
+  "/api/vendor-payments",
+  "/api/purchase-orders",
+  "/api/bills",
+  "/api/goods-receipts",
+  "/api/delivery-challans",
+  "/api/returns",
+  "/api/expenses",
+  "/api/petty-cash",
+  "/api/accounts",
+  "/api/journal-entries",
+  "/api/receipt-entries",
+  "/api/payment-entries",
+  "/api/payroll",
+  "/api/cash-book",
+  "/api/bank-book",
+  "/api/customer-statement",
+  "/api/ledger",
+  "/api/trial-balance",
+  "/api/profit-loss",
+  "/api/balance-sheet",
+  "/api/business",
+  "/api/reports",
+  "/api/backup",
+  "/api/dashboard",
+];
+
+if (isSubscriptionEnforcementEnabled()) {
+  app.use(tenantErpRoutePrefixes, authMiddleware, requireValidSubscription);
+  console.log("Subscription enforcement is enabled");
+} else {
+  console.log("Subscription enforcement is disabled");
+}
 
 app.use("/api/users", authMiddleware, ownerOnly, usersRoutes);
 

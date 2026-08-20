@@ -148,7 +148,10 @@ test("route registration uses auth only and remains outside commercial enforceme
   assert.match(routeSource, /router\.get\("\/status", authMiddleware, getSubscriptionStatus\)/);
   assert.doesNotMatch(routeSource, /requireValidSubscription|subscriptionMiddleware/);
   assert.match(indexSource, /app\.use\("\/api\/subscription", subscriptionRoutes\)/);
-  assert.doesNotMatch(indexSource, /requireValidSubscription|subscriptionMiddleware/);
+  assert.ok(
+    indexSource.indexOf('app.use("/api/subscription", subscriptionRoutes)')
+      < indexSource.indexOf("if (isSubscriptionEnforcementEnabled())")
+  );
 });
 
 test("controller is read-only and invokes only the status lookup dependency", async () => {
