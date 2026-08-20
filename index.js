@@ -33,6 +33,7 @@ const db = require("./db/connection");
 
 /* ================= AUTH ================= */
 const authRoutes = require("./routes/authRoutes");
+const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const usersRoutes = require("./routes/usersRoutes");
 const staffRoutes = require("./routes/staffRoutes");
 const auditLogRoutes = require("./routes/auditLogRoutes");
@@ -185,6 +186,8 @@ app.get("/", (req, res) => {
 ========================================================= */
 
 app.use("/api/auth", authRateLimiter, authRoutes);
+
+app.use("/api/subscription", subscriptionRoutes);
 
 app.use("/api/users", authMiddleware, ownerOnly, usersRoutes);
 
