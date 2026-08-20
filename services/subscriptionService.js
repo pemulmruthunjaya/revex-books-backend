@@ -2,6 +2,8 @@ const db = require("../db/connection");
 
 const MAX_TRIAL_DAYS = 365;
 const MAX_IDEMPOTENCY_KEY_LENGTH = 64;
+const DEFAULT_EXPIRY_BATCH_SIZE = 100;
+const MAX_EXPIRY_BATCH_SIZE = 500;
 const BILLING_CYCLES = new Set(["monthly", "annual", "custom"]);
 
 class SubscriptionServiceError extends Error {
@@ -694,11 +696,148 @@ const activateSubscription = async ({
   });
 };
 
+const normalizeBatchSize = (value) => {
+  const batchSize = value === undefined || value === null || value === ""
+    ? DEFAULT_EXPIRY_BATCH_SIZE
+    : Number(value);
+  if (!Number.isSafeInteger(batchSize)
+    || batchSize <= 0
+    || batchSize > MAX_EXPIRY_BATCH_SIZE) {
+    throw serviceError(
+      "INVALID_BATCH_SIZE",
+      `batchSize must be between 1 and ${MAX_EXPIRY_BATCH_SIZE}`
+    );
+  }
+  return batchSize;
+};
+
+const expireDueTrialCandidate = async (candidate, callerConnection) =>
+  withMutationTransaction(callerConnection, async (connection) => {
+    const [rows] = await connection.query(
+      `SELECT id, company_id, plan_id, status, trial_start_at, trial_end_at,
+              DATE_FORMAT(trial_end_at, '%Y%m%d%H%i%s') AS trial_end_key,
+              CASE
+                WHEN status = 'trialing'
+                 AND trial_end_at IS NOT NULL
+                 AND trial_end_at <= UTC_TIMESTAMP() THEN 1
+                ELSE 0
+              END AS is_due
+         FROM company_subscriptions
+        WHERE id = ?
+        FOR UPDATE`,
+      [candidate.id]
+    );
+    if (!rows.length || Number(rows[0].is_due) !== 1) {
+      return { outcome: "skipped", subscriptionId: candidate.id };
+    }
+
+    const subscription = rows[0];
+    const requestId = `trial-expired:${subscription.id}:${subscription.trial_end_key}`;
+    const existingEvent = await findRequestEvent(
+      connection,
+      subscription.id,
+      requestId
+    );
+    if (existingEvent && existingEvent.event_type !== "trial_expired") {
+      throw serviceError(
+        "IDEMPOTENCY_CONFLICT",
+        "The deterministic trial-expiry request ID is already used by another event"
+      );
+    }
+
+    await connection.query(
+      `UPDATE company_subscriptions
+          SET status = 'expired', expired_at = trial_end_at,
+              version = version + 1
+        WHERE id = ? AND company_id = ? AND status = 'trialing'`,
+      [subscription.id, subscription.company_id]
+    );
+    await connection.query(
+      `UPDATE subscription_periods
+          SET status = 'expired'
+        WHERE subscription_id = ? AND company_id = ?
+          AND period_type = 'trial' AND status = 'active'`,
+      [subscription.id, subscription.company_id]
+    );
+
+    if (!existingEvent) {
+      await insertEvent(connection, {
+        subscriptionId: subscription.id,
+        companyId: subscription.company_id,
+        eventType: "trial_expired",
+        fromStatus: "trialing",
+        toStatus: "expired",
+        oldPlanId: subscription.plan_id,
+        newPlanId: subscription.plan_id,
+        effectiveAt: subscription.trial_end_at,
+        actor: {
+          type: "system",
+          userId: null,
+          reason: "Trial reached configured end time",
+        },
+        requestId,
+        metadata: {
+          trial_end_at: subscription.trial_end_at,
+          source: "subscription_expiry_scheduler",
+        },
+      });
+    }
+
+    return {
+      outcome: "expired",
+      subscriptionId: subscription.id,
+      companyId: subscription.company_id,
+      requestId,
+    };
+  });
+
+const expireDueTrials = async (options = {}) => {
+  const batchSize = normalizeBatchSize(options.batchSize);
+  const discoveryExecutor = options.connection || db;
+  const [candidates] = await discoveryExecutor.query(
+    `SELECT id, company_id
+       FROM company_subscriptions
+      WHERE status = 'trialing'
+        AND trial_end_at IS NOT NULL
+        AND trial_end_at <= UTC_TIMESTAMP()
+      ORDER BY trial_end_at ASC, id ASC
+      LIMIT ?`,
+    [batchSize]
+  );
+
+  const summary = {
+    found: candidates.length,
+    expired: 0,
+    skipped: 0,
+    failed: 0,
+    failures: [],
+  };
+
+  for (const candidate of candidates) {
+    try {
+      const result = await expireDueTrialCandidate(candidate, options.connection);
+      if (result.outcome === "expired") summary.expired += 1;
+      else summary.skipped += 1;
+    } catch (error) {
+      summary.failed += 1;
+      summary.failures.push({
+        subscription_id: candidate.id,
+        company_id: candidate.company_id,
+        code: error.code || "TRIAL_EXPIRY_FAILED",
+        message: error.message,
+      });
+    }
+  }
+  return summary;
+};
+
 module.exports = {
   BILLING_CYCLES,
+  DEFAULT_EXPIRY_BATCH_SIZE,
   MAX_TRIAL_DAYS,
   SubscriptionServiceError,
   activateSubscription,
   createTrialCompany,
+  expireDueTrials,
   getEffectiveSubscription,
 };

@@ -3,6 +3,7 @@ const db = require("../db/connection");
 const {
   activateSubscription,
   createTrialCompany,
+  expireDueTrials,
   getEffectiveSubscription,
 } = require("../services/subscriptionService");
 
@@ -585,6 +586,286 @@ test("owned transaction rolls back and releases on database failure", async () =
   } finally {
     db.getConnection = originalGetConnection;
   }
+});
+
+const expirySubscription = (overrides = {}) => ({
+  id: 301,
+  company_id: 41,
+  plan_id: 2,
+  status: "trialing",
+  trial_start_at: "2026-08-06T00:00:00.000Z",
+  trial_end_at: NOW,
+  expired_at: null,
+  version: 1,
+  ...overrides,
+});
+
+const createExpiryHarness = (subscriptions, options = {}) => {
+  const state = {
+    companies: subscriptions.map((item) => ({
+      id: item.company_id, status: "active", plan_id: item.plan_id,
+    })),
+    subscriptions: clone(subscriptions),
+    periods: subscriptions.map((item) => ({
+      id: item.id + 1000,
+      subscription_id: item.id,
+      company_id: item.company_id,
+      plan_id: item.plan_id,
+      period_type: "trial",
+      status: "active",
+      starts_at: item.trial_start_at,
+      ends_at: item.trial_end_at,
+    })),
+    events: [],
+  };
+  const lifecycle = { begin: 0, commit: 0, rollback: 0, release: 0 };
+  const toKey = (value) => new Date(value).toISOString()
+    .slice(0, 19).replace(/[-T:]/g, "");
+
+  const poolQuery = async (sql, params = []) => {
+    const normalized = sql.replace(/\s+/g, " ").trim();
+    if (normalized.includes("FROM company_subscriptions")
+      && normalized.includes("ORDER BY trial_end_at")
+      && !normalized.includes("FOR UPDATE")) {
+      const limit = Number(params[0]);
+      const due = state.subscriptions
+        .filter((item) => item.status === "trialing"
+          && item.trial_end_at
+          && new Date(item.trial_end_at) <= new Date(NOW))
+        .sort((a, b) => new Date(a.trial_end_at) - new Date(b.trial_end_at)
+          || a.id - b.id)
+        .slice(0, limit)
+        .map(({ id, company_id }) => ({ id, company_id }));
+      return [due];
+    }
+    throw new Error(`Unexpected expiry pool query: ${normalized}`);
+  };
+
+  const getConnection = async () => {
+    let snapshot;
+    return {
+      beginTransaction: async () => {
+        lifecycle.begin += 1;
+        snapshot = clone(state);
+      },
+      commit: async () => { lifecycle.commit += 1; snapshot = null; },
+      rollback: async () => {
+        lifecycle.rollback += 1;
+        state.companies = snapshot.companies;
+        state.subscriptions = snapshot.subscriptions;
+        state.periods = snapshot.periods;
+        state.events = snapshot.events;
+      },
+      release: () => { lifecycle.release += 1; },
+      query: async (sql, params = []) => {
+        const normalized = sql.replace(/\s+/g, " ").trim();
+        if (normalized.includes("FROM company_subscriptions")
+          && normalized.includes("FOR UPDATE")) {
+          const item = state.subscriptions.find((row) => row.id === Number(params[0]));
+          if (!item) return [[]];
+          return [[{
+            ...clone(item),
+            trial_end_key: toKey(item.trial_end_at),
+            is_due: item.status === "trialing"
+              && new Date(item.trial_end_at) <= new Date(NOW) ? 1 : 0,
+          }]];
+        }
+        if (normalized.includes("FROM subscription_events")
+          && normalized.includes("request_id = ?")) {
+          const event = state.events.find((row) =>
+            row.subscription_id === Number(params[0]) && row.request_id === params[1]);
+          return [event ? [clone(event)] : []];
+        }
+        if (normalized.startsWith("UPDATE company_subscriptions")) {
+          const item = state.subscriptions.find((row) =>
+            row.id === Number(params[0]) && row.company_id === Number(params[1]));
+          if (item && item.status === "trialing") {
+            item.status = "expired";
+            item.expired_at = item.trial_end_at;
+            item.version += 1;
+          }
+          return [{ affectedRows: item ? 1 : 0 }];
+        }
+        if (normalized.startsWith("UPDATE subscription_periods")) {
+          state.periods
+            .filter((row) => row.subscription_id === Number(params[0])
+              && row.company_id === Number(params[1])
+              && row.period_type === "trial" && row.status === "active")
+            .forEach((row) => { row.status = "expired"; });
+          return [{ affectedRows: 1 }];
+        }
+        if (normalized.startsWith("INSERT INTO subscription_events")) {
+          if (options.failEventInsert) throw new Error("Injected expiry event failure");
+          const event = {
+            id: state.events.length + 1,
+            subscription_id: params[0], company_id: params[1],
+            event_type: params[2], from_status: params[3], to_status: params[4],
+            old_plan_id: params[5], new_plan_id: params[6], effective_at: params[7],
+            actor_type: params[8], actor_user_id: params[9], reason: params[10],
+            metadata: params[11], request_id: params[12],
+          };
+          if (state.events.some((row) => row.subscription_id === event.subscription_id
+            && row.request_id === event.request_id)) {
+            const error = new Error("Duplicate expiry event");
+            error.code = "ER_DUP_ENTRY";
+            throw error;
+          }
+          state.events.push(event);
+          return [{ insertId: event.id, affectedRows: 1 }];
+        }
+        throw new Error(`Unexpected expiry connection query: ${normalized}`);
+      },
+    };
+  };
+
+  return { state, lifecycle, poolQuery, getConnection };
+};
+
+const withExpiryHarness = async (harness, work) => {
+  const originalQuery = db.query;
+  const originalGetConnection = db.getConnection;
+  db.query = harness.poolQuery;
+  db.getConnection = harness.getConnection;
+  try {
+    return await work();
+  } finally {
+    db.query = originalQuery;
+    db.getConnection = originalGetConnection;
+  }
+};
+
+test("due trial expires atomically and preserves tenant fields", async () => {
+  const original = expirySubscription();
+  const harness = createExpiryHarness([original]);
+  const summary = await withExpiryHarness(harness, () => expireDueTrials());
+  assert.deepEqual(summary, { found: 1, expired: 1, skipped: 0, failed: 0, failures: [] });
+  const subscription = harness.state.subscriptions[0];
+  assert.equal(subscription.status, "expired");
+  assert.equal(subscription.expired_at, original.trial_end_at);
+  assert.equal(subscription.trial_start_at, original.trial_start_at);
+  assert.equal(subscription.trial_end_at, original.trial_end_at);
+  assert.equal(subscription.plan_id, original.plan_id);
+  assert.equal(subscription.version, 2);
+  assert.deepEqual(harness.state.companies[0], {
+    id: original.company_id, status: "active", plan_id: original.plan_id,
+  });
+  assert.equal(harness.state.periods[0].status, "expired");
+});
+
+test("expiry event is deterministic and repeated run is idempotent", async () => {
+  const harness = createExpiryHarness([expirySubscription()]);
+  await withExpiryHarness(harness, async () => {
+    await expireDueTrials();
+    const second = await expireDueTrials();
+    assert.equal(second.found, 0);
+  });
+  assert.equal(harness.state.events.length, 1);
+  const event = harness.state.events[0];
+  assert.equal(event.event_type, "trial_expired");
+  assert.equal(event.from_status, "trialing");
+  assert.equal(event.to_status, "expired");
+  assert.equal(event.old_plan_id, 2);
+  assert.equal(event.new_plan_id, 2);
+  assert.equal(event.actor_type, "system");
+  assert.equal(event.actor_user_id, null);
+  assert.equal(event.reason, "Trial reached configured end time");
+  assert.equal(event.request_id, "trial-expired:301:20260820000000");
+});
+
+test("future and non-trialing subscriptions are not discovered", async () => {
+  const subscriptions = [
+    expirySubscription({ id: 1, trial_end_at: "2026-08-20T00:00:01.000Z" }),
+    expirySubscription({ id: 2, status: "expired" }),
+    expirySubscription({ id: 3, status: "suspended" }),
+    expirySubscription({ id: 4, status: "cancelled" }),
+    expirySubscription({ id: 5, status: "active" }),
+  ];
+  const harness = createExpiryHarness(subscriptions);
+  const summary = await withExpiryHarness(harness, () => expireDueTrials());
+  assert.deepEqual(summary, { found: 0, expired: 0, skipped: 0, failed: 0, failures: [] });
+  assert.equal(harness.state.events.length, 0);
+});
+
+test("database UTC boundary is due", async () => {
+  const harness = createExpiryHarness([expirySubscription({ trial_end_at: NOW })]);
+  const summary = await withExpiryHarness(harness, () => expireDueTrials());
+  assert.equal(summary.expired, 1);
+});
+
+test("batch size limits one-transaction-per-subscription work", async () => {
+  const subscriptions = [1, 2, 3].map((id) => expirySubscription({
+    id, company_id: 100 + id,
+  }));
+  const harness = createExpiryHarness(subscriptions);
+  const summary = await withExpiryHarness(harness, () => expireDueTrials({ batchSize: 2 }));
+  assert.equal(summary.found, 2);
+  assert.equal(summary.expired, 2);
+  assert.deepEqual(harness.lifecycle, { begin: 2, commit: 2, rollback: 0, release: 2 });
+  assert.equal(harness.state.subscriptions.filter((row) => row.status === "trialing").length, 1);
+});
+
+test("expiry event failure rolls back subscription and period", async () => {
+  const original = expirySubscription();
+  const harness = createExpiryHarness([original], { failEventInsert: true });
+  const summary = await withExpiryHarness(harness, () => expireDueTrials());
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.expired, 0);
+  assert.equal(harness.state.subscriptions[0].status, "trialing");
+  assert.equal(harness.state.subscriptions[0].expired_at, null);
+  assert.equal(harness.state.subscriptions[0].version, 1);
+  assert.equal(harness.state.periods[0].status, "active");
+  assert.equal(harness.state.events.length, 0);
+  assert.deepEqual(harness.lifecycle, { begin: 1, commit: 0, rollback: 1, release: 1 });
+});
+
+const withSchedulerDouble = async (enabled, work) => {
+  const cron = require("node-cron");
+  const originalValidate = cron.validate;
+  const originalSchedule = cron.schedule;
+  const originalEnabled = process.env.SUBSCRIPTION_EXPIRY_SCHEDULER_ENABLED;
+  const originalCron = process.env.SUBSCRIPTION_EXPIRY_CRON;
+  const calls = [];
+  cron.validate = () => true;
+  cron.schedule = (expression, callback, options) => {
+    calls.push({ expression, callback, options });
+    return { stop() {} };
+  };
+  if (enabled) process.env.SUBSCRIPTION_EXPIRY_SCHEDULER_ENABLED = "true";
+  else delete process.env.SUBSCRIPTION_EXPIRY_SCHEDULER_ENABLED;
+  delete process.env.SUBSCRIPTION_EXPIRY_CRON;
+  const modulePath = require.resolve("../jobs/subscriptionExpiryScheduler");
+  delete require.cache[modulePath];
+  try {
+    const scheduler = require(modulePath);
+    return await work(scheduler, calls);
+  } finally {
+    delete require.cache[modulePath];
+    cron.validate = originalValidate;
+    cron.schedule = originalSchedule;
+    if (originalEnabled === undefined) delete process.env.SUBSCRIPTION_EXPIRY_SCHEDULER_ENABLED;
+    else process.env.SUBSCRIPTION_EXPIRY_SCHEDULER_ENABLED = originalEnabled;
+    if (originalCron === undefined) delete process.env.SUBSCRIPTION_EXPIRY_CRON;
+    else process.env.SUBSCRIPTION_EXPIRY_CRON = originalCron;
+  }
+};
+
+test("subscription expiry scheduler import and disabled start remain inert", async () => {
+  await withSchedulerDouble(false, async (scheduler, calls) => {
+    assert.equal(calls.length, 0, "module import must not schedule work");
+    assert.equal(scheduler.startSubscriptionExpiryScheduler(), null);
+    assert.equal(calls.length, 0);
+  });
+});
+
+test("explicit scheduler start uses default cron and noOverlap", async () => {
+  await withSchedulerDouble(true, async (scheduler, calls) => {
+    assert.equal(calls.length, 0);
+    const task = scheduler.startSubscriptionExpiryScheduler();
+    assert(task);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].expression, "*/15 * * * *");
+    assert.deepEqual(calls[0].options, { noOverlap: true });
+  });
 });
 
 const run = async () => {

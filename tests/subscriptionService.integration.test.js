@@ -4,6 +4,7 @@ const db = require("../db/connection");
 const {
   activateSubscription,
   createTrialCompany,
+  expireDueTrials,
   getEffectiveSubscription,
 } = require("../services/subscriptionService");
 
@@ -157,6 +158,10 @@ check("trial at or after expiry is invalid before scheduler", async () => {
   const result = await getEffectiveSubscription(companyId);
   assert.equal(result.access.valid, false);
   assert.equal(result.access.reason, "TRIAL_EXPIRED");
+  await pool.query(
+    "UPDATE company_subscriptions SET status='expired', expired_at=trial_end_at WHERE company_id=?",
+    [companyId]
+  );
 });
 
 for (const [status, reason] of [
@@ -494,6 +499,198 @@ check("subscription boolean checks are enforced", async () => {
     "UPDATE company_subscriptions SET auto_renew=2 WHERE company_id=?",
     [companyId]
   ), (error) => error.code === "ER_CHECK_CONSTRAINT_VIOLATED");
+});
+
+const createDueServiceTrial = async ({ offsetSeconds = 0 } = {}) => {
+  const companyId = await createServiceTrial();
+  await pool.query(
+    `UPDATE company_subscriptions
+        SET trial_start_at=DATE_SUB(UTC_TIMESTAMP(), INTERVAL 14 DAY),
+            trial_end_at=DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? SECOND),
+            trial_duration_days=14,
+            current_period_start_at=DATE_SUB(UTC_TIMESTAMP(), INTERVAL 14 DAY),
+            current_period_end_at=DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? SECOND)
+      WHERE company_id=?`,
+    [offsetSeconds, offsetSeconds, companyId]
+  );
+  await pool.query(
+    `UPDATE subscription_periods sp
+      JOIN company_subscriptions cs ON cs.id=sp.subscription_id
+        SET sp.starts_at=cs.trial_start_at, sp.ends_at=cs.trial_end_at
+      WHERE cs.company_id=? AND sp.period_type='trial'`,
+    [companyId]
+  );
+  return companyId;
+};
+
+check("due trial expiry preserves tenant data and writes one deterministic event", async () => {
+  const companyId = await createDueServiceTrial();
+  const before = await scalar(
+    `SELECT c.status company_status, c.plan_id company_plan_id,
+            cs.id subscription_id, cs.plan_id, cs.trial_start_at, cs.trial_end_at,
+            cs.version,
+            DATE_FORMAT(cs.trial_end_at, '%Y%m%d%H%i%s') trial_end_key
+       FROM companies c JOIN company_subscriptions cs ON cs.company_id=c.id
+      WHERE c.id=?`,
+    [companyId]
+  );
+  const summary = await expireDueTrials({ batchSize: 10 });
+  assert.equal(summary.failed, 0);
+  assert.equal(summary.expired, 1);
+  const after = await scalar(
+    `SELECT c.status company_status, c.plan_id company_plan_id,
+            cs.plan_id, cs.status, cs.trial_start_at, cs.trial_end_at,
+            cs.expired_at, cs.version,
+            (SELECT status FROM subscription_periods sp
+              WHERE sp.subscription_id=cs.id AND sp.period_type='trial' LIMIT 1) period_status,
+            (SELECT COUNT(*) FROM subscription_events se
+              WHERE se.subscription_id=cs.id AND se.event_type='trial_expired') event_count
+       FROM companies c JOIN company_subscriptions cs ON cs.company_id=c.id
+      WHERE c.id=?`,
+    [companyId]
+  );
+  assert.equal(after.company_status, before.company_status);
+  assert.equal(after.company_plan_id, before.company_plan_id);
+  assert.equal(after.plan_id, before.plan_id);
+  assert.deepEqual(after.trial_start_at, before.trial_start_at);
+  assert.deepEqual(after.trial_end_at, before.trial_end_at);
+  assert.deepEqual(after.expired_at, before.trial_end_at);
+  assert.equal(after.status, "expired");
+  assert.equal(after.version, before.version + 1);
+  assert.equal(after.period_status, "expired");
+  assert.equal(after.event_count, 1);
+
+  const event = await scalar(
+    `SELECT event_type, from_status, to_status, old_plan_id, new_plan_id,
+            effective_at, actor_type, actor_user_id, reason, request_id
+       FROM subscription_events
+      WHERE subscription_id=? AND event_type='trial_expired'`,
+    [before.subscription_id]
+  );
+  assert.equal(event.event_type, "trial_expired");
+  assert.equal(event.from_status, "trialing");
+  assert.equal(event.to_status, "expired");
+  assert.equal(event.old_plan_id, before.plan_id);
+  assert.equal(event.new_plan_id, before.plan_id);
+  assert.deepEqual(event.effective_at, before.trial_end_at);
+  assert.equal(event.actor_type, "system");
+  assert.equal(event.actor_user_id, null);
+  assert.equal(event.reason, "Trial reached configured end time");
+  assert.equal(
+    event.request_id,
+    `trial-expired:${before.subscription_id}:${before.trial_end_key}`
+  );
+  const second = await expireDueTrials({ batchSize: 10 });
+  assert.equal(second.expired, 0);
+  const eventCount = await scalar(
+    "SELECT COUNT(*) count FROM subscription_events WHERE subscription_id=? AND event_type='trial_expired'",
+    [before.subscription_id]
+  );
+  assert.equal(eventCount.count, 1);
+});
+
+check("future and non-trialing rows are skipped by database UTC discovery", async () => {
+  const futureCompanyId = await createDueServiceTrial({ offsetSeconds: 60 });
+  for (const status of ["expired", "suspended", "cancelled", "active"]) {
+    const companyId = await insertCompany({ planId: activePlanId });
+    await insertSubscription({
+      companyId, planId: activePlanId, status,
+      trialStart: new Date(Date.now() - 172800000),
+      trialEnd: new Date(Date.now() - 86400000),
+    });
+  }
+  const summary = await expireDueTrials({ batchSize: 20 });
+  assert.equal(summary.found, 0);
+  const future = await scalar(
+    "SELECT status FROM company_subscriptions WHERE company_id=?",
+    [futureCompanyId]
+  );
+  assert.equal(future.status, "trialing");
+});
+
+check("batch size limits the number expired in one invocation", async () => {
+  const companyIds = [];
+  for (let index = 0; index < 3; index += 1) {
+    companyIds.push(await createDueServiceTrial());
+  }
+  const first = await expireDueTrials({ batchSize: 2 });
+  assert.equal(first.found, 2);
+  assert.equal(first.expired, 2);
+  const placeholders = companyIds.map(() => "?").join(",");
+  const remaining = await scalar(
+    `SELECT SUM(status='trialing') remaining
+       FROM company_subscriptions WHERE company_id IN (${placeholders})`,
+    companyIds
+  );
+  assert.equal(Number(remaining.remaining), 1);
+  const second = await expireDueTrials({ batchSize: 2 });
+  assert.equal(second.expired, 1);
+});
+
+check("concurrent expiry invocations create one event", async () => {
+  const companyId = await createDueServiceTrial();
+  const subscription = await scalar(
+    "SELECT id FROM company_subscriptions WHERE company_id=?",
+    [companyId]
+  );
+  const summaries = await Promise.all([
+    expireDueTrials({ batchSize: 10 }),
+    expireDueTrials({ batchSize: 10 }),
+  ]);
+  assert.equal(summaries.reduce((sum, item) => sum + item.expired, 0), 1);
+  assert.equal(summaries.reduce((sum, item) => sum + item.failed, 0), 0);
+  const row = await scalar(
+    `SELECT cs.status,
+            (SELECT COUNT(*) FROM subscription_events se
+              WHERE se.subscription_id=cs.id AND se.event_type='trial_expired') event_count
+       FROM company_subscriptions cs WHERE cs.id=?`,
+    [subscription.id]
+  );
+  assert.equal(row.status, "expired");
+  assert.equal(row.event_count, 1);
+});
+
+check("expiry event failure rolls back real MySQL state", async () => {
+  const companyId = await createDueServiceTrial();
+  const before = await scalar(
+    `SELECT c.status company_status, c.plan_id company_plan_id,
+            cs.id subscription_id, cs.status, cs.plan_id, cs.expired_at,
+            cs.version,
+            (SELECT status FROM subscription_periods sp
+              WHERE sp.subscription_id=cs.id AND sp.period_type='trial' LIMIT 1) period_status,
+            (SELECT COUNT(*) FROM subscription_events se
+              WHERE se.subscription_id=cs.id) event_count
+       FROM companies c JOIN company_subscriptions cs ON cs.company_id=c.id
+      WHERE c.id=?`,
+    [companyId]
+  );
+  await pool.query(
+    `ALTER TABLE subscription_events
+       ADD CONSTRAINT chk_integration_fail_expiry
+       CHECK (NOT (event_type = 'trial_expired' AND company_id = ${Number(companyId)}))`
+  );
+  try {
+    const summary = await expireDueTrials({ batchSize: 10 });
+    assert.equal(summary.failed, 1);
+    assert.equal(summary.expired, 0);
+  } finally {
+    await pool.query(
+      "ALTER TABLE subscription_events DROP CHECK chk_integration_fail_expiry"
+    );
+  }
+  const after = await scalar(
+    `SELECT c.status company_status, c.plan_id company_plan_id,
+            cs.id subscription_id, cs.status, cs.plan_id, cs.expired_at,
+            cs.version,
+            (SELECT status FROM subscription_periods sp
+              WHERE sp.subscription_id=cs.id AND sp.period_type='trial' LIMIT 1) period_status,
+            (SELECT COUNT(*) FROM subscription_events se
+              WHERE se.subscription_id=cs.id) event_count
+       FROM companies c JOIN company_subscriptions cs ON cs.company_id=c.id
+      WHERE c.id=?`,
+    [companyId]
+  );
+  assert.deepEqual(after, before);
 });
 
 const run = async () => {
