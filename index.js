@@ -107,6 +107,9 @@ const {
 const {
   startRecurringInvoiceScheduler,
 } = require("./jobs/recurringInvoiceScheduler");
+const {
+  startSubscriptionExpiryScheduler,
+} = require("./jobs/subscriptionExpiryScheduler");
 
 /**
  * =========================================================
@@ -644,4 +647,9 @@ app.listen(PORT, () => {
   );
 
   startRecurringInvoiceScheduler();
+  try {
+    startSubscriptionExpiryScheduler();
+  } catch (error) {
+    console.error("Subscription expiry scheduler initialization failed");
+  }
 });

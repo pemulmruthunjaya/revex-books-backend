@@ -141,14 +141,14 @@ test("returns a safe 500 for unexpected service failures", async () => {
   assert.equal(calls.logs.length, 1);
 });
 
-test("route registration uses auth only and does not enable enforcement or scheduler", async () => {
+test("route registration uses auth only and remains outside commercial enforcement", async () => {
   const root = path.resolve(__dirname, "..");
   const routeSource = fs.readFileSync(path.join(root, "routes", "subscriptionRoutes.js"), "utf8");
   const indexSource = fs.readFileSync(path.join(root, "index.js"), "utf8");
   assert.match(routeSource, /router\.get\("\/status", authMiddleware, getSubscriptionStatus\)/);
   assert.doesNotMatch(routeSource, /requireValidSubscription|subscriptionMiddleware/);
   assert.match(indexSource, /app\.use\("\/api\/subscription", subscriptionRoutes\)/);
-  assert.doesNotMatch(indexSource, /startSubscriptionExpiryScheduler/);
+  assert.doesNotMatch(indexSource, /requireValidSubscription|subscriptionMiddleware/);
 });
 
 test("controller is read-only and invokes only the status lookup dependency", async () => {
