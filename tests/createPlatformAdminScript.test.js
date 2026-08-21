@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { Readable } = require("node:stream");
-const { BootstrapPromptError, concealedPasswordPrompt, main, passwordFromStdin, run, safeFailureMessage } = require("../scripts/createPlatformAdmin");
+const { BootstrapPromptError, concealedPasswordPrompt, createBootstrapDatabase, main, passwordFromStdin, run, safeFailureMessage } = require("../scripts/createPlatformAdmin");
 
 class FakeInput extends EventEmitter {
   constructor() { super(); this.isTTY = true; this.isRaw = false; this.paused = true; this.rawChanges = []; }
@@ -129,6 +129,34 @@ test("command-line password forms are forbidden and main returns non-zero", asyn
   assert.equal(code, 1);
   assert.match(errors[0], /must not be supplied as command-line arguments/i);
   assert.doesNotMatch(errors.join(" "), /exposed-value/);
+});
+
+test("bootstrap database uses only dedicated temporary environment settings", () => {
+  const calls = [];
+  const environment = {
+    REVEX_BOOTSTRAP_DB_HOST: "127.0.0.1",
+    REVEX_BOOTSTRAP_DB_PORT: "3306",
+    REVEX_BOOTSTRAP_DB_USER: "temporary-user",
+    REVEX_BOOTSTRAP_DB_PASSWORD: "temporary-password",
+    REVEX_BOOTSTRAP_DB_NAME: "temporary-database",
+    DB_HOST: "must-not-be-used",
+  };
+  const pool = createBootstrapDatabase(environment, { createPool: (options) => { calls.push(options); return {}; } });
+  assert.deepEqual(pool, {});
+  assert.equal(calls[0].host, "127.0.0.1");
+  assert.equal(calls[0].user, "temporary-user");
+  assert.equal(calls[0].password, "temporary-password");
+  assert.equal(calls[0].database, "temporary-database");
+  assert.notEqual(calls[0].host, environment.DB_HOST);
+});
+
+test("missing bootstrap database environment fails before mysql pool creation", () => {
+  let calls = 0;
+  assert.throws(
+    () => createBootstrapDatabase({}, { createPool: () => { calls += 1; } }),
+    (error) => error.code === "BOOTSTRAP_DB_CONFIG_MISSING"
+  );
+  assert.equal(calls, 0);
 });
 
 const runTests = async () => {

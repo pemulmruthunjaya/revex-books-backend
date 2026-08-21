@@ -1,6 +1,7 @@
 const bcrypt = require("bcryptjs");
-const db = require("../db/connection");
 const { signAuthToken } = require("../utils/jwtToken");
+
+const defaultExecutor = () => require("../db/connection");
 
 class PlatformAdminError extends Error {
   constructor(code, message, status = 400) {
@@ -14,7 +15,7 @@ class PlatformAdminError extends Error {
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
 
 const createPlatformAdmin = async ({ name, email, password }, options = {}) => {
-  const executor = options.executor || db;
+  const executor = options.executor || defaultExecutor();
   const normalizedName = String(name || "").trim();
   const normalizedEmail = normalizeEmail(email);
   if (!normalizedName || !normalizedEmail || !normalizedEmail.includes("@")) {
@@ -48,7 +49,7 @@ const createPlatformAdmin = async ({ name, email, password }, options = {}) => {
 };
 
 const authenticatePlatformAdmin = async ({ email, password }, options = {}) => {
-  const executor = options.executor || db;
+  const executor = options.executor || defaultExecutor();
   const normalizedEmail = normalizeEmail(email);
   if (!normalizedEmail || !password) {
     throw new PlatformAdminError("INVALID_CREDENTIALS", "Invalid credentials", 401);

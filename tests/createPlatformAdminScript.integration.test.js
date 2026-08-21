@@ -2,7 +2,6 @@ const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const mysql = require("mysql2/promise");
 const { Readable } = require("node:stream");
-const { createPlatformAdmin } = require("../services/platformAdminService");
 const { BootstrapPromptError, run } = require("../scripts/createPlatformAdmin");
 
 const database = "revex_platform_bootstrap_integration_20260821";
@@ -17,8 +16,14 @@ const pool = mysql.createPool({
   database,
   timezone: "Z",
 });
-const createAdmin = (input) => createPlatformAdmin(input, { executor: pool });
 const args = ["--name", "Windows Bootstrap Admin", "--email", "windows.bootstrap@revex.test", "--password-stdin"];
+const bootstrapEnvironment = {
+  REVEX_BOOTSTRAP_DB_HOST: "127.0.0.1",
+  REVEX_BOOTSTRAP_DB_PORT: String(process.env.REVEX_INTEGRATION_DB_PORT || 3306),
+  REVEX_BOOTSTRAP_DB_USER: process.env.REVEX_INTEGRATION_DB_USER,
+  REVEX_BOOTSTRAP_DB_PASSWORD: process.env.REVEX_INTEGRATION_DB_PASSWORD,
+  REVEX_BOOTSTRAP_DB_NAME: database,
+};
 const passwordInput = (value) => {
   const input = Readable.from([value]);
   input.isTTY = false;
@@ -27,7 +32,7 @@ const passwordInput = (value) => {
 
 const runTest = async () => {
   const logs = [];
-  await run({ argv: args, input: passwordInput("Windows-safe-password\r\n"), createAdmin, output: { log: (message) => logs.push(message) } });
+  await run({ argv: args, input: passwordInput("Windows-safe-password\r\n"), environment: bootstrapEnvironment, output: { log: (message) => logs.push(message) } });
   const [[stored]] = await pool.query("SELECT id, email, password_hash FROM platform_admins WHERE email=?", ["windows.bootstrap@revex.test"]);
   assert(stored);
   assert.notEqual(stored.password_hash, "Windows-safe-password");
@@ -35,19 +40,19 @@ const runTest = async () => {
   assert.doesNotMatch(logs.join(" "), /Windows-safe-password/);
 
   await assert.rejects(
-    run({ argv: args, input: passwordInput("Windows-safe-password\n"), createAdmin, output: { log() {} } }),
+    run({ argv: args, input: passwordInput("Windows-safe-password\n"), environment: bootstrapEnvironment, output: { log() {} } }),
     (error) => error.code === "PLATFORM_ADMIN_EXISTS"
   );
   await assert.rejects(
-    run({ argv: ["--name", "Short", "--email", "short@revex.test", "--password-stdin"], input: passwordInput("short\n"), createAdmin, output: { log() {} } }),
+    run({ argv: ["--name", "Short", "--email", "short@revex.test", "--password-stdin"], input: passwordInput("short\n"), environment: bootstrapEnvironment, output: { log() {} } }),
     (error) => error.code === "PASSWORD_TOO_SHORT"
   );
   await assert.rejects(
-    run({ argv: ["--name", "Cancel", "--email", "cancel@revex.test"], passwordPrompt: async () => { throw new BootstrapPromptError("PROMPT_CANCELLED", "cancelled"); }, createAdmin, output: { log() {} } }),
+    run({ argv: ["--name", "Cancel", "--email", "cancel@revex.test"], passwordPrompt: async () => { throw new BootstrapPromptError("PROMPT_CANCELLED", "cancelled"); }, environment: bootstrapEnvironment, output: { log() {} } }),
     (error) => error.code === "PROMPT_CANCELLED"
   );
   await assert.rejects(
-    run({ argv: ["--name", "Empty", "--email", "empty@revex.test", "--password-stdin"], input: passwordInput("\n"), createAdmin, output: { log() {} } }),
+    run({ argv: ["--name", "Empty", "--email", "empty@revex.test", "--password-stdin"], input: passwordInput("\n"), environment: bootstrapEnvironment, output: { log() {} } }),
     (error) => error.code === "EMPTY_PASSWORD"
   );
   const [[notCreated]] = await pool.query("SELECT COUNT(*) count FROM platform_admins WHERE email IN ('short@revex.test','cancel@revex.test','empty@revex.test')");

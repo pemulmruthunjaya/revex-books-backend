@@ -8,6 +8,39 @@ class BootstrapPromptError extends Error {
   }
 }
 
+const BOOTSTRAP_DB_ENV = {
+  host: "REVEX_BOOTSTRAP_DB_HOST",
+  port: "REVEX_BOOTSTRAP_DB_PORT",
+  user: "REVEX_BOOTSTRAP_DB_USER",
+  password: "REVEX_BOOTSTRAP_DB_PASSWORD",
+  database: "REVEX_BOOTSTRAP_DB_NAME",
+};
+
+const createBootstrapDatabase = (environment = process.env, mysql = require("mysql2/promise")) => {
+  const missing = Object.values(BOOTSTRAP_DB_ENV).filter((name) => !String(environment[name] || ""));
+  if (missing.length) {
+    throw new BootstrapPromptError(
+      "BOOTSTRAP_DB_CONFIG_MISSING",
+      `Missing bootstrap database settings: ${missing.join(", ")}`
+    );
+  }
+  const port = Number(environment[BOOTSTRAP_DB_ENV.port]);
+  if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) {
+    throw new BootstrapPromptError("BOOTSTRAP_DB_CONFIG_INVALID", "REVEX_BOOTSTRAP_DB_PORT must be a valid port");
+  }
+  return mysql.createPool({
+    host: environment[BOOTSTRAP_DB_ENV.host],
+    port,
+    user: environment[BOOTSTRAP_DB_ENV.user],
+    password: environment[BOOTSTRAP_DB_ENV.password],
+    database: environment[BOOTSTRAP_DB_ENV.database],
+    timezone: "Z",
+    waitForConnections: true,
+    connectionLimit: 2,
+    queueLimit: 0,
+  });
+};
+
 const argument = (argv, name) => {
   const index = argv.indexOf(`--${name}`);
   return index >= 0 ? String(argv[index + 1] || "").trim() : "";
@@ -112,7 +145,7 @@ const passwordFromStdin = ({ input = process.stdin } = {}) => {
 };
 
 const safeFailureMessage = (error) => {
-  if (["PROMPT_CANCELLED", "INTERACTIVE_TERMINAL_REQUIRED", "INVALID_ARGUMENTS", "PASSWORD_ARGUMENT_FORBIDDEN", "PASSWORD_STDIN_REQUIRES_PIPE", "PASSWORD_STDIN_FAILED", "PASSWORD_INPUT_TOO_LONG"].includes(error?.code)) return error.message;
+  if (["PROMPT_CANCELLED", "INTERACTIVE_TERMINAL_REQUIRED", "INVALID_ARGUMENTS", "PASSWORD_ARGUMENT_FORBIDDEN", "PASSWORD_STDIN_REQUIRES_PIPE", "PASSWORD_STDIN_FAILED", "PASSWORD_INPUT_TOO_LONG", "BOOTSTRAP_DB_CONFIG_MISSING", "BOOTSTRAP_DB_CONFIG_INVALID"].includes(error?.code)) return error.message;
   if (error?.code === "EMPTY_PASSWORD") return "Password cannot be empty";
   if (error?.code === "PASSWORD_TOO_SHORT") return "Password must be at least 8 characters";
   if (["PLATFORM_ADMIN_EXISTS", "INVALID_PLATFORM_ADMIN"].includes(error?.code)) return error.message;
@@ -130,6 +163,8 @@ const run = async ({
   output = console,
   input = process.stdin,
   promptOutput = process.stdout,
+  environment = process.env,
+  createDatabase = createBootstrapDatabase,
 } = {}) => {
   if (argv.some((value) => value === "--password" || value.startsWith("--password=") || value.startsWith("--password-stdin="))) {
     throw new BootstrapPromptError(
@@ -152,10 +187,14 @@ const run = async ({
 
   let runtime;
   try {
-    runtime = createAdmin ? null : {
-      createAdmin: require("../services/platformAdminService").createPlatformAdmin,
-      db: require("../db/connection"),
-    };
+    if (!createAdmin) {
+      const db = createDatabase(environment);
+      const service = require("../services/platformAdminService");
+      runtime = {
+        createAdmin: (value) => service.createPlatformAdmin(value, { executor: db }),
+        db,
+      };
+    }
     const admin = await (createAdmin || runtime.createAdmin)({ name, email, password });
     output.log("Platform administrator created successfully");
     return admin;
@@ -177,4 +216,4 @@ const main = async (options = {}) => {
 
 if (require.main === module) main().then((code) => { process.exitCode = code; });
 
-module.exports = { BootstrapPromptError, argument, concealedPasswordPrompt, main, passwordFromStdin, run, safeFailureMessage };
+module.exports = { BOOTSTRAP_DB_ENV, BootstrapPromptError, argument, concealedPasswordPrompt, createBootstrapDatabase, main, passwordFromStdin, run, safeFailureMessage };
