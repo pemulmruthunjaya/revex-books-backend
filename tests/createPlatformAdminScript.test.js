@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
-const { BootstrapPromptError, concealedPasswordPrompt, run, safeFailureMessage } = require("../scripts/createPlatformAdmin");
+const { Readable } = require("node:stream");
+const { BootstrapPromptError, concealedPasswordPrompt, main, passwordFromStdin, run, safeFailureMessage } = require("../scripts/createPlatformAdmin");
 
 class FakeInput extends EventEmitter {
   constructor() { super(); this.isTTY = true; this.isRaw = false; this.paused = true; this.rawChanges = []; }
@@ -81,6 +82,53 @@ test("safe errors distinguish validation, duplicate and database categories", ()
   assert.match(safeFailureMessage({ code: "PLATFORM_ADMIN_EXISTS", message: "Already exists" }), /Already exists/);
   assert.match(safeFailureMessage({ code: "ER_NO_SUCH_TABLE", message: "SQL details" }), /ER_NO_SUCH_TABLE/);
   assert.doesNotMatch(safeFailureMessage({ code: "ER_NO_SUCH_TABLE", message: "SQL details" }), /SQL details/);
+});
+
+test("password-stdin reads one line and preserves meaningful whitespace", async () => {
+  const input = Readable.from(["  meaningful password  \r\nignored second line\n"]);
+  input.isTTY = false;
+  assert.equal(await passwordFromStdin({ input }), "  meaningful password  ");
+});
+
+test("password-stdin success never writes plaintext", async () => {
+  const input = Readable.from(["stdin-safe-password\n"]);
+  input.isTTY = false;
+  const logs = [];
+  const calls = [];
+  await run({
+    argv: ["--name", "Admin", "--email", "admin@example.test", "--password-stdin"],
+    input,
+    createAdmin: async (value) => { calls.push(value); return { id: 1 }; },
+    output: { log: (message) => logs.push(message) },
+  });
+  assert.equal(calls[0].password, "stdin-safe-password");
+  assert.doesNotMatch(logs.join(" "), /stdin-safe-password/);
+});
+
+test("password-stdin rejects empty and short input before creation", async () => {
+  for (const [value, code] of [["\n", "EMPTY_PASSWORD"], ["short\n", "PASSWORD_TOO_SHORT"]]) {
+    let calls = 0;
+    const input = Readable.from([value]);
+    input.isTTY = false;
+    await assert.rejects(run({
+      argv: ["--name", "Admin", "--email", "admin@example.test", "--password-stdin"],
+      input,
+      createAdmin: async () => { calls += 1; },
+      output: { log() {} },
+    }), (error) => error.code === code);
+    assert.equal(calls, 0);
+  }
+});
+
+test("command-line password forms are forbidden and main returns non-zero", async () => {
+  const errors = [];
+  const code = await main({
+    argv: ["--name", "Admin", "--email", "admin@example.test", "--password=exposed-value"],
+    output: { log() {}, error: (message) => errors.push(message) },
+  });
+  assert.equal(code, 1);
+  assert.match(errors[0], /must not be supplied as command-line arguments/i);
+  assert.doesNotMatch(errors.join(" "), /exposed-value/);
 });
 
 const runTests = async () => {

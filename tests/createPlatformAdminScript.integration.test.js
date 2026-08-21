@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const bcrypt = require("bcryptjs");
 const mysql = require("mysql2/promise");
+const { Readable } = require("node:stream");
 const { createPlatformAdmin } = require("../services/platformAdminService");
 const { BootstrapPromptError, run } = require("../scripts/createPlatformAdmin");
 
@@ -17,11 +18,16 @@ const pool = mysql.createPool({
   timezone: "Z",
 });
 const createAdmin = (input) => createPlatformAdmin(input, { executor: pool });
-const args = ["--name", "Windows Bootstrap Admin", "--email", "windows.bootstrap@revex.test"];
+const args = ["--name", "Windows Bootstrap Admin", "--email", "windows.bootstrap@revex.test", "--password-stdin"];
+const passwordInput = (value) => {
+  const input = Readable.from([value]);
+  input.isTTY = false;
+  return input;
+};
 
 const runTest = async () => {
   const logs = [];
-  await run({ argv: args, passwordPrompt: async () => "Windows-safe-password", createAdmin, output: { log: (message) => logs.push(message) } });
+  await run({ argv: args, input: passwordInput("Windows-safe-password\r\n"), createAdmin, output: { log: (message) => logs.push(message) } });
   const [[stored]] = await pool.query("SELECT id, email, password_hash FROM platform_admins WHERE email=?", ["windows.bootstrap@revex.test"]);
   assert(stored);
   assert.notEqual(stored.password_hash, "Windows-safe-password");
@@ -29,20 +35,24 @@ const runTest = async () => {
   assert.doesNotMatch(logs.join(" "), /Windows-safe-password/);
 
   await assert.rejects(
-    run({ argv: args, passwordPrompt: async () => "Windows-safe-password", createAdmin, output: { log() {} } }),
+    run({ argv: args, input: passwordInput("Windows-safe-password\n"), createAdmin, output: { log() {} } }),
     (error) => error.code === "PLATFORM_ADMIN_EXISTS"
   );
   await assert.rejects(
-    run({ argv: ["--name", "Short", "--email", "short@revex.test"], passwordPrompt: async () => "short", createAdmin, output: { log() {} } }),
+    run({ argv: ["--name", "Short", "--email", "short@revex.test", "--password-stdin"], input: passwordInput("short\n"), createAdmin, output: { log() {} } }),
     (error) => error.code === "PASSWORD_TOO_SHORT"
   );
   await assert.rejects(
     run({ argv: ["--name", "Cancel", "--email", "cancel@revex.test"], passwordPrompt: async () => { throw new BootstrapPromptError("PROMPT_CANCELLED", "cancelled"); }, createAdmin, output: { log() {} } }),
     (error) => error.code === "PROMPT_CANCELLED"
   );
-  const [[notCreated]] = await pool.query("SELECT COUNT(*) count FROM platform_admins WHERE email IN ('short@revex.test','cancel@revex.test')");
+  await assert.rejects(
+    run({ argv: ["--name", "Empty", "--email", "empty@revex.test", "--password-stdin"], input: passwordInput("\n"), createAdmin, output: { log() {} } }),
+    (error) => error.code === "EMPTY_PASSWORD"
+  );
+  const [[notCreated]] = await pool.query("SELECT COUNT(*) count FROM platform_admins WHERE email IN ('short@revex.test','cancel@revex.test','empty@revex.test')");
   assert.equal(Number(notCreated.count), 0);
-  console.log("Platform admin bootstrap real-MySQL integration: 7 checks passed");
+  console.log("Platform admin bootstrap real-MySQL integration: 8 checks passed");
 };
 
 runTest()
