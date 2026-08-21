@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const db = require("../db/connection");
 const {
   activateSubscription,
+  activateSubscriptionByPlanCode,
   createTrialCompany,
   expireDueTrials,
   getEffectiveSubscription,
@@ -102,7 +103,10 @@ const createConnection = (state, options = {}) => {
         return [state.subscription ? [clone(state.subscription)] : []];
       }
       if (normalized.includes("FROM plans") && normalized.includes("FOR UPDATE")) {
-        return [state.plan && Number(params[0]) === state.plan.id ? [clone(state.plan)] : []];
+        const matches = normalized.includes("WHERE code = ?")
+          ? state.plan && params[0] === state.plan.code
+          : state.plan && Number(params[0]) === state.plan.id;
+        return [matches ? [clone(state.plan)] : []];
       }
       if (normalized.includes("FROM subscription_events")
         && normalized.includes("request_id = ?")) {
@@ -513,6 +517,30 @@ test("activation from expired trial succeeds", async () => {
   });
   assert.equal(state.subscription.status, "active");
   assert.equal(state.subscription.billing_cycle, "annual");
+});
+
+test("manual activation resolves an active plan by stable code", async () => {
+  const state = trialState();
+  await activateSubscriptionByPlanCode({
+    companyId: 1, planCode: " plan_2 ", billingCycle: "monthly",
+    idempotencyKey: "activate-by-code", connection: createConnection(state),
+  });
+  assert.equal(state.subscription.status, "active");
+  assert.equal(state.company.plan_id, 2);
+});
+
+test("manual activation rejects missing and inactive plan codes", async () => {
+  await expectCode(activateSubscriptionByPlanCode({
+    companyId: 1, planCode: "MISSING", billingCycle: "monthly",
+    idempotencyKey: "missing-code", connection: createConnection(trialState()),
+  }), "PLAN_NOT_FOUND");
+
+  const state = trialState();
+  state.plan.is_active = 0;
+  await expectCode(activateSubscriptionByPlanCode({
+    companyId: 1, planCode: "PLAN_2", billingCycle: "monthly",
+    idempotencyKey: "inactive-code", connection: createConnection(state),
+  }), "PLAN_INACTIVE");
 });
 
 test("invalid activation transition is rejected", async () => {

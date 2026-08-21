@@ -696,6 +696,48 @@ const activateSubscription = async ({
   });
 };
 
+const activateSubscriptionByPlanCode = async ({
+  companyId,
+  planCode,
+  billingCycle,
+  periodStartAt,
+  periodEndAt,
+  actor,
+  idempotencyKey,
+  connection: callerConnection,
+} = {}) => {
+  const normalizedCode = String(planCode || "").trim().toUpperCase();
+  if (!normalizedCode || normalizedCode.length > 50) {
+    throw serviceError("PLAN_NOT_FOUND", "Plan not found");
+  }
+
+  return withMutationTransaction(callerConnection, async (connection) => {
+    const [plans] = await connection.query(
+      `SELECT id, is_active
+         FROM plans
+        WHERE code = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [normalizedCode]
+    );
+    if (!plans.length) throw serviceError("PLAN_NOT_FOUND", "Plan not found");
+    if (Number(plans[0].is_active) !== 1) {
+      throw serviceError("PLAN_INACTIVE", "Plan is inactive");
+    }
+
+    return activateSubscription({
+      companyId,
+      planId: plans[0].id,
+      billingCycle,
+      periodStartAt,
+      periodEndAt,
+      actor,
+      idempotencyKey,
+      connection,
+    });
+  });
+};
+
 const normalizeBatchSize = (value) => {
   const batchSize = value === undefined || value === null || value === ""
     ? DEFAULT_EXPIRY_BATCH_SIZE
@@ -837,6 +879,7 @@ module.exports = {
   MAX_TRIAL_DAYS,
   SubscriptionServiceError,
   activateSubscription,
+  activateSubscriptionByPlanCode,
   createTrialCompany,
   expireDueTrials,
   getEffectiveSubscription,

@@ -51,13 +51,18 @@ test("every mounted tenant ERP prefix is protected", () => {
   assert.deepEqual(protectedPrefixes, expectedTenantPrefixes);
   assert.equal(new Set(protectedPrefixes).size, protectedPrefixes.length);
 
-  const exemptMounts = new Set(["/api/auth", "/api/subscription"]);
+  const exemptMounts = new Set(["/api/auth", "/api/platform", "/api/subscription"]);
   const mountedTenantPrefixes = parseMountedApiPrefixes()
     .filter((prefix) => !exemptMounts.has(prefix));
   assert.deepEqual(
     [...mountedTenantPrefixes].sort(),
     [...new Set(expectedTenantPrefixes)].sort()
   );
+});
+
+test("platform administration namespace is outside tenant commercial enforcement", () => {
+  assert.match(indexSource, /app\.use\("\/api\/platform", platformRoutes\)/);
+  assert.doesNotMatch(JSON.stringify(parseTenantPrefixes()), /\/api\/platform/);
 });
 
 test("central boundary is opt-in and orders authentication before subscription validation", () => {

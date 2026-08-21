@@ -5,8 +5,10 @@ const {
   SubscriptionServiceError,
 } = require("../services/subscriptionService");
 const {
+  createActivateSubscription,
   createGetSubscriptionStatus,
 } = require("../controllers/subscriptionController");
+const root = path.resolve(__dirname, "..");
 
 const makeResult = ({
   status = "active",
@@ -142,7 +144,6 @@ test("returns a safe 500 for unexpected service failures", async () => {
 });
 
 test("route registration uses auth only and remains outside commercial enforcement", async () => {
-  const root = path.resolve(__dirname, "..");
   const routeSource = fs.readFileSync(path.join(root, "routes", "subscriptionRoutes.js"), "utf8");
   const indexSource = fs.readFileSync(path.join(root, "index.js"), "utf8");
   assert.match(routeSource, /router\.get\("\/status", authMiddleware, getSubscriptionStatus\)/);
@@ -158,6 +159,70 @@ test("controller is read-only and invokes only the status lookup dependency", as
   const calls = await invoke({ result: makeResult() });
   assert.deepEqual(calls.service, [17]);
   assert.equal(calls.status[0], 200);
+});
+
+const invokeActivation = async ({ body = {}, result = makeResult(), error } = {}) => {
+  const calls = { activate: [], status: [], json: [], logs: [] };
+  const controller = createActivateSubscription({
+    activate: async (options) => {
+      calls.activate.push(options);
+      if (error) throw error;
+      return result;
+    },
+    logger: { error: (message) => calls.logs.push(message) },
+  });
+  const res = {
+    status(code) { calls.status.push(code); return this; },
+    json(value) { calls.json.push(value); return this; },
+  };
+  await controller({ body }, res);
+  return calls;
+};
+
+test("manual controller accepts only company, plan code, cycle and request id", async () => {
+  const calls = await invokeActivation({ body: {
+    company_id: 17,
+    plan_code: " plan_2 ",
+    billing_cycle: "MONTHLY",
+    request_id: "manual-activation-17-20260821",
+    plan_id: 999,
+    actor_user_id: 999,
+    status: "active",
+    price: 1,
+  } });
+  assert.equal(calls.status[0], 200);
+  assert.deepEqual(calls.activate[0], {
+    companyId: 17,
+    planCode: "PLAN_2",
+    billingCycle: "monthly",
+    idempotencyKey: "manual-activation-17-20260821",
+    actor: {
+      type: "system",
+      userId: null,
+      reason: "Manual RevEx Books activation",
+      metadata: { channel: "internal_admin" },
+    },
+  });
+});
+
+test("manual controller validates cycle, plan, company and request id", async () => {
+  for (const [body, code] of [
+    [{ company_id: 0, plan_code: "PLAN_2", billing_cycle: "monthly", request_id: "x" }, "INVALID_COMPANY_ID"],
+    [{ company_id: 17, billing_cycle: "monthly", request_id: "x" }, "PLAN_NOT_FOUND"],
+    [{ company_id: 17, plan_code: "PLAN_2", billing_cycle: "custom", request_id: "x" }, "INVALID_BILLING_CYCLE"],
+    [{ company_id: 17, plan_code: "PLAN_2", billing_cycle: "annual" }, "INVALID_IDEMPOTENCY_KEY"],
+  ]) {
+    const calls = await invokeActivation({ body });
+    assert.equal(calls.status[0], 400);
+    assert.equal(calls.json[0].code, code);
+    assert.equal(calls.activate.length, 0);
+  }
+});
+
+test("manual activation route is intentionally unmounted without platform admin", async () => {
+  const routeSource = fs.readFileSync(path.join(root, "routes", "subscriptionRoutes.js"), "utf8");
+  assert.doesNotMatch(routeSource, /router\.post\("\/activate"/);
+  assert.doesNotMatch(routeSource, /activateSubscription/);
 });
 
 const run = async () => {

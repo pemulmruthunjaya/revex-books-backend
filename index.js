@@ -40,6 +40,7 @@ const db = require("./db/connection");
 /* ================= AUTH ================= */
 const authRoutes = require("./routes/authRoutes");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
+const platformRoutes = require("./routes/platformRoutes");
 const usersRoutes = require("./routes/usersRoutes");
 const staffRoutes = require("./routes/staffRoutes");
 const auditLogRoutes = require("./routes/auditLogRoutes");
@@ -195,6 +196,7 @@ app.get("/", (req, res) => {
 ========================================================= */
 
 app.use("/api/auth", authRateLimiter, authRoutes);
+app.use("/api/platform", platformRoutes);
 
 app.use("/api/subscription", subscriptionRoutes);
 

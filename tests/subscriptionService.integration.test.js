@@ -3,6 +3,7 @@ const mysql = require("mysql2/promise");
 const db = require("../db/connection");
 const {
   activateSubscription,
+  activateSubscriptionByPlanCode,
   createTrialCompany,
   expireDueTrials,
   getEffectiveSubscription,
@@ -326,6 +327,58 @@ check("monthly activation updates subscription and preserves trial history", asy
   }), "IDEMPOTENCY_CONFLICT");
 });
 
+check("manual activation resolves plan code and remains idempotent", async () => {
+  const plan = await scalar("SELECT code FROM plans WHERE id=?", [activePlanId]);
+  const companyId = await insertCompany({ planId: activePlanId });
+  await insertSubscription({
+    companyId,
+    planId: activePlanId,
+    status: "trialing",
+    trialStart: "2026-08-01 00:00:00",
+    trialEnd: "2026-08-15 00:00:00",
+  });
+  const input = {
+    companyId,
+    planCode: plan.code,
+    billingCycle: "monthly",
+    idempotencyKey: unique("manual_code"),
+    actor: { type: "system", userId: null, reason: "Manual RevEx Books activation" },
+  };
+  const first = await activateSubscriptionByPlanCode(input);
+  const second = await activateSubscriptionByPlanCode(input);
+  assert.equal(first.access.valid, true);
+  assert.equal(second.subscription.status, "active");
+  const counts = await scalar(
+    `SELECT
+       (SELECT COUNT(*) FROM subscription_periods
+         WHERE subscription_id=cs.id AND period_type='paid') period_count,
+       (SELECT COUNT(*) FROM subscription_events
+         WHERE subscription_id=cs.id AND event_type='activated') event_count
+       FROM company_subscriptions cs WHERE company_id=?`,
+    [companyId]
+  );
+  assert.equal(Number(counts.period_count), 1);
+  assert.equal(Number(counts.event_count), 1);
+});
+
+check("manual activation rejects inactive plan code", async () => {
+  const plan = await scalar("SELECT code FROM plans WHERE id=?", [inactivePlanId]);
+  const companyId = await insertCompany({ planId: activePlanId });
+  await insertSubscription({
+    companyId,
+    planId: activePlanId,
+    status: "trialing",
+    trialStart: "2026-08-01 00:00:00",
+    trialEnd: "2026-08-15 00:00:00",
+  });
+  await expectCode(activateSubscriptionByPlanCode({
+    companyId,
+    planCode: plan.code,
+    billingCycle: "annual",
+    idempotencyKey: unique("inactive_manual"),
+  }), "PLAN_INACTIVE");
+});
+
 check("expired trial activates with an annual period", async () => {
   const companyId = await insertCompany({ planId: activePlanId });
   await insertSubscription({
@@ -391,6 +444,7 @@ check("invalid activation transition is rejected", async () => {
 
 check("event foreign-key failure rolls back every activation write", async () => {
   const companyId = await createServiceTrial();
+  const plan = await scalar("SELECT code FROM plans WHERE id=?", [activePlanId]);
   const before = await scalar(
     `SELECT c.plan_id company_plan_id, cs.status, cs.plan_id,
             cs.current_period_start_at, cs.current_period_end_at,
@@ -400,9 +454,9 @@ check("event foreign-key failure rolls back every activation write", async () =>
       WHERE c.id=?`,
     [companyId]
   );
-  await assert.rejects(activateSubscription({
+  await assert.rejects(activateSubscriptionByPlanCode({
     companyId,
-    planId: activePlanId,
+    planCode: plan.code,
     billingCycle: "monthly",
     idempotencyKey: unique("force_rollback"),
     actor: { type: "admin", userId: 2147483647 },
@@ -524,6 +578,13 @@ const createDueServiceTrial = async ({ offsetSeconds = 0 } = {}) => {
 };
 
 check("due trial expiry preserves tenant data and writes one deterministic event", async () => {
+  // Earlier constraint fixtures intentionally leave trial rows behind. Keep the
+  // scheduler assertions isolated to candidates created by the expiry checks.
+  await pool.query(
+    `UPDATE company_subscriptions
+        SET status='expired', expired_at=trial_end_at
+      WHERE status='trialing' AND trial_end_at <= UTC_TIMESTAMP()`
+  );
   const companyId = await createDueServiceTrial();
   const before = await scalar(
     `SELECT c.status company_status, c.plan_id company_plan_id,
