@@ -16,7 +16,7 @@
     "test:receipt-entry": "node tests/receiptEntryService.test.js",
     "test:vendor-payment": "node tests/vendorPaymentService.test.js",
     "test:journal-history": "node tests/journalEntryHistory.test.js",
-    "reset:user-password": "node scripts/reset-user-password.js"
+    "reset:user-password": "node scripts/resetInternalUserPassword.js"
   },
   "keywords": [],
   "author": "",
