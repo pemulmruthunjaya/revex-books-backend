@@ -93,7 +93,7 @@ const createPlatformPortalController = ({ executor = db, logger = console } = {}
           sp.source_key, p.name AS plan_name, p.code AS plan_code
         FROM subscription_periods sp LEFT JOIN plans p ON p.id = sp.plan_id
         WHERE sp.company_id = ? ORDER BY sp.starts_at DESC, sp.id DESC`, [companyId]),
-      executor.query(`SELECT id, event_type, from_status, to_status, effective_at, request_id, actor_type, reason
+      executor.query(`SELECT id, event_type, from_status, to_status, effective_at, request_id, actor_type, reason, metadata
         FROM subscription_events WHERE company_id = ? ORDER BY effective_at DESC, id DESC`, [companyId]),
     ]);
     if (!companiesFound.length) return res.status(404).json({ message: "Company not found" });
@@ -108,6 +108,7 @@ const createPlatformPortalController = ({ executor = db, logger = console } = {}
     const where = [];
     const params = [];
     if (status) { where.push("cs.status = ?"); params.push(status); }
+    if (String(req.query.due_soon || "") === "true") where.push("cs.current_period_end_at >= UTC_TIMESTAMP() AND cs.current_period_end_at < DATE_ADD(UTC_TIMESTAMP(), INTERVAL 30 DAY)");
     if (Number.isSafeInteger(planId) && planId > 0) { where.push("cs.plan_id = ?"); params.push(planId); }
     const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
     const [[countRows], [rows], [plans]] = await Promise.all([
@@ -123,7 +124,12 @@ const createPlatformPortalController = ({ executor = db, logger = console } = {}
     return res.json({ data: rows, plans, pagination: { page, page_size: pageSize, total: Number(countRows[0].total), total_pages: Math.max(1, Math.ceil(Number(countRows[0].total) / pageSize)) } });
   }, logger);
 
-  return { dashboard, companies, companyDetail, subscriptions };
+  const plans = asyncHandler(async (req, res) => {
+    const [rows] = await executor.query("SELECT id, code, name, price, is_active FROM plans WHERE is_active = 1 ORDER BY sort_order, name");
+    return res.json({ data: rows });
+  }, logger);
+
+  return { dashboard, companies, companyDetail, subscriptions, plans };
 };
 
 module.exports = { createPlatformPortalController, parsePage, ...createPlatformPortalController() };

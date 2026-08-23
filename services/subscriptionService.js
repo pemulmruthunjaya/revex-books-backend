@@ -738,6 +738,129 @@ const activateSubscriptionByPlanCode = async ({
   });
 };
 
+const platformMutationContext = ({ companyId, actor, idempotencyKey, operation }) => ({
+  companyId: asPositiveInteger(companyId, "COMPANY_NOT_FOUND", "companyId"),
+  actor: normalizeActor(actor),
+  key: normalizeIdempotencyKey(idempotencyKey),
+  operation,
+});
+
+const renewSubscription = async ({ companyId, planId, billingCycle, actor, idempotencyKey, connection: callerConnection } = {}) => {
+  const context = platformMutationContext({ companyId, actor, idempotencyKey, operation: "renew" });
+  const cycle = String(billingCycle || "").trim().toLowerCase();
+  if (!new Set(["monthly", "annual"]).has(cycle)) throw serviceError("INVALID_BILLING_CYCLE", "billingCycle must be monthly or annual");
+  return withMutationTransaction(callerConnection, async (connection) => {
+    const company = await lockCompany(connection, context.companyId);
+    const subscription = await lockSubscription(connection, context.companyId);
+    if (!subscription) throw serviceError("SUBSCRIPTION_NOT_PROVISIONED", "Subscription is not provisioned");
+    const resolvedPlanId = asPositiveInteger(planId || subscription.plan_id, "PLAN_NOT_FOUND", "planId");
+    const plan = await lockPlan(connection, resolvedPlanId);
+    const intent = { operation: context.operation, plan_id: resolvedPlanId, billing_cycle: cycle };
+    const requestId = `renewed:${context.key}`;
+    const retry = await idempotentResultOrConflict({ connection, companyId: context.companyId, subscriptionId: subscription.id, requestId, eventType: "renewed", intent });
+    if (retry) return retry;
+    const status = String(subscription.status || "").toLowerCase();
+    if (!new Set(["active", "expired"]).has(status)) throw serviceError("INVALID_SUBSCRIPTION_TRANSITION", `Cannot renew a subscription from status ${subscription.status}`);
+    const [clockRows] = await connection.query(
+      `SELECT CASE WHEN ? = 'active' AND ? IS NOT NULL AND ? > UTC_TIMESTAMP()
+        THEN ? ELSE UTC_TIMESTAMP() END AS starts_at`,
+      [status, subscription.current_period_end_at, subscription.current_period_end_at, subscription.current_period_end_at]
+    );
+    const period = await calculatePaidPeriod(connection, cycle, clockRows[0].starts_at, null);
+    await connection.query(`UPDATE company_subscriptions SET plan_id = ?, status = 'active', billing_cycle = ?,
+      subscription_start_at = COALESCE(subscription_start_at, ?), current_period_start_at = ?, current_period_end_at = ?,
+      expired_at = NULL, suspended_at = NULL, suspension_reason = NULL, cancelled_at = NULL,
+      activation_source = 'manual_admin', version = version + 1 WHERE id = ? AND company_id = ?`,
+    [resolvedPlanId, cycle, period.starts_at, period.starts_at, period.ends_at, subscription.id, context.companyId]);
+    await connection.query("UPDATE companies SET plan_id = ? WHERE id = ?", [resolvedPlanId, context.companyId]);
+    await connection.query(`INSERT INTO subscription_periods (subscription_id, company_id, plan_id, period_type,
+      billing_cycle, starts_at, ends_at, status, source_key, staff_limit_snapshot, user_limit_snapshot, price_snapshot, currency)
+      VALUES (?, ?, ?, 'paid', ?, ?, ?, 'active', ?, ?, ?, ?, 'INR')`,
+    [subscription.id, context.companyId, resolvedPlanId, cycle, period.starts_at, period.ends_at, `renewal:${context.key}`, plan.max_staff, plan.max_users, plan.price]);
+    await insertEvent(connection, { subscriptionId: subscription.id, companyId: context.companyId, eventType: "renewed", fromStatus: subscription.status, toStatus: "active", oldPlanId: subscription.plan_id || company.plan_id, newPlanId: resolvedPlanId, effectiveAt: period.starts_at, actor: context.actor, requestId, metadata: { intent, period_start_at: period.starts_at, period_end_at: period.ends_at, actor_metadata: context.actor.metadata } });
+    return getEffectiveSubscription(context.companyId, { connection });
+  });
+};
+
+const changeSubscriptionPlan = async ({ companyId, planId, actor, idempotencyKey, connection: callerConnection } = {}) => {
+  const context = platformMutationContext({ companyId, actor, idempotencyKey, operation: "change_plan" });
+  const normalizedPlanId = asPositiveInteger(planId, "PLAN_NOT_FOUND", "planId");
+  return withMutationTransaction(callerConnection, async (connection) => {
+    const company = await lockCompany(connection, context.companyId);
+    const subscription = await lockSubscription(connection, context.companyId);
+    if (!subscription) throw serviceError("SUBSCRIPTION_NOT_PROVISIONED", "Subscription is not provisioned");
+    await lockPlan(connection, normalizedPlanId);
+    const intent = { operation: context.operation, plan_id: normalizedPlanId };
+    const requestId = `plan-changed:${context.key}`;
+    const retry = await idempotentResultOrConflict({ connection, companyId: context.companyId, subscriptionId: subscription.id, requestId, eventType: "plan_changed", intent });
+    if (retry) return retry;
+    if (!new Set(["active", "trialing", "suspended"]).has(String(subscription.status).toLowerCase())) throw serviceError("INVALID_SUBSCRIPTION_TRANSITION", `Cannot change plan from status ${subscription.status}`);
+    if (Number(subscription.plan_id) === normalizedPlanId) throw serviceError("PLAN_UNCHANGED", "The subscription already uses this plan");
+    const [clockRows] = await connection.query("SELECT UTC_TIMESTAMP() AS effective_at");
+    await connection.query("UPDATE company_subscriptions SET plan_id = ?, version = version + 1 WHERE id = ? AND company_id = ?", [normalizedPlanId, subscription.id, context.companyId]);
+    await connection.query("UPDATE companies SET plan_id = ? WHERE id = ?", [normalizedPlanId, context.companyId]);
+    await insertEvent(connection, { subscriptionId: subscription.id, companyId: context.companyId, eventType: "plan_changed", fromStatus: subscription.status, toStatus: subscription.status, oldPlanId: subscription.plan_id || company.plan_id, newPlanId: normalizedPlanId, effectiveAt: clockRows[0].effective_at, actor: context.actor, requestId, metadata: { intent, proration: false, billing_change: false, actor_metadata: context.actor.metadata } });
+    return getEffectiveSubscription(context.companyId, { connection });
+  });
+};
+
+const extendSubscriptionTrial = async ({ companyId, extensionDays, actor, idempotencyKey, connection: callerConnection } = {}) => {
+  const context = platformMutationContext({ companyId, actor, idempotencyKey, operation: "extend_trial" });
+  const days = Number(extensionDays);
+  if (!Number.isSafeInteger(days) || days < 1 || days > 90) throw serviceError("INVALID_TRIAL_EXTENSION", "extensionDays must be between 1 and 90");
+  return withMutationTransaction(callerConnection, async (connection) => {
+    await lockCompany(connection, context.companyId);
+    const subscription = await lockSubscription(connection, context.companyId);
+    if (!subscription) throw serviceError("SUBSCRIPTION_NOT_PROVISIONED", "Subscription is not provisioned");
+    const intent = { operation: context.operation, extension_days: days };
+    const requestId = `trial-extended:${context.key}`;
+    const retry = await idempotentResultOrConflict({ connection, companyId: context.companyId, subscriptionId: subscription.id, requestId, eventType: "trial_extended", intent });
+    if (retry) return retry;
+    if (String(subscription.status).toLowerCase() !== "trialing" || !subscription.trial_end_at) throw serviceError("INVALID_SUBSCRIPTION_TRANSITION", `Cannot extend trial from status ${subscription.status}`);
+    const [clockRows] = await connection.query("SELECT UTC_TIMESTAMP() AS effective_at, DATE_ADD(?, INTERVAL ? DAY) AS new_trial_end_at", [subscription.trial_end_at, days]);
+    const effectiveAt = clockRows[0].effective_at, newEnd = clockRows[0].new_trial_end_at;
+    await connection.query("UPDATE company_subscriptions SET trial_end_at = ?, current_period_end_at = ?, trial_duration_days = COALESCE(trial_duration_days, 0) + ?, version = version + 1 WHERE id = ? AND company_id = ?", [newEnd, newEnd, days, subscription.id, context.companyId]);
+    await connection.query("UPDATE subscription_periods SET ends_at = ? WHERE subscription_id = ? AND company_id = ? AND period_type = 'trial' AND status = 'active'", [newEnd, subscription.id, context.companyId]);
+    await connection.query(`INSERT INTO trial_extensions (subscription_id, company_id, previous_trial_end_at, new_trial_end_at,
+      extension_days, reason, granted_by_type, granted_by_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [subscription.id, context.companyId, subscription.trial_end_at, newEnd, days, context.actor.reason || "Platform administrator trial extension", context.actor.type, context.actor.userId]);
+    await insertEvent(connection, { subscriptionId: subscription.id, companyId: context.companyId, eventType: "trial_extended", fromStatus: subscription.status, toStatus: subscription.status, oldPlanId: subscription.plan_id, newPlanId: subscription.plan_id, effectiveAt, actor: context.actor, requestId, metadata: { intent, previous_trial_end_at: subscription.trial_end_at, new_trial_end_at: newEnd, actor_metadata: context.actor.metadata } });
+    return getEffectiveSubscription(context.companyId, { connection });
+  });
+};
+
+const suspendSubscription = async ({ companyId, reason, actor, idempotencyKey, connection: callerConnection } = {}) => {
+  const context = platformMutationContext({ companyId, actor: { ...actor, reason: String(reason || actor?.reason || "").trim() || null }, idempotencyKey, operation: "suspend" });
+  return withMutationTransaction(callerConnection, async (connection) => {
+    await lockCompany(connection, context.companyId); const subscription = await lockSubscription(connection, context.companyId);
+    if (!subscription) throw serviceError("SUBSCRIPTION_NOT_PROVISIONED", "Subscription is not provisioned");
+    const intent = { operation: context.operation, reason: context.actor.reason };
+    const requestId = `suspended:${context.key}`;
+    const retry = await idempotentResultOrConflict({ connection, companyId: context.companyId, subscriptionId: subscription.id, requestId, eventType: "suspended", intent }); if (retry) return retry;
+    if (String(subscription.status).toLowerCase() !== "active") throw serviceError("INVALID_SUBSCRIPTION_TRANSITION", `Cannot suspend a subscription from status ${subscription.status}`);
+    const [clockRows] = await connection.query("SELECT UTC_TIMESTAMP() AS effective_at"); const effectiveAt = clockRows[0].effective_at;
+    await connection.query("UPDATE company_subscriptions SET status = 'suspended', suspended_at = ?, suspension_reason = ?, version = version + 1 WHERE id = ? AND company_id = ?", [effectiveAt, context.actor.reason, subscription.id, context.companyId]);
+    await insertEvent(connection, { subscriptionId: subscription.id, companyId: context.companyId, eventType: "suspended", fromStatus: subscription.status, toStatus: "suspended", oldPlanId: subscription.plan_id, newPlanId: subscription.plan_id, effectiveAt, actor: context.actor, requestId, metadata: { intent, actor_metadata: context.actor.metadata } });
+    return getEffectiveSubscription(context.companyId, { connection });
+  });
+};
+
+const reactivateSubscription = async ({ companyId, actor, idempotencyKey, connection: callerConnection } = {}) => {
+  const context = platformMutationContext({ companyId, actor, idempotencyKey, operation: "reactivate" });
+  return withMutationTransaction(callerConnection, async (connection) => {
+    await lockCompany(connection, context.companyId); const subscription = await lockSubscription(connection, context.companyId);
+    if (!subscription) throw serviceError("SUBSCRIPTION_NOT_PROVISIONED", "Subscription is not provisioned");
+    const intent = { operation: context.operation };
+    const requestId = `reactivated:${context.key}`;
+    const retry = await idempotentResultOrConflict({ connection, companyId: context.companyId, subscriptionId: subscription.id, requestId, eventType: "reactivated", intent }); if (retry) return retry;
+    if (String(subscription.status).toLowerCase() !== "suspended") throw serviceError("INVALID_SUBSCRIPTION_TRANSITION", `Cannot reactivate a subscription from status ${subscription.status}`);
+    const [clockRows] = await connection.query("SELECT UTC_TIMESTAMP() AS effective_at, (? IS NULL OR ? > UTC_TIMESTAMP()) AS period_is_valid", [subscription.current_period_end_at, subscription.current_period_end_at]);
+    if (Number(clockRows[0].period_is_valid) !== 1) throw serviceError("PAID_PERIOD_EXPIRED", "The paid period expired while suspended; renew the subscription instead");
+    await connection.query("UPDATE company_subscriptions SET status = 'active', suspended_at = NULL, suspension_reason = NULL, version = version + 1 WHERE id = ? AND company_id = ?", [subscription.id, context.companyId]);
+    await insertEvent(connection, { subscriptionId: subscription.id, companyId: context.companyId, eventType: "reactivated", fromStatus: subscription.status, toStatus: "active", oldPlanId: subscription.plan_id, newPlanId: subscription.plan_id, effectiveAt: clockRows[0].effective_at, actor: context.actor, requestId, metadata: { intent, current_period_end_at: subscription.current_period_end_at, actor_metadata: context.actor.metadata } });
+    return getEffectiveSubscription(context.companyId, { connection });
+  });
+};
+
 const normalizeBatchSize = (value) => {
   const batchSize = value === undefined || value === null || value === ""
     ? DEFAULT_EXPIRY_BATCH_SIZE
@@ -880,7 +1003,12 @@ module.exports = {
   SubscriptionServiceError,
   activateSubscription,
   activateSubscriptionByPlanCode,
+  changeSubscriptionPlan,
   createTrialCompany,
+  extendSubscriptionTrial,
   expireDueTrials,
   getEffectiveSubscription,
+  reactivateSubscription,
+  renewSubscription,
+  suspendSubscription,
 };
