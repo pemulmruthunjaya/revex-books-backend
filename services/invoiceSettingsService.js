@@ -37,6 +37,20 @@ const DEFAULTS = Object.freeze({
   accent_color: "#2563eb",
   logo_size: "medium",
   table_density: "normal",
+  barcodeScan: false,
+  defaultUnit: "PCS",
+  partyWiseItemRate: false,
+  description: false,
+  itemWiseDiscount: true,
+  overallBillDiscount: false,
+  additionalDiscount: false,
+  roundOff: false,
+  itemWiseTax: true,
+  mrp: true,
+  serialImei: false,
+  batchNo: false,
+  mfgDate: false,
+  expDate: false,
 });
 
 const ALLOWED_ENUMS = {
@@ -49,7 +63,15 @@ const ALLOWED_ENUMS = {
   table_density: ["compact", "normal"],
 };
 
-const BOOLEAN_FIELDS = Object.keys(DEFAULTS).filter((key) => key.startsWith("show_"));
+const SALES_BOOLEAN_FIELDS = [
+  "barcodeScan", "partyWiseItemRate", "description", "itemWiseDiscount",
+  "overallBillDiscount", "additionalDiscount", "roundOff", "itemWiseTax",
+  "mrp", "serialImei", "batchNo", "mfgDate", "expDate",
+];
+const BOOLEAN_FIELDS = [
+  ...Object.keys(DEFAULTS).filter((key) => key.startsWith("show_")),
+  ...SALES_BOOLEAN_FIELDS,
+];
 const TEXT_FIELDS = [
   "invoice_title",
   "bill_to_label",
@@ -119,6 +141,13 @@ const validateCustomization = (input = {}) => {
     throw error;
   }
   settings.accent_color = accentColor.toLowerCase();
+  const defaultUnit = String(input.defaultUnit ?? DEFAULTS.defaultUnit).trim();
+  if (!defaultUnit || defaultUnit.length > 30 || !/^[\p{L}\p{N} ._\/-]+$/u.test(defaultUnit)) {
+    const error = new Error("Default unit is invalid");
+    error.status = 400;
+    throw error;
+  }
+  settings.defaultUnit = defaultUnit;
 
   if (settings.paper_size === "Thermal80") settings.orientation = "portrait";
   return settings;
@@ -152,13 +181,22 @@ const updateSettings = async (companyId, input) => {
   const current = await getSettings(companyId);
   const customization = validateCustomization({ ...current, ...input });
 
+  const requestedPrefix = input.prefix === undefined
+    ? current.prefix
+    : String(input.prefix).trim().replace(/-+$/, "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,18}$/.test(requestedPrefix)) {
+    const error = new Error("Invoice prefix must be 1-19 letters, numbers, underscores, or hyphens");
+    error.status = 400;
+    throw error;
+  }
+
   await db.query(
     `UPDATE invoice_settings
-     SET customization_json = ?
+     SET prefix = ?, customization_json = ?
      WHERE company_id = ?`,
-    [JSON.stringify(customization), companyId]
+    [requestedPrefix, JSON.stringify(customization), companyId]
   );
-  return { prefix: current.prefix, current_number: current.current_number, ...customization };
+  return { prefix: requestedPrefix, current_number: current.current_number, ...customization };
 };
 
 module.exports = {
@@ -166,4 +204,5 @@ module.exports = {
   ensureInvoiceCustomizationSchema,
   getSettings,
   updateSettings,
+  validateCustomization,
 };
