@@ -211,10 +211,192 @@ const generateInvoiceNumber = async (company_id, executor = db) => {
  * ✅ CREATE INVOICE + STOCK FIX
  * ===============================
  */
-const invoiceCreationError = (message, status = 400) => {
+const invoiceCreationError = (message, status = 400, code) => {
   const error = new Error(message);
   error.status = status;
+  if (code) error.code = code;
   return error;
+};
+
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+const nullableText = (value, maxLength) => {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (maxLength && text.length > maxLength) {
+    throw invoiceCreationError(`Value must not exceed ${maxLength} characters`);
+  }
+  return text;
+};
+
+const normalizeInvoiceType = (value, { required = false } = {}) => {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    if (required) throw invoiceCreationError("invoice_type must be CASH or CREDIT", 400, "INVALID_INVOICE_TYPE");
+    return null;
+  }
+  const type = String(value).trim().toUpperCase();
+  if (!["CASH", "CREDIT"].includes(type)) {
+    throw invoiceCreationError("invoice_type must be CASH or CREDIT", 400, "INVALID_INVOICE_TYPE");
+  }
+  return type;
+};
+
+const normalizeCreditDays = (value) => {
+  const days = typeof value === "number" ? value : Number(String(value).trim());
+  if (!Number.isInteger(days) || days < 0 || days > 3650) {
+    throw invoiceCreationError("credit_days must be an integer between 0 and 3650", 400, "INVALID_CREDIT_DAYS");
+  }
+  return days;
+};
+
+const normalizeInvoiceDate = (value) => {
+  const text = String(value || "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    throw invoiceCreationError("invoice_date is invalid");
+  }
+  const [year, month, day] = text.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    throw invoiceCreationError("invoice_date is invalid");
+  }
+  return text;
+};
+
+const addCalendarDays = (dateText, days) => {
+  const normalized = normalizeInvoiceDate(dateText);
+  const [year, month, day] = normalized.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return date.toISOString().slice(0, 10);
+};
+
+const dateValueToText = (value) => {
+  if (!value) return null;
+  if (value instanceof Date) {
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, "0");
+    const day = String(value.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+  return normalizeInvoiceDate(String(value).slice(0, 10));
+};
+
+const resolveInvoicePersistence = async ({ body, companyId, connection, existing = null, creating = false }) => {
+  const explicitType = hasOwn(body, "invoice_type");
+  const currentType = normalizeInvoiceType(existing?.invoice_type);
+  const invoiceType = creating
+    ? normalizeInvoiceType(body.invoice_type, { required: true })
+    : explicitType
+      ? normalizeInvoiceType(body.invoice_type)
+      : currentType;
+
+  if (!creating && currentType && !invoiceType) {
+    throw invoiceCreationError(
+      "A classified invoice cannot be changed back to Legacy/Unspecified",
+      409,
+      "INVOICE_TYPE_CHANGE_NOT_ALLOWED"
+    );
+  }
+  if (!creating && currentType === "CREDIT" && invoiceType === "CASH") {
+    throw invoiceCreationError(
+      "Credit invoices cannot be converted to Cash without an accounting conversion workflow",
+      409,
+      "INVOICE_TYPE_CHANGE_NOT_ALLOWED"
+    );
+  }
+
+  const invoiceDate = normalizeInvoiceDate(body.invoice_date);
+  if (!invoiceType) {
+    const customerName = nullableText(
+      hasOwn(body, "customer_name") ? body.customer_name : existing?.customer_name,
+      255
+    );
+    if (!customerName) throw invoiceCreationError("Customer name is required for a legacy invoice");
+    return {
+      invoiceType: null,
+      customerId: hasOwn(body, "customer_id") ? (body.customer_id || null) : (existing?.customer_id || null),
+      customerName,
+      customerPhone: hasOwn(body, "customer_phone") ? nullableText(body.customer_phone, 20) : (existing?.customer_phone || null),
+      cashCustomerName: existing?.cash_customer_name || null,
+      cashCustomerMobile: existing?.cash_customer_mobile || null,
+      creditDays: existing?.credit_days ?? null,
+      dueDate: dateValueToText(existing?.due_date),
+      shippingAddress: hasOwn(body, "shipping_address") ? nullableText(body.shipping_address) : (existing?.shipping_address || null),
+    };
+  }
+
+  if (invoiceType === "CASH") {
+    if (body.customer_id !== null && body.customer_id !== undefined && String(body.customer_id).trim() !== "") {
+      throw invoiceCreationError("customer_id must be null for a Cash invoice", 400, "CASH_CUSTOMER_ID_NOT_ALLOWED");
+    }
+    if ((body.credit_days !== null && body.credit_days !== undefined && String(body.credit_days).trim() !== "") ||
+        (body.due_date !== null && body.due_date !== undefined && String(body.due_date).trim() !== "")) {
+      throw invoiceCreationError(
+        "credit_days and due_date must be null for a Cash invoice",
+        400,
+        "CASH_CREDIT_TERMS_NOT_ALLOWED"
+      );
+    }
+    const cashCustomerName = nullableText(
+      hasOwn(body, "cash_customer_name")
+        ? body.cash_customer_name
+        : existing?.cash_customer_name || (!currentType ? existing?.customer_name : null),
+      255
+    );
+    const cashCustomerMobile = nullableText(
+      hasOwn(body, "cash_customer_mobile")
+        ? body.cash_customer_mobile
+        : existing?.cash_customer_mobile || (!currentType ? existing?.customer_phone : null),
+      50
+    );
+    return {
+      invoiceType,
+      customerId: null,
+      customerName: cashCustomerName || "Cash Customer",
+      customerPhone: cashCustomerMobile ? cashCustomerMobile.slice(0, 20) : null,
+      cashCustomerName,
+      cashCustomerMobile,
+      creditDays: null,
+      dueDate: null,
+      shippingAddress: hasOwn(body, "shipping_address") ? nullableText(body.shipping_address) : (existing?.shipping_address || null),
+    };
+  }
+
+  const customerIdValue = hasOwn(body, "customer_id") ? body.customer_id : existing?.customer_id;
+  const customerId = Number(customerIdValue);
+  if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+    throw invoiceCreationError("customer_id is required for a Credit invoice", 400, "CREDIT_CUSTOMER_REQUIRED");
+  }
+  const [customers] = await connection.query(
+    `SELECT id, name, phone, credit_period_days, shipping_address, billing_address
+     FROM customers WHERE id=? AND company_id=? LIMIT 1`,
+    [customerId, companyId]
+  );
+  if (!customers.length) {
+    throw invoiceCreationError("Customer not found for this company", 404, "CREDIT_CUSTOMER_NOT_FOUND");
+  }
+  const customer = customers[0];
+  const sameCreditCustomer = currentType === "CREDIT" && Number(existing?.customer_id) === customerId;
+  const creditDays = hasOwn(body, "credit_days")
+    ? normalizeCreditDays(body.credit_days)
+    : sameCreditCustomer && existing?.credit_days !== null && existing?.credit_days !== undefined
+      ? normalizeCreditDays(existing.credit_days)
+      : normalizeCreditDays(customer.credit_period_days ?? 30);
+  const shippingAddress = hasOwn(body, "shipping_address")
+    ? nullableText(body.shipping_address)
+    : sameCreditCustomer
+      ? (existing?.shipping_address || null)
+      : nullableText(customer.shipping_address || customer.billing_address);
+
+  return {
+    invoiceType,
+    customerId,
+    customerName: sameCreditCustomer ? existing.customer_name : String(customer.name).trim(),
+    customerPhone: sameCreditCustomer ? (existing.customer_phone || null) : nullableText(customer.phone, 20),
+    cashCustomerName: null,
+    cashCustomerMobile: null,
+    creditDays,
+    dueDate: addCalendarDays(invoiceDate, creditDays),
+    shippingAddress,
+  };
 };
 
 const ensureInvoiceCreationSchema = async () => {
@@ -225,13 +407,20 @@ const ensureInvoiceCreationSchema = async () => {
 const createInvoiceRecord = async ({ body, user, connection = db }) => {
     await ensureInvoiceCreationSchema();
 
-    const { invoice_date, customer_id, customer_name, items } = body;
+    const { invoice_date, items } = body;
     const company_id = user.company_id;
     const created_by = user.user_id;
 
-    if (!invoice_date || !customer_name || !items?.length) {
+    if (!invoice_date || !items?.length) {
       throw invoiceCreationError("Missing required fields");
     }
+
+    const party = await resolveInvoicePersistence({
+      body,
+      companyId: company_id,
+      connection,
+      creating: true,
+    });
 
     const invoice_number = await generateInvoiceNumber(company_id, connection);
 
@@ -309,16 +498,25 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
     // ✅ INSERT INVOICE
     const [invoiceResult] = await connection.query(
       `INSERT INTO invoices 
-      (company_id, created_by, invoice_number, invoice_date, customer_id, customer_name, subtotal, discount_amount, tax_amount, cgst, sgst, igst,
+      (company_id, created_by, invoice_number, invoice_date, invoice_type, customer_id, customer_name, customer_phone,
+       cash_customer_name, cash_customer_mobile, credit_days, due_date, shipping_address,
+       subtotal, discount_amount, tax_amount, cgst, sgst, igst,
        overall_discount_type, overall_discount_value, overall_discount_amount, additional_discount_type, additional_discount_value, additional_discount_amount, round_off_amount, total_amount)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         company_id,
         created_by,
         invoice_number,
         invoice_date,
-        customer_id || null,
-        customer_name,
+        party.invoiceType,
+        party.customerId,
+        party.customerName,
+        party.customerPhone,
+        party.cashCustomerName,
+        party.cashCustomerMobile,
+        party.creditDays,
+        party.dueDate,
+        party.shippingAddress,
         subtotal,
         discount_amount,
         tax_amount,
@@ -386,6 +584,10 @@ exports.createInvoiceRecord = createInvoiceRecord;
 exports.ensureInvoiceCreationSchema = ensureInvoiceCreationSchema;
 exports.calculateInvoiceLevelTotals = calculateInvoiceLevelTotals;
 exports.normalizeAdvancedItem = normalizeAdvancedItem;
+exports.normalizeInvoiceType = normalizeInvoiceType;
+exports.normalizeCreditDays = normalizeCreditDays;
+exports.addCalendarDays = addCalendarDays;
+exports.resolveInvoicePersistence = resolveInvoicePersistence;
 
 exports.createInvoice = async (req, res) => {
   const connection = await db.getConnection();
@@ -403,6 +605,7 @@ exports.createInvoice = async (req, res) => {
     console.error("❌ CREATE ERROR:", error);
     res.status(error.status || 500).json({
       message: error.status ? error.message : "Server error",
+      ...(error.code ? { code: error.code } : {}),
     });
   } finally {
     connection.release();
@@ -463,9 +666,9 @@ exports.getInvoiceById = async (req, res) => {
     const [invoice] = await db.query(
       `SELECT
         i.*,
-        c.phone AS customer_phone,
+        COALESCE(i.customer_phone, c.phone) AS customer_phone,
         c.email AS customer_email,
-        c.address AS customer_address,
+        COALESCE(i.shipping_address, c.shipping_address, c.billing_address, c.address) AS customer_address,
         LOWER(COALESCE(i.status, 'pending')) AS status,
         CASE
           WHEN LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
@@ -481,7 +684,7 @@ exports.getInvoiceById = async (req, res) => {
         ) AS due_amount
        FROM invoices i
        LEFT JOIN customers c
-         ON c.name = i.customer_name
+         ON c.id = i.customer_id
         AND c.company_id = i.company_id
        LEFT JOIN (
          SELECT invoice_id, company_id, SUM(amount) AS paid_amount
@@ -580,9 +783,9 @@ exports.updateInvoice = async (req, res) => {
 
     const { id } = req.params;
     const company_id = req.user.company_id;
-    const { invoice_date, customer_id, customer_name, items } = req.body;
+    const { invoice_date, items } = req.body;
 
-    if (!invoice_date || !customer_name || !items?.length) {
+    if (!invoice_date || !items?.length) {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
@@ -590,7 +793,9 @@ exports.updateInvoice = async (req, res) => {
     await connection.beginTransaction();
 
     const [invoiceRows] = await connection.query(
-      "SELECT id, status FROM invoices WHERE id=? AND company_id=?",
+      `SELECT id, status, invoice_type, customer_id, customer_name, customer_phone,
+              cash_customer_name, cash_customer_mobile, credit_days, due_date, shipping_address
+       FROM invoices WHERE id=? AND company_id=? FOR UPDATE`,
       [id, company_id]
     );
 
@@ -598,6 +803,13 @@ exports.updateInvoice = async (req, res) => {
       await connection.rollback();
       return res.status(404).json({ message: "Invoice not found" });
     }
+
+    const party = await resolveInvoicePersistence({
+      body: req.body,
+      companyId: company_id,
+      connection,
+      existing: invoiceRows[0],
+    });
 
     const [oldItems] = await connection.query(
       "SELECT * FROM invoice_items WHERE invoice_id=? AND company_id=?",
@@ -705,13 +917,22 @@ exports.updateInvoice = async (req, res) => {
 
     await connection.query(
       `UPDATE invoices
-       SET invoice_date=?, customer_id=?, customer_name=?, subtotal=?, discount_amount=?, tax_amount=?, cgst=?, sgst=?, igst=?,
+       SET invoice_date=?, invoice_type=?, customer_id=?, customer_name=?, customer_phone=?,
+           cash_customer_name=?, cash_customer_mobile=?, credit_days=?, due_date=?, shipping_address=?,
+           subtotal=?, discount_amount=?, tax_amount=?, cgst=?, sgst=?, igst=?,
            overall_discount_type=?, overall_discount_value=?, overall_discount_amount=?, additional_discount_type=?, additional_discount_value=?, additional_discount_amount=?, round_off_amount=?, total_amount=?, status=?
        WHERE id=? AND company_id=?`,
       [
         invoice_date,
-        customer_id || null,
-        customer_name,
+        party.invoiceType,
+        party.customerId,
+        party.customerName,
+        party.customerPhone,
+        party.cashCustomerName,
+        party.cashCustomerMobile,
+        party.creditDays,
+        party.dueDate,
+        party.shippingAddress,
         subtotal,
         discount_amount,
         tax_amount,
@@ -761,6 +982,7 @@ exports.updateInvoice = async (req, res) => {
     console.error("Update invoice error:", error);
     res.status(error.status || 500).json({
       message: error.status ? error.message : "Server error",
+      ...(error.code ? { code: error.code } : {}),
       ...(error.status ? {} : { error: error.message }),
     });
   } finally {
