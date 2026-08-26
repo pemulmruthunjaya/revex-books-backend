@@ -27,6 +27,7 @@ router.post("/", authMiddleware, safe(invoiceController.createInvoice));
 router.get("/", authMiddleware, safe(invoiceController.getInvoices));
 
 router.get("/party-item-rate", authMiddleware, safe(invoiceController.getPartyItemRate));
+router.get("/next-number", authMiddleware, safe(invoiceController.getNextInvoiceNumber));
 
 /* ================= GET ONE ================= */
 router.get("/:id", authMiddleware, safe(invoiceController.getInvoiceById));

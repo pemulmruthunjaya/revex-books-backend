@@ -206,6 +206,22 @@ const generateInvoiceNumber = async (company_id, executor = db) => {
   return invoiceNumber;
 };
 
+const previewNextInvoiceNumber = async (companyId, executor = db) => {
+  const [settings] = await executor.query(
+    "SELECT prefix, current_number FROM invoice_settings WHERE company_id=? LIMIT 1",
+    [companyId]
+  );
+  const prefix = settings[0]?.prefix || "INV";
+  const currentNumber = Number(settings[0]?.current_number || 1);
+  const nextNumberFromExisting = await getNextInvoiceNumberFromExisting(
+    companyId,
+    prefix,
+    executor
+  );
+  const number = Math.max(currentNumber, nextNumberFromExisting);
+  return `${prefix}-${String(number).padStart(4, "0")}`;
+};
+
 /**
  * ===============================
  * ✅ CREATE INVOICE + STOCK FIX
@@ -588,6 +604,7 @@ exports.normalizeInvoiceType = normalizeInvoiceType;
 exports.normalizeCreditDays = normalizeCreditDays;
 exports.addCalendarDays = addCalendarDays;
 exports.resolveInvoicePersistence = resolveInvoicePersistence;
+exports.previewNextInvoiceNumber = previewNextInvoiceNumber;
 
 exports.createInvoice = async (req, res) => {
   const connection = await db.getConnection();
@@ -609,6 +626,16 @@ exports.createInvoice = async (req, res) => {
     });
   } finally {
     connection.release();
+  }
+};
+
+exports.getNextInvoiceNumber = async (req, res) => {
+  try {
+    const nextInvoiceNumber = await previewNextInvoiceNumber(req.user.company_id);
+    return res.json({ next_invoice_number: nextInvoiceNumber });
+  } catch (error) {
+    console.error("Next invoice number preview error:", error);
+    return res.status(500).json({ message: "Unable to preview next invoice number" });
   }
 };
 
