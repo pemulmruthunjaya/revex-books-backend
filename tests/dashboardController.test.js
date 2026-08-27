@@ -66,6 +66,16 @@ const run = async () => {
   assert.match(activityQuery, /p\.receipt_entry_id IS NULL/, "linked receipt payments must be suppressed");
   assert.match(activityQuery, /NOT EXISTS[\s\S]*receipt_entries linked_receipt/, "linked receipt journals must be suppressed");
   assert.doesNotMatch(activityQuery, /je\.source_type\s*=\s*'manual'/, "standalone manual journals must remain visible");
+  assert.match(
+    activityQuery,
+    /CONVERT\(re\.receipt_number USING utf8mb4\) COLLATE utf8mb4_0900_ai_ci/,
+    "mixed-collation receipt references must be normalized in UNION output"
+  );
+  assert.match(
+    activityQuery,
+    /WHERE re\.company_id=\? AND re\.receipt_date BETWEEN \? AND \?/,
+    "receipt filters must remain directly indexable"
+  );
 
   const beforeInvalid = calls.length;
   const invalid = responseFor();

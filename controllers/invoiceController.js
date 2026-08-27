@@ -1,4 +1,7 @@
 const db = require("../db/connection");
+const crypto = require("node:crypto");
+const { ensureReceiptEntrySchema, normalizePaymentMethod, postReceipt } = require("../services/receiptEntryService");
+const { postSalesInvoiceJournal } = require("../services/salesInvoiceAccountingService");
 
 let invoiceStatusColumnReady = false;
 let invoiceMrpColumnsReady = false;
@@ -244,6 +247,36 @@ const nullableText = (value, maxLength) => {
   return text;
 };
 
+const normalizeRequestId = (value) => nullableText(value, 80);
+const settlementIdempotencyKey = (requestId, companyId, invoiceId) => requestId
+  ? `invoice:${crypto.createHash("sha256").update(requestId).digest("hex")}`
+  : `invoice-${companyId}-${invoiceId}-settlement`;
+
+const normalizeSettlement = (value, totalAmount) => {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw invoiceCreationError("settlement must be an object", 400, "INVALID_SETTLEMENT");
+  }
+  const amount = Number(value.amount);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > Number(totalAmount)) {
+    throw invoiceCreationError(
+      "settlement amount must be greater than zero and cannot exceed invoice total",
+      400,
+      "INVALID_SETTLEMENT_AMOUNT"
+    );
+  }
+  const accountId = Number(value.account_id);
+  if (!Number.isSafeInteger(accountId) || accountId <= 0) {
+    throw invoiceCreationError("settlement account_id is required", 400, "INVALID_SETTLEMENT_ACCOUNT");
+  }
+  return {
+    amount,
+    paymentMethod: normalizePaymentMethod(value.payment_method),
+    accountId,
+    referenceNumber: nullableText(value.reference_number, 120),
+  };
+};
+
 const normalizeInvoiceType = (value, { required = false } = {}) => {
   if (value === null || value === undefined || String(value).trim() === "") {
     if (required) throw invoiceCreationError("invoice_type must be CASH or CREDIT", 400, "INVALID_INVOICE_TYPE");
@@ -426,9 +459,21 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
     const { invoice_date, items } = body;
     const company_id = user.company_id;
     const created_by = user.user_id;
+    const requestId = normalizeRequestId(body.request_id);
 
     if (!invoice_date || !items?.length) {
       throw invoiceCreationError("Missing required fields");
+    }
+
+    if (requestId) {
+      const [existing] = await connection.query(
+        `SELECT id invoice_id,invoice_number,payment_status
+         FROM invoices WHERE company_id=? AND request_id=? LIMIT 1 FOR UPDATE`,
+        [company_id, requestId]
+      );
+      if (existing.length) {
+        return { message: "Invoice request already processed", ...existing[0], duplicate: true };
+      }
     }
 
     const party = await resolveInvoicePersistence({
@@ -510,6 +555,7 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
     const sgst = tax_amount / 2;
     const igst = 0;
     const total_amount = invoiceLevel.total;
+    const settlement = normalizeSettlement(body.settlement, total_amount);
 
     // ✅ INSERT INVOICE
     const [invoiceResult] = await connection.query(
@@ -517,8 +563,9 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
       (company_id, created_by, invoice_number, invoice_date, invoice_type, customer_id, customer_name, customer_phone,
        cash_customer_name, cash_customer_mobile, credit_days, due_date, shipping_address,
        subtotal, discount_amount, tax_amount, cgst, sgst, igst,
-       overall_discount_type, overall_discount_value, overall_discount_amount, additional_discount_type, additional_discount_value, additional_discount_amount, round_off_amount, total_amount)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       overall_discount_type, overall_discount_value, overall_discount_amount, additional_discount_type, additional_discount_value, additional_discount_amount, round_off_amount, total_amount,
+       request_id,payment_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         company_id,
         created_by,
@@ -546,7 +593,9 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
         invoiceLevel.additional.value,
         invoiceLevel.additional.amount,
         invoiceLevel.roundOff,
-        total_amount
+        total_amount,
+        requestId,
+        "UNPAID"
       ]
     );
 
@@ -589,10 +638,40 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
       );
     }
 
+    const salesJournal = await postSalesInvoiceJournal(connection, {
+      id: invoice_id,
+      company_id,
+      created_by,
+      invoice_number,
+      invoice_date,
+      total_amount,
+      tax_amount,
+    });
+
+    let receipt = null;
+    if (settlement) {
+      receipt = await postReceipt(connection, {
+        receipt_date: invoice_date,
+        receipt_type: "CUSTOMER",
+        customer_id: party.customerId,
+        invoice_id,
+        received_in_account_id: settlement.accountId,
+        amount: settlement.amount,
+        payment_method: settlement.paymentMethod,
+        reference_number: settlement.referenceNumber,
+        narration: `Settlement for ${invoice_number}`,
+        idempotency_key: settlementIdempotencyKey(requestId, company_id, invoice_id),
+      }, user);
+    }
+
     return {
       message: "Invoice created & stock updated ✅",
       invoice_id,
-      invoice_number
+      invoice_number,
+      payment_status: receipt?.invoice_status || "UNPAID",
+      sales_journal_id: salesJournal.id,
+      receipt_id: receipt?.id || null,
+      duplicate: false,
     };
 };
 
@@ -605,27 +684,121 @@ exports.normalizeCreditDays = normalizeCreditDays;
 exports.addCalendarDays = addCalendarDays;
 exports.resolveInvoicePersistence = resolveInvoicePersistence;
 exports.previewNextInvoiceNumber = previewNextInvoiceNumber;
+exports.normalizeSettlement = normalizeSettlement;
+exports.normalizeRequestId = normalizeRequestId;
+exports.settlementIdempotencyKey = settlementIdempotencyKey;
 
-exports.createInvoice = async (req, res) => {
-  const connection = await db.getConnection();
+const runInvoiceCreationTransaction = async ({ connection, body, user, createRecord = createInvoiceRecord }) => {
+  await connection.beginTransaction();
   try {
-    await connection.beginTransaction();
-    const invoice = await createInvoiceRecord({
-      body: req.body,
-      user: req.user,
-      connection,
-    });
-    await connection.commit();
-    res.status(201).json(invoice);
+    const invoice = await createRecord({ body, user, connection });
+    if (invoice.duplicate) await connection.rollback();
+    else await connection.commit();
+    return invoice;
   } catch (error) {
     await connection.rollback();
+    throw error;
+  }
+};
+exports.runInvoiceCreationTransaction = runInvoiceCreationTransaction;
+
+const IDEMPOTENCY_LOOKUP_DELAYS_MS = Object.freeze([0, 15, 30, 60, 120, 120]);
+const INVOICE_DEADLOCK_RETRY_BASE_MS = Object.freeze([25, 60]);
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const isMySqlDeadlock = (error) =>
+  error?.code === "ER_LOCK_DEADLOCK" || Number(error?.errno) === 1213;
+const isInvoiceRequestRace = (error) => {
+  if (isMySqlDeadlock(error)) return true;
+  if (error?.code !== "ER_DUP_ENTRY" && Number(error?.errno) !== 1062) return false;
+  return /uq_invoices_company_request/i.test(
+    `${error?.sqlMessage || ""} ${error?.message || ""}`
+  );
+};
+const resolveCommittedInvoiceRequest = async ({
+  companyId,
+  requestId,
+  executor = db,
+  sleep = wait,
+  delays = IDEMPOTENCY_LOOKUP_DELAYS_MS,
+}) => {
+  for (const delay of delays) {
+    if (delay) await sleep(delay);
+    const [existing] = await executor.query(
+      `SELECT id invoice_id,invoice_number,payment_status
+       FROM invoices WHERE company_id=? AND request_id=? LIMIT 1`,
+      [companyId, requestId]
+    );
+    if (existing.length) {
+      return {
+        message: "Invoice request already processed",
+        ...existing[0],
+        duplicate: true,
+      };
+    }
+  }
+  return null;
+};
+exports.IDEMPOTENCY_LOOKUP_DELAYS_MS = IDEMPOTENCY_LOOKUP_DELAYS_MS;
+exports.INVOICE_DEADLOCK_RETRY_BASE_MS = INVOICE_DEADLOCK_RETRY_BASE_MS;
+exports.isMySqlDeadlock = isMySqlDeadlock;
+exports.isInvoiceRequestRace = isInvoiceRequestRace;
+exports.resolveCommittedInvoiceRequest = resolveCommittedInvoiceRequest;
+
+const executeInvoiceCreationRequest = async ({
+  body,
+  user,
+  connectionProvider = () => db.getConnection(),
+  createRecord = createInvoiceRecord,
+  resolveWinner = resolveCommittedInvoiceRequest,
+  sleep = wait,
+  random = Math.random,
+  retryBaseDelays = INVOICE_DEADLOCK_RETRY_BASE_MS,
+}) => {
+  const requestId = normalizeRequestId(body.request_id);
+  for (let attempt = 0; ; attempt += 1) {
+    const connection = await connectionProvider();
+    try {
+      const invoice = await runInvoiceCreationTransaction({
+        body,
+        user,
+        connection,
+        createRecord,
+      });
+      return { invoice, status: invoice.duplicate ? 200 : 201 };
+    } catch (error) {
+      if (requestId && isInvoiceRequestRace(error)) {
+        const existing = await resolveWinner({
+          companyId: user.company_id,
+          requestId,
+        });
+        if (existing) return { invoice: existing, status: 200 };
+      }
+      if (!requestId || !isMySqlDeadlock(error) || attempt >= retryBaseDelays.length) {
+        throw error;
+      }
+      const jitter = Math.floor(random() * 21);
+      await sleep(retryBaseDelays[attempt] + jitter);
+    } finally {
+      connection.release();
+    }
+  }
+};
+exports.executeInvoiceCreationRequest = executeInvoiceCreationRequest;
+
+exports.createInvoice = async (req, res) => {
+  await ensureReceiptEntrySchema();
+  try {
+    const result = await executeInvoiceCreationRequest({
+      body: req.body,
+      user: req.user,
+    });
+    res.status(result.status).json(result.invoice);
+  } catch (error) {
     console.error("❌ CREATE ERROR:", error);
     res.status(error.status || 500).json({
       message: error.status ? error.message : "Server error",
       ...(error.code ? { code: error.code } : {}),
     });
-  } finally {
-    connection.release();
   }
 };
 
@@ -649,15 +822,15 @@ exports.getInvoices = async (req, res) => {
     const [rows] = await db.query(
       `SELECT
         i.*,
-        LOWER(COALESCE(i.status, 'pending')) AS status,
+        COALESCE(LOWER(i.payment_status), LOWER(COALESCE(i.status, 'pending'))) AS status,
         CASE
-          WHEN LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
+          WHEN i.payment_status IS NULL AND LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
           ELSE COALESCE(payment_totals.paid_amount, 0)
         END AS paid_amount,
         GREATEST(
           i.total_amount -
           CASE
-            WHEN LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
+            WHEN i.payment_status IS NULL AND LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
             ELSE COALESCE(payment_totals.paid_amount, 0)
           END,
           0
@@ -696,15 +869,15 @@ exports.getInvoiceById = async (req, res) => {
         COALESCE(i.customer_phone, c.phone) AS customer_phone,
         c.email AS customer_email,
         COALESCE(i.shipping_address, c.shipping_address, c.billing_address, c.address) AS customer_address,
-        LOWER(COALESCE(i.status, 'pending')) AS status,
+        COALESCE(LOWER(i.payment_status), LOWER(COALESCE(i.status, 'pending'))) AS status,
         CASE
-          WHEN LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
+          WHEN i.payment_status IS NULL AND LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
           ELSE COALESCE(payment_totals.paid_amount, 0)
         END AS paid_amount,
         GREATEST(
           i.total_amount -
           CASE
-            WHEN LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
+            WHEN i.payment_status IS NULL AND LOWER(COALESCE(i.status, '')) = 'paid' THEN i.total_amount
             ELSE COALESCE(payment_totals.paid_amount, 0)
           END,
           0
@@ -770,6 +943,19 @@ exports.deleteInvoice = async (req, res) => {
       return res.status(404).json({ message: "Invoice not found" });
     }
 
+    const [financialLinks] = await db.query(
+      `SELECT
+         EXISTS(SELECT 1 FROM journal_entries WHERE company_id=? AND source_type='sales_invoice' AND source_id=?) has_sales_journal,
+         EXISTS(SELECT 1 FROM payments WHERE company_id=? AND invoice_id=?) has_payments`,
+      [company_id, id, company_id, id]
+    );
+    if (financialLinks[0]?.has_sales_journal || financialLinks[0]?.has_payments) {
+      return res.status(409).json({
+        code: "POSTED_INVOICE_DELETE_NOT_ALLOWED",
+        message: "A financially posted invoice cannot be deleted; a reversal workflow is required",
+      });
+    }
+
     const [items] = await db.query(
       "SELECT * FROM invoice_items WHERE invoice_id=? AND company_id=?",
       [id, company_id]
@@ -829,6 +1015,19 @@ exports.updateInvoice = async (req, res) => {
     if (!invoiceRows.length) {
       await connection.rollback();
       return res.status(404).json({ message: "Invoice not found" });
+    }
+
+    const [postedRows] = await connection.query(
+      `SELECT id FROM journal_entries
+       WHERE company_id=? AND source_type='sales_invoice' AND source_id=? LIMIT 1`,
+      [company_id, id]
+    );
+    if (postedRows.length) {
+      await connection.rollback();
+      return res.status(409).json({
+        code: "POSTED_INVOICE_EDIT_NOT_ALLOWED",
+        message: "A financially posted invoice cannot be edited; a reversal workflow is required",
+      });
     }
 
     const party = await resolveInvoicePersistence({
@@ -1073,12 +1272,17 @@ exports.updateInvoiceStatus = async (req, res) => {
   await ensureInvoiceStatusColumn();
 
   const [result] = await db.query(
-    "UPDATE invoices SET status=? WHERE id=? AND company_id=?",
+    "UPDATE invoices SET status=? WHERE id=? AND company_id=? AND payment_status IS NULL",
     [status, id, company_id]
   );
 
   if (result.affectedRows === 0) {
-    return res.status(404).json({ message: "Invoice not found" });
+    const [rows] = await db.query("SELECT id FROM invoices WHERE id=? AND company_id=?", [id, company_id]);
+    if (!rows.length) return res.status(404).json({ message: "Invoice not found" });
+    return res.status(409).json({
+      code: "PAYMENT_STATUS_MANUAL_UPDATE_NOT_ALLOWED",
+      message: "Payment status for a classified invoice is derived from settlement records",
+    });
   }
 
   res.json({ message: "Status updated" });

@@ -158,7 +158,8 @@ const getDashboardSnapshot = async (companyId, range) => {
          FROM bills b LEFT JOIN vendors v ON v.id=b.vendor_id AND v.company_id=b.company_id
          WHERE b.company_id=? AND b.bill_date BETWEEN ? AND ?
          UNION ALL
-         SELECT 'Receipt',re.receipt_date,re.receipt_number,
+         SELECT 'Receipt',re.receipt_date,
+                CONVERT(re.receipt_number USING utf8mb4) COLLATE utf8mb4_0900_ai_ci,
                 COALESCE(c.name,CASE WHEN re.receipt_type='CUSTOMER' THEN 'Customer receipt' ELSE 'Receipt entry' END),re.amount,
                 CONCAT('/receipt-entry/',re.id)
          FROM receipt_entries re LEFT JOIN customers c ON c.id=re.customer_id AND c.company_id=re.company_id

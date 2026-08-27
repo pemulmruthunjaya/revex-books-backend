@@ -1,3 +1,4 @@
+const crypto = require("node:crypto");
 const db = require("../db/connection");
 
 const RECEIPT_TYPES = Object.freeze(["CUSTOMER", "OTHER", "ADVANCE"]);
@@ -8,6 +9,12 @@ const EXCLUDED_CREDIT_PATTERN =
   /(cash|bank|salary|wages|expense|purchase|receivable|debtor)/i;
 const receiptJournalSourceType = (receiptType) =>
   receiptType === "CUSTOMER" ? "customer_receipt" : "receipt_entry";
+const pendingReceiptNumber = (idempotencyKey) =>
+  `PENDING-${crypto
+    .createHash("sha256")
+    .update(idempotencyKey)
+    .digest("hex")
+    .slice(0, 48)}`;
 
 let schemaReady = false;
 
@@ -99,6 +106,14 @@ const isCashBankAccount = (account) =>
   (CASH_PATTERN.test(accountSearchText(account)) ||
     BANK_PATTERN.test(accountSearchText(account)));
 
+const isCashAccount = (account) =>
+  String(account.account_type || "").toUpperCase() === "ASSET" &&
+  CASH_PATTERN.test(accountSearchText(account));
+
+const isBankAccount = (account) =>
+  String(account.account_type || "").toUpperCase() === "ASSET" &&
+  BANK_PATTERN.test(accountSearchText(account));
+
 const isOtherCreditAccount = (account) =>
   CREDIT_ACCOUNT_TYPES.has(String(account.account_type || "").toUpperCase()) &&
   !EXCLUDED_CREDIT_PATTERN.test(accountSearchText(account));
@@ -124,7 +139,7 @@ const listAccountOptions = async (companyId) => {
 const ensureSystemAccount = async (
   connection,
   companyId,
-  { code, name, type, alternateCode = code, alternateName = name }
+  { code, name, type, alternateCode = code, alternateName = name, description = "System ledger used by Receipt Entry" }
 ) => {
   const [rows] = await connection.query(
     `SELECT id, account_code, account_name, account_type
@@ -156,7 +171,7 @@ const ensureSystemAccount = async (
       name,
       type,
       type === "ASSET" ? "DEBIT" : "CREDIT",
-      "System ledger used by Receipt Entry",
+      description,
       companyId,
     ]
   );
@@ -193,13 +208,49 @@ const clean = (value, maxLength) => {
   return text ? text.slice(0, maxLength) : null;
 };
 
-const createReceipt = async (body, user) => {
-  await ensureReceiptEntrySchema();
+const PAYMENT_METHODS = Object.freeze(["cash", "upi", "bank", "card", "cheque", "other"]);
+const normalizePaymentMethod = (value) => {
+  const text = String(value || "").trim().toLowerCase();
+  const aliases = { "bank transfer": "bank", "bank_transfer": "bank" };
+  const method = aliases[text] || text;
+  if (!PAYMENT_METHODS.includes(method)) {
+    throw Object.assign(new Error("Unsupported payment method"), {
+      status: 400,
+      code: "INVALID_PAYMENT_METHOD",
+    });
+  }
+  return method;
+};
+
+const validateReceiptDestination = (account, method) => {
+  const valid = method === "cash"
+    ? isCashAccount(account)
+    : ["bank", "upi", "card", "cheque"].includes(method)
+      ? isBankAccount(account)
+      : isCashBankAccount(account);
+  if (!valid) {
+    throw Object.assign(new Error(`Selected account is not valid for ${method}`), {
+      status: 400,
+      code: "INVALID_SETTLEMENT_ACCOUNT",
+    });
+  }
+};
+
+const paymentStatusFor = (total, paid) => {
+  const invoiceTotal = Number(total || 0);
+  const paidTotal = Number(paid || 0);
+  if (paidTotal >= invoiceTotal) return "PAID";
+  if (paidTotal > 0) return "PARTIAL";
+  return "UNPAID";
+};
+
+const postReceipt = async (connection, body, user) => {
   const companyId = Number(user.company_id);
   const createdBy = Number(user.user_id);
   const receiptType = String(body.receipt_type || "").toUpperCase();
   const amount = Number(body.amount || 0);
   const idempotencyKey = clean(body.idempotency_key, 80);
+  const paymentMethod = normalizePaymentMethod(body.payment_mode || body.payment_method || "cash");
 
   if (!body.receipt_date) throw Object.assign(new Error("Receipt date is required"), { status: 400 });
   if (!RECEIPT_TYPES.includes(receiptType)) {
@@ -214,7 +265,7 @@ const createReceipt = async (body, user) => {
   if (!idempotencyKey) {
     throw Object.assign(new Error("Submission key is required"), { status: 400 });
   }
-  if (receiptType !== "OTHER" && !body.customer_id) {
+  if (receiptType === "ADVANCE" && !body.customer_id) {
     throw Object.assign(new Error("Customer is required"), { status: 400 });
   }
   if (receiptType === "CUSTOMER" && !body.invoice_id) {
@@ -224,21 +275,14 @@ const createReceipt = async (body, user) => {
     throw Object.assign(new Error("Received From account is required"), { status: 400 });
   }
 
-  const connection = await db.getConnection();
-  try {
-    await connection.beginTransaction();
-
-    const [duplicates] = await connection.query(
+  const [duplicates] = await connection.query(
       `SELECT id, receipt_number, journal_entry_id
        FROM receipt_entries
        WHERE company_id = ? AND idempotency_key = ?
        LIMIT 1`,
       [companyId, idempotencyKey]
     );
-    if (duplicates.length) {
-      await connection.rollback();
-      return { ...duplicates[0], duplicate: true };
-    }
+  if (duplicates.length) return { ...duplicates[0], duplicate: true };
 
     const [receivedInRows] = await connection.query(
       `SELECT a.*, p.account_name AS parent_account_name
@@ -250,9 +294,10 @@ const createReceipt = async (body, user) => {
        FOR UPDATE`,
       [body.received_in_account_id, companyId]
     );
-    if (!receivedInRows.length || !isCashBankAccount(receivedInRows[0])) {
-      throw Object.assign(new Error("Received In must be a valid Cash or Bank ledger"), { status: 400 });
-    }
+  if (!receivedInRows.length) {
+    throw Object.assign(new Error("Received In account was not found for this company"), { status: 400 });
+  }
+  validateReceiptDestination(receivedInRows[0], paymentMethod);
 
     let customer = null;
     let invoice = null;
@@ -271,22 +316,23 @@ const createReceipt = async (body, user) => {
       customer = customers[0];
     }
 
-    if (receiptType === "CUSTOMER") {
+  if (receiptType === "CUSTOMER") {
       const [invoices] = await connection.query(
-        `SELECT id, invoice_number, total_amount, status
+        `SELECT id, invoice_number, total_amount, status, customer_id, customer_name
          FROM invoices
-         WHERE id = ? AND company_id = ? AND customer_name = ?
+         WHERE id = ? AND company_id = ?
          LIMIT 1
          FOR UPDATE`,
-        [body.invoice_id, companyId, customer.name]
+        [body.invoice_id, companyId]
       );
       if (!invoices.length) {
-        throw Object.assign(
-          new Error("Selected invoice does not belong to this customer"),
-          { status: 400 }
-        );
+        throw Object.assign(new Error("Invoice not found for this company"), { status: 404 });
       }
       invoice = invoices[0];
+      if (customer && Number(invoice.customer_id) !== Number(customer.id) &&
+          !(invoice.customer_id == null && invoice.customer_name === customer.name)) {
+        throw Object.assign(new Error("Selected invoice does not belong to this customer"), { status: 400 });
+      }
       if (String(invoice.status || "").toLowerCase() === "cancelled") {
         throw Object.assign(new Error("A cancelled invoice cannot receive payment"), { status: 400 });
       }
@@ -345,7 +391,7 @@ const createReceipt = async (body, user) => {
       );
     }
 
-    const pendingNumber = `PENDING-${idempotencyKey}`;
+    const pendingNumber = pendingReceiptNumber(idempotencyKey);
     const [receiptResult] = await connection.query(
       `INSERT INTO receipt_entries
        (receipt_number, receipt_date, receipt_type, customer_id, invoice_id,
@@ -361,7 +407,7 @@ const createReceipt = async (body, user) => {
         receivedInRows[0].id,
         receivedFromAccount.id,
         amount,
-        clean(body.payment_mode, 40) || "Cash",
+        paymentMethod,
         clean(body.reference_number, 120),
         clean(body.narration, 500),
         companyId,
@@ -427,7 +473,7 @@ const createReceipt = async (body, user) => {
           companyId,
           amount,
           body.receipt_date,
-          clean(body.payment_mode, 40) || "Cash",
+          paymentMethod,
           clean(body.reference_number, 120),
           receiptId,
         ]
@@ -435,10 +481,16 @@ const createReceipt = async (body, user) => {
       paymentId = paymentResult.insertId;
       const totalPaid = alreadyPaid + amount;
       remainingAmount = Math.max(Number(invoice.total_amount) - totalPaid, 0);
-      invoiceStatus = remainingAmount <= 0 ? "paid" : totalPaid > 0 ? "partial" : "pending";
+      invoiceStatus = paymentStatusFor(invoice.total_amount, totalPaid);
       await connection.query(
-        "UPDATE invoices SET status = ? WHERE id = ? AND company_id = ?",
-        [invoiceStatus, invoice.id, companyId]
+        `UPDATE invoices
+         SET payment_status=?,
+             status=CASE
+               WHEN LOWER(COALESCE(status,'')) IN ('pending','partial','paid') THEN LOWER(?)
+               ELSE status
+             END
+         WHERE id=? AND company_id=?`,
+        [invoiceStatus, invoiceStatus, invoice.id, companyId]
       );
     }
 
@@ -460,7 +512,6 @@ const createReceipt = async (body, user) => {
       [journalId, paymentId, advanceId, receiptId, companyId]
     );
 
-    await connection.commit();
     return {
       id: receiptId,
       receipt_number: receiptNumber,
@@ -471,15 +522,25 @@ const createReceipt = async (body, user) => {
       remaining_amount: remainingAmount,
       duplicate: false,
     };
+};
+
+const createReceipt = async (body, user) => {
+  await ensureReceiptEntrySchema();
+  const connection = await db.getConnection();
+  const idempotencyKey = clean(body.idempotency_key, 80);
+  try {
+    await connection.beginTransaction();
+    const result = await postReceipt(connection, body, user);
+    if (result.duplicate) await connection.rollback();
+    else await connection.commit();
+    return result;
   } catch (error) {
     await connection.rollback();
     if (error.code === "ER_DUP_ENTRY" && idempotencyKey) {
       const [duplicates] = await db.query(
-        `SELECT id, receipt_number, journal_entry_id
-         FROM receipt_entries
-         WHERE company_id = ? AND idempotency_key = ?
-         LIMIT 1`,
-        [companyId, idempotencyKey]
+        `SELECT id, receipt_number, journal_entry_id FROM receipt_entries
+         WHERE company_id=? AND idempotency_key=? LIMIT 1`,
+        [Number(user.company_id), idempotencyKey]
       );
       if (duplicates.length) return { ...duplicates[0], duplicate: true };
     }
@@ -492,11 +553,18 @@ const createReceipt = async (body, user) => {
 module.exports = {
   RECEIPT_TYPES,
   createReceipt,
+  postReceipt,
   ensureReceiptEntrySchema,
   getCustomerOpenInvoices,
   ensureSystemAccount,
   isCashBankAccount,
+  isCashAccount,
+  isBankAccount,
   isOtherCreditAccount,
   listAccountOptions,
   receiptJournalSourceType,
+  normalizePaymentMethod,
+  validateReceiptDestination,
+  paymentStatusFor,
+  pendingReceiptNumber,
 };

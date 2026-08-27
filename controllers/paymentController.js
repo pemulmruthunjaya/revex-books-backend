@@ -1,18 +1,5 @@
 const db = require("../db/connection");
-
-let invoiceStatusColumnReady = false;
-
-const ensureInvoiceStatusColumn = async () => {
-  if (invoiceStatusColumnReady) {
-    return;
-  }
-
-  await db.query(
-    "ALTER TABLE invoices MODIFY status VARCHAR(30) NOT NULL DEFAULT 'pending'"
-  );
-
-  invoiceStatusColumnReady = true;
-};
+const { createReceipt } = require("../services/receiptEntryService");
 
 /**
  * ADD PAYMENT
@@ -21,12 +8,12 @@ const ensureInvoiceStatusColumn = async () => {
 exports.addPayment = async (req, res) => {
   try {
     const { invoiceId } = req.params;
-    const { amount, payment_date, payment_method, reference_number } = req.body;
+    const { amount, payment_date, payment_method, reference_number, account_id, request_id } = req.body;
     const paymentAmount = Number(amount || 0);
 
-    if (!paymentAmount || !payment_date || !payment_method) {
+    if (!paymentAmount || !payment_date || !payment_method || !account_id || !request_id) {
       return res.status(400).json({
-        message: "amount, payment_date, payment_method are required"
+        message: "amount, payment_date, payment_method, account_id and request_id are required"
       });
     }
 
@@ -37,11 +24,8 @@ exports.addPayment = async (req, res) => {
     }
 
     const company_id = req.user.company_id;
-    await ensureInvoiceStatusColumn();
-
-    // 🔍 Fetch invoice
     const [invoices] = await db.query(
-      "SELECT id, total_amount, status FROM invoices WHERE id = ? AND company_id = ?",
+      "SELECT id,customer_id,total_amount,status FROM invoices WHERE id=? AND company_id=?",
       [invoiceId, company_id]
     );
 
@@ -55,60 +39,29 @@ exports.addPayment = async (req, res) => {
       return res.status(400).json({ message: "Cannot pay a cancelled invoice" });
     }
 
-    // 🔢 Get total paid so far
-    const [paidRows] = await db.query(
-      "SELECT IFNULL(SUM(amount),0) AS paid FROM payments WHERE invoice_id = ? AND company_id = ?",
-      [invoiceId, company_id]
-    );
+    const result = await createReceipt({
+      receipt_date: payment_date,
+      receipt_type: "CUSTOMER",
+      customer_id: invoice.customer_id,
+      invoice_id: Number(invoiceId),
+      received_in_account_id: Number(account_id),
+      amount: paymentAmount,
+      payment_method,
+      reference_number: reference_number || null,
+      narration: `Invoice payment ${invoiceId}`,
+      idempotency_key: String(request_id),
+    }, req.user);
 
-    const totalPaid = Number(paidRows[0].paid || 0);
-    const remaining = Number(invoice.total_amount || 0) - totalPaid;
-
-    if (paymentAmount > remaining) {
-      return res.status(400).json({
-        message: "Payment exceeds remaining invoice amount"
-      });
-    }
-
-    // 💾 Insert payment
-    await db.query(
-      `INSERT INTO payments (
-        invoice_id,
-        company_id,
-        amount,
-        payment_date,
-        payment_method,
-        reference_number
-      ) VALUES (?, ?, ?, ?, ?, ?)`,
-      [
-        invoiceId,
-        company_id,
-        paymentAmount,
-        payment_date,
-        payment_method,
-        reference_number || null
-      ]
-    );
-
-    const newPaidAmount = totalPaid + paymentAmount;
-    const status = newPaidAmount >= Number(invoice.total_amount || 0)
-      ? "paid"
-      : "partial";
-
-    await db.query(
-      "UPDATE invoices SET status = ? WHERE id = ? AND company_id = ?",
-      [status, invoiceId, company_id]
-    );
-
-    res.status(201).json({
-      message: "Payment recorded successfully",
-      remaining_amount: remaining - paymentAmount
+    res.status(result.duplicate ? 200 : 201).json({
+      message: result.duplicate ? "Payment request already processed" : "Payment recorded successfully",
+      ...result,
     });
 
   } catch (error) {
     console.error("Add payment error:", error);
-    res.status(500).json({
-      message: "Failed to record payment"
+    res.status(error.status || 500).json({
+      message: error.status ? error.message : "Failed to record payment",
+      ...(error.code ? { code: error.code } : {}),
     });
   }
 };
