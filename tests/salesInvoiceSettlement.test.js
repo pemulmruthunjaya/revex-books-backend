@@ -121,7 +121,9 @@ test("walk-in Cash invoice can settle directly by invoice without a dummy custom
         id: 44, invoice_number: "INV-0044", total_amount: 950,
         status: "pending", customer_id: null, customer_name: "Walk In",
       }]];
-      if (sql.includes("SELECT COALESCE(SUM(amount)")) return [[{ paid: 0 }]];
+      if (sql.includes("SELECT invoice_id, amount") && sql.includes("FROM payments")) {
+        return [[]];
+      }
       if (sql.includes("FROM accounts") && sql.includes("LOWER(account_name)")) {
         return [[{ id: 24, account_code: "1100", account_name: "Accounts Receivable", account_type: "ASSET" }]];
       }

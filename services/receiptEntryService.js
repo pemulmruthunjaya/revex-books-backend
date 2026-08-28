@@ -27,12 +27,18 @@ const ensurePaymentsReceiptColumn = async () => {
       "ALTER TABLE payments ADD COLUMN receipt_entry_id BIGINT UNSIGNED NULL"
     );
   }
-  const [indexes] = await db.query(
+  const [uniqueIndexes] = await db.query(
     "SHOW INDEX FROM payments WHERE Key_name = 'uq_payments_receipt_entry'"
+  );
+  if (uniqueIndexes.length) {
+    await db.query("DROP INDEX uq_payments_receipt_entry ON payments");
+  }
+  const [indexes] = await db.query(
+    "SHOW INDEX FROM payments WHERE Key_name = 'idx_payments_receipt_entry'"
   );
   if (!indexes.length) {
     await db.query(
-      "CREATE UNIQUE INDEX uq_payments_receipt_entry ON payments (receipt_entry_id)"
+      "CREATE INDEX idx_payments_receipt_entry ON payments (receipt_entry_id)"
     );
   }
 };
@@ -208,6 +214,64 @@ const clean = (value, maxLength) => {
   return text ? text.slice(0, maxLength) : null;
 };
 
+const moneyToMinor = (value, field = "Amount") => {
+  if (value === null || value === undefined || value === "") {
+    throw Object.assign(new Error(`${field} is required`), { status: 400 });
+  }
+  const text = String(value).trim();
+  if (!/^-?\d+(?:\.\d{1,2})?$/.test(text)) {
+    throw Object.assign(new Error(`${field} must have at most two decimal places`), { status: 400 });
+  }
+  const negative = text.startsWith("-");
+  const unsigned = negative ? text.slice(1) : text;
+  const [whole, fraction = ""] = unsigned.split(".");
+  const minor = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+  if (!Number.isSafeInteger(minor)) {
+    throw Object.assign(new Error(`${field} is outside the supported range`), { status: 400 });
+  }
+  return negative ? -minor : minor;
+};
+
+const minorToMoney = (minor) => Number((Number(minor) / 100).toFixed(2));
+
+const normalizeCustomerAllocations = (body) => {
+  const hasAllocations = body.allocations !== undefined;
+  const source = hasAllocations
+    ? body.allocations
+    : [{ invoice_id: body.invoice_id, amount: body.amount }];
+  if (!Array.isArray(source) || source.length === 0) {
+    throw Object.assign(new Error("Allocations must be a non-empty array"), { status: 400 });
+  }
+
+  const seen = new Set();
+  const allocations = source.map((allocation, index) => {
+    const invoiceId = Number(allocation?.invoice_id);
+    if (!Number.isSafeInteger(invoiceId) || invoiceId <= 0) {
+      throw Object.assign(new Error(`Allocation ${index + 1} has an invalid invoice_id`), { status: 400 });
+    }
+    if (seen.has(invoiceId)) {
+      throw Object.assign(new Error("Duplicate invoice allocations are not allowed"), { status: 400 });
+    }
+    seen.add(invoiceId);
+    const amountMinor = moneyToMinor(allocation?.amount, `Allocation ${index + 1} amount`);
+    if (amountMinor <= 0) {
+      throw Object.assign(new Error("Allocation amounts must be greater than zero"), { status: 400 });
+    }
+    return { invoiceId, amountMinor, amount: minorToMoney(amountMinor) };
+  });
+
+  allocations.sort((left, right) => left.invoiceId - right.invoiceId);
+  const receiptMinor = moneyToMinor(body.amount, "Receipt amount");
+  if (receiptMinor <= 0) {
+    throw Object.assign(new Error("Amount must be greater than zero"), { status: 400 });
+  }
+  const allocatedMinor = allocations.reduce((sum, allocation) => sum + allocation.amountMinor, 0);
+  if (allocatedMinor !== receiptMinor) {
+    throw Object.assign(new Error("Allocation total must equal receipt amount"), { status: 400 });
+  }
+  return { allocations, receiptMinor, isMulti: hasAllocations && allocations.length > 1 };
+};
+
 const PAYMENT_METHODS = Object.freeze(["cash", "upi", "bank", "card", "cheque", "other"]);
 const normalizePaymentMethod = (value) => {
   const text = String(value || "").trim().toLowerCase();
@@ -237,20 +301,73 @@ const validateReceiptDestination = (account, method) => {
 };
 
 const paymentStatusFor = (total, paid) => {
-  const invoiceTotal = Number(total || 0);
-  const paidTotal = Number(paid || 0);
+  const invoiceTotal = moneyToMinor(total || 0, "Invoice total");
+  const paidTotal = moneyToMinor(paid || 0, "Paid total");
   if (paidTotal >= invoiceTotal) return "PAID";
   if (paidTotal > 0) return "PARTIAL";
   return "UNPAID";
+};
+
+const dateKey = (value) => {
+  if (value instanceof Date) {
+    return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  }
+  return String(value || "").slice(0, 10);
+};
+
+const assertIdempotentReceiptEquivalent = async (executor, existing, body, companyId) => {
+  const receiptType = String(body.receipt_type || "").toUpperCase();
+  const method = normalizePaymentMethod(body.payment_mode || body.payment_method || "cash");
+  const expectedAmountMinor = moneyToMinor(body.amount, "Receipt amount");
+  const sameHeader =
+    receiptType === String(existing.receipt_type || "").toUpperCase() &&
+    dateKey(body.receipt_date) === dateKey(existing.receipt_date) &&
+    Number(body.received_in_account_id) === Number(existing.received_in_account_id) &&
+    Number(body.customer_id || 0) === Number(existing.customer_id || 0) &&
+    expectedAmountMinor === moneyToMinor(existing.amount, "Existing receipt amount") &&
+    method === String(existing.payment_mode || "").toLowerCase() &&
+    clean(body.reference_number, 120) === clean(existing.reference_number, 120) &&
+    clean(body.narration, 500) === clean(existing.narration, 500) &&
+    (receiptType !== "OTHER" || Number(body.received_from_account_id) === Number(existing.received_from_account_id));
+  if (!sameHeader) {
+    throw Object.assign(new Error("Idempotency key was already used with different receipt details"), {
+      status: 409,
+      code: "IDEMPOTENCY_KEY_REUSED",
+    });
+  }
+
+  if (receiptType === "CUSTOMER") {
+    const expected = normalizeCustomerAllocations(body).allocations;
+    const [rows] = await executor.query(
+      `SELECT invoice_id, amount FROM payments
+       WHERE company_id = ? AND receipt_entry_id = ?
+       ORDER BY invoice_id`,
+      [companyId, existing.id]
+    );
+    const equivalent = rows.length === expected.length && rows.every((row, index) =>
+      Number(row.invoice_id) === expected[index].invoiceId &&
+      moneyToMinor(row.amount, "Existing allocation amount") === expected[index].amountMinor
+    );
+    if (!equivalent) {
+      throw Object.assign(new Error("Idempotency key was already used with different allocations"), {
+        status: 409,
+        code: "IDEMPOTENCY_KEY_REUSED",
+      });
+    }
+  }
 };
 
 const postReceipt = async (connection, body, user) => {
   const companyId = Number(user.company_id);
   const createdBy = Number(user.user_id);
   const receiptType = String(body.receipt_type || "").toUpperCase();
-  const amount = Number(body.amount || 0);
+  const amountMinor = moneyToMinor(body.amount, "Receipt amount");
+  const amount = minorToMoney(amountMinor);
   const idempotencyKey = clean(body.idempotency_key, 80);
   const paymentMethod = normalizePaymentMethod(body.payment_mode || body.payment_method || "cash");
+  const allocationPlan = receiptType === "CUSTOMER"
+    ? normalizeCustomerAllocations(body)
+    : null;
 
   if (!body.receipt_date) throw Object.assign(new Error("Receipt date is required"), { status: 400 });
   if (!RECEIPT_TYPES.includes(receiptType)) {
@@ -259,7 +376,7 @@ const postReceipt = async (connection, body, user) => {
   if (!body.received_in_account_id) {
     throw Object.assign(new Error("Received In account is required"), { status: 400 });
   }
-  if (!(amount > 0)) {
+  if (amountMinor <= 0) {
     throw Object.assign(new Error("Amount must be greater than zero"), { status: 400 });
   }
   if (!idempotencyKey) {
@@ -268,21 +385,26 @@ const postReceipt = async (connection, body, user) => {
   if (receiptType === "ADVANCE" && !body.customer_id) {
     throw Object.assign(new Error("Customer is required"), { status: 400 });
   }
-  if (receiptType === "CUSTOMER" && !body.invoice_id) {
-    throw Object.assign(new Error("Invoice is required for a customer receipt"), { status: 400 });
+  if (receiptType === "CUSTOMER" && body.allocations !== undefined && !body.customer_id) {
+    throw Object.assign(new Error("Customer is required for multi-invoice allocations"), { status: 400 });
   }
   if (receiptType === "OTHER" && !body.received_from_account_id) {
     throw Object.assign(new Error("Received From account is required"), { status: 400 });
   }
 
   const [duplicates] = await connection.query(
-      `SELECT id, receipt_number, journal_entry_id
+      `SELECT id, receipt_number, receipt_date, receipt_type, customer_id,
+              received_in_account_id, received_from_account_id, amount,
+              payment_mode, reference_number, narration, journal_entry_id
        FROM receipt_entries
        WHERE company_id = ? AND idempotency_key = ?
        LIMIT 1`,
       [companyId, idempotencyKey]
     );
-  if (duplicates.length) return { ...duplicates[0], duplicate: true };
+  if (duplicates.length) {
+    await assertIdempotentReceiptEquivalent(connection, duplicates[0], body, companyId);
+    return { ...duplicates[0], duplicate: true };
+  }
 
     const [receivedInRows] = await connection.query(
       `SELECT a.*, p.account_name AS parent_account_name
@@ -300,9 +422,8 @@ const postReceipt = async (connection, body, user) => {
   validateReceiptDestination(receivedInRows[0], paymentMethod);
 
     let customer = null;
-    let invoice = null;
-    let alreadyPaid = 0;
-    let outstanding = 0;
+    let invoices = [];
+    let singleInvoice = null;
     let receivedFromAccount = null;
 
     if (body.customer_id) {
@@ -317,40 +438,58 @@ const postReceipt = async (connection, body, user) => {
     }
 
   if (receiptType === "CUSTOMER") {
-      const [invoices] = await connection.query(
+      const invoiceIds = allocationPlan.allocations.map((allocation) => allocation.invoiceId);
+      const placeholders = invoiceIds.map(() => "?").join(",");
+      const [lockedInvoices] = await connection.query(
         `SELECT id, invoice_number, total_amount, status, customer_id, customer_name
          FROM invoices
-         WHERE id = ? AND company_id = ?
-         LIMIT 1
+         WHERE company_id = ? AND id IN (${placeholders})
+         ORDER BY id
          FOR UPDATE`,
-        [body.invoice_id, companyId]
+        [companyId, ...invoiceIds]
       );
-      if (!invoices.length) {
-        throw Object.assign(new Error("Invoice not found for this company"), { status: 404 });
+      if (lockedInvoices.length !== invoiceIds.length) {
+        throw Object.assign(new Error("One or more invoices were not found for this company"), { status: 404 });
       }
-      invoice = invoices[0];
-      if (customer && Number(invoice.customer_id) !== Number(customer.id) &&
-          !(invoice.customer_id == null && invoice.customer_name === customer.name)) {
-        throw Object.assign(new Error("Selected invoice does not belong to this customer"), { status: 400 });
-      }
-      if (String(invoice.status || "").toLowerCase() === "cancelled") {
-        throw Object.assign(new Error("A cancelled invoice cannot receive payment"), { status: 400 });
-      }
+      const invoiceById = new Map(lockedInvoices.map((invoice) => [Number(invoice.id), invoice]));
+      invoices = allocationPlan.allocations.map((allocation) => {
+        const invoice = invoiceById.get(allocation.invoiceId);
+        if (customer && Number(invoice.customer_id) !== Number(customer.id) &&
+            !(invoice.customer_id == null && invoice.customer_name === customer.name)) {
+          throw Object.assign(new Error("Selected invoice does not belong to this customer"), { status: 400 });
+        }
+        if (String(invoice.status || "").toLowerCase() === "cancelled") {
+          throw Object.assign(new Error("A cancelled invoice cannot receive payment"), { status: 400 });
+        }
+        return { ...invoice, allocation };
+      });
 
       const [paidRows] = await connection.query(
-        `SELECT COALESCE(SUM(amount), 0) AS paid
+        `SELECT invoice_id, amount
          FROM payments
-         WHERE invoice_id = ? AND company_id = ?`,
-        [invoice.id, companyId]
+         WHERE company_id = ? AND invoice_id IN (${placeholders})
+         ORDER BY invoice_id, id
+         FOR UPDATE`,
+        [companyId, ...invoiceIds]
       );
-      alreadyPaid = Number(paidRows[0].paid || 0);
-      outstanding = Math.max(Number(invoice.total_amount) - alreadyPaid, 0);
-      if (amount > outstanding) {
-        throw Object.assign(
-          new Error("Amount cannot exceed the selected invoice outstanding amount"),
-          { status: 400 }
-        );
-      }
+      const paidByInvoice = paidRows.reduce((totals, row) => {
+        const invoiceId = Number(row.invoice_id);
+        totals.set(invoiceId, (totals.get(invoiceId) || 0) + moneyToMinor(row.amount || 0, "Paid amount"));
+        return totals;
+      }, new Map());
+      invoices = invoices.map((invoice) => {
+        const alreadyPaidMinor = paidByInvoice.get(Number(invoice.id)) || 0;
+        const totalMinor = moneyToMinor(invoice.total_amount, "Invoice total");
+        const outstandingMinor = Math.max(totalMinor - alreadyPaidMinor, 0);
+        if (invoice.allocation.amountMinor > outstandingMinor) {
+          throw Object.assign(
+            new Error(`Allocation cannot exceed outstanding amount for invoice ${invoice.invoice_number}`),
+            { status: 400 }
+          );
+        }
+        return { ...invoice, alreadyPaidMinor, totalMinor, outstandingMinor };
+      });
+      singleInvoice = invoices.length === 1 ? invoices[0] : null;
       receivedFromAccount = await ensureSystemAccount(connection, companyId, {
         code: `SYS-AR-${companyId}`,
         name: "Accounts Receivable",
@@ -403,7 +542,7 @@ const postReceipt = async (connection, body, user) => {
         body.receipt_date,
         receiptType,
         customer?.id || null,
-        invoice?.id || null,
+        singleInvoice?.id || null,
         receivedInRows[0].id,
         receivedFromAccount.id,
         amount,
@@ -461,37 +600,51 @@ const postReceipt = async (connection, body, user) => {
     let advanceId = null;
     let invoiceStatus = null;
     let remainingAmount = null;
+    let allocations = [];
 
     if (receiptType === "CUSTOMER") {
-      const [paymentResult] = await connection.query(
-        `INSERT INTO payments
-         (invoice_id, company_id, amount, payment_date, payment_method,
-          reference_number, receipt_entry_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          invoice.id,
-          companyId,
-          amount,
-          body.receipt_date,
-          paymentMethod,
-          clean(body.reference_number, 120),
-          receiptId,
-        ]
-      );
-      paymentId = paymentResult.insertId;
-      const totalPaid = alreadyPaid + amount;
-      remainingAmount = Math.max(Number(invoice.total_amount) - totalPaid, 0);
-      invoiceStatus = paymentStatusFor(invoice.total_amount, totalPaid);
-      await connection.query(
-        `UPDATE invoices
-         SET payment_status=?,
-             status=CASE
-               WHEN LOWER(COALESCE(status,'')) IN ('pending','partial','paid') THEN LOWER(?)
-               ELSE status
-             END
-         WHERE id=? AND company_id=?`,
-        [invoiceStatus, invoiceStatus, invoice.id, companyId]
-      );
+      for (const invoice of invoices) {
+        const [paymentResult] = await connection.query(
+          `INSERT INTO payments
+           (invoice_id, company_id, amount, payment_date, payment_method,
+            reference_number, receipt_entry_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            invoice.id,
+            companyId,
+            invoice.allocation.amount,
+            body.receipt_date,
+            paymentMethod,
+            clean(body.reference_number, 120),
+            receiptId,
+          ]
+        );
+        const totalPaidMinor = invoice.alreadyPaidMinor + invoice.allocation.amountMinor;
+        const invoiceRemainingMinor = Math.max(invoice.totalMinor - totalPaidMinor, 0);
+        const status = paymentStatusFor(minorToMoney(invoice.totalMinor), minorToMoney(totalPaidMinor));
+        await connection.query(
+          `UPDATE invoices
+           SET payment_status=?,
+               status=CASE
+                 WHEN LOWER(COALESCE(status,'')) IN ('pending','partial','paid') THEN LOWER(?)
+                 ELSE status
+               END
+           WHERE id=? AND company_id=?`,
+          [status, status, invoice.id, companyId]
+        );
+        allocations.push({
+          payment_id: paymentResult.insertId,
+          invoice_id: Number(invoice.id),
+          amount: invoice.allocation.amount,
+          invoice_status: status,
+          remaining_amount: minorToMoney(invoiceRemainingMinor),
+        });
+      }
+      if (allocations.length === 1) {
+        paymentId = allocations[0].payment_id;
+        invoiceStatus = allocations[0].invoice_status;
+        remainingAmount = allocations[0].remaining_amount;
+      }
     }
 
     if (receiptType === "ADVANCE") {
@@ -520,6 +673,7 @@ const postReceipt = async (connection, body, user) => {
       advance_id: advanceId,
       invoice_status: invoiceStatus,
       remaining_amount: remainingAmount,
+      allocations,
       duplicate: false,
     };
 };
@@ -538,11 +692,17 @@ const createReceipt = async (body, user) => {
     await connection.rollback();
     if (error.code === "ER_DUP_ENTRY" && idempotencyKey) {
       const [duplicates] = await db.query(
-        `SELECT id, receipt_number, journal_entry_id FROM receipt_entries
+        `SELECT id, receipt_number, receipt_date, receipt_type, customer_id,
+                received_in_account_id, received_from_account_id, amount,
+                payment_mode, reference_number, narration, journal_entry_id
+         FROM receipt_entries
          WHERE company_id=? AND idempotency_key=? LIMIT 1`,
         [Number(user.company_id), idempotencyKey]
       );
-      if (duplicates.length) return { ...duplicates[0], duplicate: true };
+      if (duplicates.length) {
+        await assertIdempotentReceiptEquivalent(db, duplicates[0], body, Number(user.company_id));
+        return { ...duplicates[0], duplicate: true };
+      }
     }
     throw error;
   } finally {
@@ -567,4 +727,8 @@ module.exports = {
   validateReceiptDestination,
   paymentStatusFor,
   pendingReceiptNumber,
+  moneyToMinor,
+  minorToMoney,
+  normalizeCustomerAllocations,
+  assertIdempotentReceiptEquivalent,
 };
