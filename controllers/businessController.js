@@ -22,6 +22,21 @@ const getUser = async (userId) => {
   return rows[0];
 };
 
+const buildBusinessContextResponse = ({ authenticatedUser, companies, branches }) => ({
+  companies,
+  branches,
+  current_company_id: authenticatedUser.company_id,
+  current_branch_id: authenticatedUser.branch_id || null,
+  consolidated: !authenticatedUser.branch_id,
+  user: {
+    id: authenticatedUser.user_id || authenticatedUser.id || null,
+    name: authenticatedUser.name || null,
+    email: authenticatedUser.email || null,
+    role: authenticatedUser.role || null,
+    access_role: authenticatedUser.access_role || null,
+  },
+});
+
 exports.getBusinessProfile = async (req, res) => {
   try {
     const [rows] = await db.query(
@@ -131,18 +146,18 @@ exports.getContext = async (req, res) => {
       companyId: req.user.company_id,
       role: req.user.role,
     });
-    return res.json({
+    return res.json(buildBusinessContextResponse({
+      authenticatedUser: req.user,
       companies,
       branches,
-      current_company_id: req.user.company_id,
-      current_branch_id: req.user.branch_id || null,
-      consolidated: !req.user.branch_id,
-    });
+    }));
   } catch (error) {
     console.error("Business context error:", error);
     return res.status(500).json({ message: "Failed to load business context" });
   }
 };
+
+exports.buildBusinessContextResponse = buildBusinessContextResponse;
 
 exports.createBusiness = async (req, res) => {
   const connection = await db.getConnection();
