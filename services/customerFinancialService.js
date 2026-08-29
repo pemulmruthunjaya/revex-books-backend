@@ -47,6 +47,54 @@ const ADVANCE_BALANCE_SQL = `
     AND customer_id = ?
     AND status IN ('UNAPPLIED', 'PARTIALLY_APPLIED')`;
 
+const PAYMENT_HISTORY_SQL = `
+  SELECT
+    re.id AS receipt_entry_id,
+    re.receipt_number,
+    re.receipt_date,
+    re.receipt_type,
+    re.amount,
+    re.payment_mode,
+    re.received_in_account_id,
+    received_in.account_name AS received_in_account_name,
+    received_in.account_code AS received_in_account_code,
+    re.reference_number,
+    re.narration,
+    COUNT(DISTINCT p.id) AS allocation_count,
+    COALESCE(SUM(p.amount), 0.00) AS allocated_amount,
+    GROUP_CONCAT(DISTINCT i.invoice_number ORDER BY i.invoice_number SEPARATOR '||')
+      AS invoice_numbers,
+    COALESCE(advance_totals.unapplied_amount, 0.00) AS unapplied_amount
+  FROM receipt_entries re
+  INNER JOIN accounts received_in
+    ON received_in.id = re.received_in_account_id
+   AND received_in.company_id = re.company_id
+  LEFT JOIN payments p
+    ON p.receipt_entry_id = re.id
+   AND p.company_id = re.company_id
+   AND re.receipt_type = 'CUSTOMER'
+  LEFT JOIN invoices i
+    ON i.id = p.invoice_id
+   AND i.company_id = p.company_id
+  LEFT JOIN (
+    SELECT company_id, customer_id, receipt_entry_id, SUM(unapplied_amount) AS unapplied_amount
+    FROM customer_advances
+    GROUP BY company_id, customer_id, receipt_entry_id
+  ) advance_totals
+    ON advance_totals.receipt_entry_id = re.id
+   AND advance_totals.company_id = re.company_id
+   AND advance_totals.customer_id = re.customer_id
+  WHERE re.company_id = ?
+    AND re.customer_id = ?
+    AND re.receipt_type IN ('CUSTOMER', 'ADVANCE')
+  GROUP BY
+    re.id, re.receipt_number, re.receipt_date, re.receipt_type, re.amount,
+    re.payment_mode, re.received_in_account_id, received_in.account_name,
+    received_in.account_code, re.reference_number, re.narration,
+    advance_totals.unapplied_amount
+  ORDER BY re.receipt_date DESC, re.id DESC
+  LIMIT ? OFFSET ?`;
+
 const normalizeDateOnly = (value) => {
   if (value === null || value === undefined || value === "") return null;
   if (value instanceof Date) {
@@ -151,11 +199,72 @@ const getCustomerFinancialSummary = async (companyId, customerId, executor = db)
   );
 };
 
+const normalizePaymentHistoryRow = (row) => {
+  const invoiceNumbers = row.invoice_numbers
+    ? [...new Set(String(row.invoice_numbers).split("||").filter(Boolean))]
+    : [];
+  const isAdvance = row.receipt_type === "ADVANCE";
+
+  return {
+    receipt_entry_id: Number(row.receipt_entry_id),
+    receipt_number: row.receipt_number,
+    receipt_date: normalizeDateOnly(row.receipt_date),
+    receipt_type: row.receipt_type,
+    amount: minorToMoney(moneyToMinor(row.amount || 0, "Receipt amount")),
+    payment_mode: row.payment_mode || null,
+    received_in_account_id: Number(row.received_in_account_id),
+    received_in_account_name: row.received_in_account_name,
+    received_in_account_code: row.received_in_account_code || null,
+    reference_number: row.reference_number || null,
+    narration: row.narration || null,
+    allocation_count: isAdvance ? 0 : Number(row.allocation_count || 0),
+    allocated_amount: isAdvance
+      ? 0
+      : minorToMoney(moneyToMinor(row.allocated_amount || 0, "Allocated amount")),
+    invoice_numbers: isAdvance ? [] : invoiceNumbers,
+    unapplied_amount: isAdvance
+      ? minorToMoney(moneyToMinor(row.unapplied_amount || 0, "Unapplied amount"))
+      : 0,
+  };
+};
+
+const getCustomerPaymentHistory = async (
+  companyId,
+  customerId,
+  { limit = 10, offset = 0 } = {},
+  executor = db
+) => {
+  const [customerRows] = await executor.query(CUSTOMER_SQL, [customerId, companyId]);
+  if (!customerRows.length) return null;
+
+  const safeLimit = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 50);
+  const parsedOffset = Number.parseInt(offset, 10);
+  const safeOffset = Number.isSafeInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+  const [rows] = await executor.query(PAYMENT_HISTORY_SQL, [
+    companyId,
+    customerId,
+    safeLimit,
+    safeOffset,
+  ]);
+
+  return {
+    customer: {
+      id: Number(customerRows[0].id),
+      name: customerRows[0].name,
+    },
+    payments: rows.map(normalizePaymentHistoryRow),
+    pagination: { limit: safeLimit, offset: safeOffset },
+  };
+};
+
 module.exports = {
   ADVANCE_BALANCE_SQL,
   CUSTOMER_SQL,
   ELIGIBLE_INVOICES_SQL,
+  PAYMENT_HISTORY_SQL,
   buildFinancialSummary,
   getCustomerFinancialSummary,
+  getCustomerPaymentHistory,
   normalizeDateOnly,
+  normalizePaymentHistoryRow,
 };

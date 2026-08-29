@@ -6,6 +6,7 @@ const {
 } = require("../services/openingBalanceService");
 const {
   getCustomerFinancialSummary,
+  getCustomerPaymentHistory,
 } = require("../services/customerFinancialService");
 
 const GSTIN_PATTERN = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
@@ -270,6 +271,34 @@ exports.getCustomerFinancialSummary = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch customer financial summary",
+    });
+  }
+};
+
+exports.getCustomerPaymentHistory = async (req, res) => {
+  try {
+    const companyId = Number(req.user?.company_id);
+    const customerId = Number(req.params.customerId);
+    if (!companyId) {
+      return res.status(401).json({ success: false, message: "Invalid token" });
+    }
+    if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+
+    const data = await getCustomerPaymentHistory(companyId, customerId, {
+      limit: req.query.limit,
+      offset: req.query.offset,
+    });
+    if (!data) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+    return res.json({ success: true, data });
+  } catch (error) {
+    console.error("Get customer payment history error:", error.message);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch customer payment history",
     });
   }
 };

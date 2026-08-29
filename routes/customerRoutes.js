@@ -7,6 +7,7 @@ const {
   getCustomers,
   getCustomer,
   getCustomerFinancialSummary,
+  getCustomerPaymentHistory,
   updateCustomer,
   deleteCustomer
 } = require("../controllers/customerController");
@@ -14,6 +15,7 @@ const {
 router.post("/", authMiddleware, createCustomer);
 router.get("/", authMiddleware, getCustomers);
 router.get("/:customerId/financial-summary", authMiddleware, getCustomerFinancialSummary);
+router.get("/:customerId/payment-history", authMiddleware, getCustomerPaymentHistory);
 router.get("/:id", authMiddleware, getCustomer);
 router.put("/:id", authMiddleware, updateCustomer);
 router.delete("/:id", authMiddleware, deleteCustomer);
