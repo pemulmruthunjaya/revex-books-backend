@@ -4,6 +4,9 @@ const {
   recordOpeningBalanceEvent,
   resolvePartyControlAccount,
 } = require("../services/openingBalanceService");
+const {
+  getCustomerFinancialSummary,
+} = require("../services/customerFinancialService");
 
 const GSTIN_PATTERN = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
 const PAN_PATTERN = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
@@ -243,6 +246,31 @@ exports.getCustomer = async (req, res) => {
   } catch (error) {
     console.error("Get customer error:", error);
     return res.status(500).json({ message: "Failed to fetch customer" });
+  }
+};
+
+exports.getCustomerFinancialSummary = async (req, res) => {
+  try {
+    const companyId = Number(req.user?.company_id);
+    const customerId = Number(req.params.customerId);
+    if (!companyId) {
+      return res.status(401).json({ success: false, message: "Invalid token" });
+    }
+    if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+
+    const data = await getCustomerFinancialSummary(companyId, customerId);
+    if (!data) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+    return res.json({ success: true, data });
+  } catch (error) {
+    console.error("Get customer financial summary error:", error.message);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch customer financial summary",
+    });
   }
 };
 
