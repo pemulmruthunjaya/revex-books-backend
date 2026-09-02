@@ -121,7 +121,10 @@ exports.purchaseRegister = send(async (req) => {
 });
 
 const poBase = async (req, pendingOnly = false) => {
-  const { where, params } = filters(req, "po", "po.po_date", { vendor: true });
+  const { where, params } = filters(req, "po", "po.po_date", {
+    vendor: true,
+    branch: false,
+  });
   const [data] = await db.query(
     `SELECT po.id,po.po_number,po.po_date,v.name vendor_name,COUNT(DISTINCT poi.id) total_items,SUM(poi.quantity) ordered_qty,
     COALESCE(SUM(r.received_qty),0) received_qty,SUM(poi.quantity)-COALESCE(SUM(r.received_qty),0) pending_qty,po.total_amount po_value,po.status,
