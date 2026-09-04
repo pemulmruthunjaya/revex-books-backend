@@ -6,6 +6,7 @@ const {
   createFinancialYear,
   getDefaultFinancialYear,
   getFinancialYear,
+  listFinancialYearEvents,
   resolveFinancialYearForDate,
   setDefaultFinancialYear,
 } = require("../services/financialYearService");
@@ -181,4 +182,21 @@ test("default lookup is company scoped", async () => {
   assert.match(observed.sql, /company_id=\? AND is_default=1/);
   assert.deepEqual(observed.params, [4]);
   assert.equal(result.id, 21);
+});
+
+test("lifecycle history is scoped by both company and financial year", async () => {
+  let observed;
+  const events = await listFinancialYearEvents(4, 21, {
+    query: async (sql, params) => {
+      observed = { sql, params };
+      return [[{
+        id: 31, company_id: 4, financial_year_id: 21, event_type: "CREATE",
+        previous_status: null, new_status: "OPEN", reason: null,
+        actor_user_id: 13, metadata: '{"source":"API"}', occurred_at: "event-time",
+      }]];
+    },
+  });
+  assert.match(observed.sql, /WHERE e\.company_id=\? AND e\.financial_year_id=\?/);
+  assert.deepEqual(observed.params, [4, 21]);
+  assert.deepEqual(events[0].metadata, { source: "API" });
 });

@@ -44,6 +44,7 @@ const platformRoutes = require("./routes/platformRoutes");
 const usersRoutes = require("./routes/usersRoutes");
 const staffRoutes = require("./routes/staffRoutes");
 const auditLogRoutes = require("./routes/auditLogRoutes");
+const financialYearRoutes = require("./routes/financialYearRoutes");
 
 /* ================= SALES ================= */
 const customerRoutes = require("./routes/customerRoutes");
@@ -204,6 +205,7 @@ const tenantErpRoutePrefixes = [
   "/api/users",
   "/api/staff",
   "/api/audit-logs",
+  "/api/financial-years",
   "/api/customers",
   "/api/invoices",
   "/api/recurring-invoices",
@@ -250,6 +252,8 @@ app.use("/api/users", authMiddleware, ownerOnly, usersRoutes);
 app.use("/api/staff", authMiddleware, ownerOnly, staffRoutes);
 
 app.use("/api/audit-logs", authMiddleware, ownerOnly, auditLogRoutes);
+
+app.use("/api/financial-years", authMiddleware, financialYearRoutes);
 
 /* =========================================================
    SALES MODULE

@@ -201,6 +201,43 @@ const resolveFinancialYearForDate = async (companyId, businessDate, executor = d
   return rowShape(rows[0]);
 };
 
+const eventShape = (row) => {
+  let metadata = {};
+  if (row.metadata && typeof row.metadata === "object") {
+    metadata = row.metadata;
+  } else if (row.metadata) {
+    try { metadata = JSON.parse(row.metadata); } catch { metadata = {}; }
+  }
+  return {
+    id: Number(row.id),
+    company_id: Number(row.company_id),
+    financial_year_id: Number(row.financial_year_id),
+    event_type: row.event_type,
+    previous_status: row.previous_status,
+    new_status: row.new_status,
+    reason: row.reason,
+    actor_user_id: row.actor_user_id === null ? null : Number(row.actor_user_id),
+    metadata,
+    occurred_at: row.occurred_at,
+  };
+};
+
+const listFinancialYearEvents = async (companyId, financialYearId, executor = db) => {
+  const normalizedCompanyId = positiveId(companyId, "companyId");
+  const normalizedYearId = positiveId(financialYearId, "financialYearId");
+  const [rows] = await executor.query(
+    `SELECT e.id,e.company_id,e.financial_year_id,e.event_type,e.previous_status,
+            e.new_status,e.reason,e.actor_user_id,e.metadata,e.occurred_at
+       FROM financial_year_events e
+       INNER JOIN financial_years fy
+         ON fy.id=e.financial_year_id AND fy.company_id=e.company_id
+      WHERE e.company_id=? AND e.financial_year_id=?
+      ORDER BY e.occurred_at ASC,e.id ASC`,
+    [normalizedCompanyId, normalizedYearId]
+  );
+  return rows.map(eventShape);
+};
+
 const createFinancialYear = async (input, executor = db) => {
   const values = {
     companyId: positiveId(input?.companyId, "companyId"),
@@ -344,6 +381,7 @@ module.exports = {
   getDefaultFinancialYear,
   getFinancialYear,
   listFinancialYears,
+  listFinancialYearEvents,
   resolveFinancialYearForDate,
   setDefaultFinancialYear,
 };
