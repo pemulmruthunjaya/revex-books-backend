@@ -156,6 +156,7 @@ exports.pendingPurchaseOrders = send(async (req) => {
   const { where, params } = filters(req, "po", "po.po_date", {
     vendor: true,
     product: "poi.product_id",
+    branch: false,
   });
   const [data] = await db.query(
     `SELECT po.id,po.po_number,po.po_date,v.name vendor_name,poi.product_name product,poi.quantity ordered_qty,COALESCE(r.received_qty,0) received_qty,poi.quantity-COALESCE(r.received_qty,0) pending_qty,COALESCE(poi.unit,p.unit,'PCS') unit,poi.price purchase_rate,(poi.quantity-COALESCE(r.received_qty,0))*poi.price pending_value,DATEDIFF(CURDATE(),po.po_date) days_pending
