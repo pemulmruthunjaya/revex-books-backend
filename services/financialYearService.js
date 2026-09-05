@@ -201,6 +201,28 @@ const resolveFinancialYearForDate = async (companyId, businessDate, executor = d
   return rowShape(rows[0]);
 };
 
+const requireFinancialYearForDate = async (companyId, businessDate, executor = db) => {
+  const financialYear = await resolveFinancialYearForDate(companyId, businessDate, executor);
+  if (!financialYear) {
+    fail(
+      "FINANCIAL_YEAR_NOT_FOUND_FOR_DATE",
+      "No financial year covers the transaction date for this company",
+      409
+    );
+  }
+  return financialYear;
+};
+
+const rejectClientFinancialYear = (input) => {
+  if (input && Object.prototype.hasOwnProperty.call(input, "financial_year_id")) {
+    fail(
+      "CLIENT_FINANCIAL_YEAR_NOT_ALLOWED",
+      "financial_year_id is assigned by the server from the transaction date",
+      400
+    );
+  }
+};
+
 const eventShape = (row) => {
   let metadata = {};
   if (row.metadata && typeof row.metadata === "object") {
@@ -383,5 +405,7 @@ module.exports = {
   listFinancialYears,
   listFinancialYearEvents,
   resolveFinancialYearForDate,
+  requireFinancialYearForDate,
+  rejectClientFinancialYear,
   setDefaultFinancialYear,
 };

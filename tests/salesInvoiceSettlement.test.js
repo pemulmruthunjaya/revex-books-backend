@@ -137,13 +137,14 @@ test("walk-in Cash invoice can settle directly by invoice without a dummy custom
     receipt_date: "2026-08-26", receipt_type: "CUSTOMER", invoice_id: 44,
     customer_id: null, received_in_account_id: 10, amount: 950,
     payment_method: "Cash", idempotency_key: "invoice-44-settlement",
-  }, { company_id: 4, user_id: 13 });
+  }, { company_id: 4, user_id: 13 }, { financialYear: { id: 2026 } });
   assert.equal(result.invoice_status, "PAID");
   const receiptInsert = calls.find((call) => call.sql.includes("INSERT INTO receipt_entries"));
   assert.equal(receiptInsert.params[3], null);
   const paymentInsert = calls.find((call) => call.sql.includes("INSERT INTO payments"));
   assert.equal(paymentInsert.params[0], 44);
-  assert.equal(paymentInsert.params[4], "cash");
+  assert.equal(paymentInsert.params[2], 2026);
+  assert.equal(paymentInsert.params[5], "cash");
 });
 
 test("caller-owned invoice transaction commits once and rolls back forced failures", async () => {

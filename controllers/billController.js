@@ -2,6 +2,7 @@ const db = require("../db/connection");
 const {
   ensureVendorPaymentSchema,
 } = require("../services/vendorPaymentService");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
 
 let billStatusColumnReady = false;
 let billMrpColumnsReady = false;
@@ -64,8 +65,11 @@ const ensureBillMrpColumns = async () => {
  * ===============================
  */
 exports.createBill = async (req, res) => {
+  const connection = await db.getConnection();
+  let transactionStarted = false;
   try {
     await ensureBillMrpColumns();
+    rejectClientFinancialYear(req.body);
 
     const { vendor_id, bill_number, bill_date, due_date, items } = req.body;
     const company_id = req.user.company_id;
@@ -75,7 +79,6 @@ exports.createBill = async (req, res) => {
         message: "Missing required fields",
       });
     }
-
     let total_amount = 0;
 
     const processedItems = [];
@@ -106,11 +109,15 @@ exports.createBill = async (req, res) => {
       });
     }
 
+    await connection.beginTransaction();
+    transactionStarted = true;
+    const financialYear = await requireFinancialYearForDate(company_id, bill_date, connection);
+
     /* ================= INSERT BILL ================= */
-    const [billResult] = await db.query(
+    const [billResult] = await connection.query(
       `INSERT INTO bills 
-      (vendor_id, bill_number, bill_date, due_date, total_amount, status, company_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      (vendor_id, bill_number, bill_date, due_date, total_amount, status, company_id, financial_year_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         vendor_id,
         bill_number,
@@ -119,6 +126,7 @@ exports.createBill = async (req, res) => {
         total_amount,
         "Unpaid",
         company_id,
+        financialYear.id,
       ],
     );
 
@@ -134,7 +142,7 @@ exports.createBill = async (req, res) => {
       }
 
       // ✅ Insert bill item
-      await db.query(
+      await connection.query(
         `INSERT INTO bill_items 
         (bill_id, product_id, product_name, quantity, price, mrp, total, gst_percent, cgst, sgst)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -153,7 +161,7 @@ exports.createBill = async (req, res) => {
       );
 
       // 🔥 STOCK INCREASE (THIS WAS MISSING)
-      await db.query(
+      await connection.query(
         `UPDATE products 
          SET stock = stock + ?,
              mrp = ?,
@@ -164,16 +172,23 @@ exports.createBill = async (req, res) => {
       );
     }
 
+    await connection.commit();
+    transactionStarted = false;
+
     res.status(201).json({
       message: "Bill created & stock increased ✅",
       bill_id,
     });
   } catch (error) {
+    if (transactionStarted) await connection.rollback();
     console.error("BILL CREATE ERROR:", error);
-    res.status(500).json({
-      message: "Server error",
-      error: error.message,
+    res.status(error.status || 500).json({
+      message: error.status ? error.message : "Server error",
+      ...(error.code ? { code: error.code } : {}),
+      ...(error.status ? {} : { error: error.message }),
     });
+  } finally {
+    connection.release();
   }
 };
 
@@ -312,6 +327,7 @@ exports.createBillFromGrn = async (req, res) => {
   const connection = await db.getConnection();
   try {
     await ensureBillMrpColumns();
+    rejectClientFinancialYear(req.body);
     const companyId = req.user.company_id;
     const branchId = req.user.branch_id || null;
     const {
@@ -336,6 +352,7 @@ exports.createBillFromGrn = async (req, res) => {
         });
     }
     await connection.beginTransaction();
+    const financialYear = await requireFinancialYearForDate(companyId, bill_date, connection);
     const branchFilter = branchId ? " AND gr.branch_id=?" : "";
     const grnParams = [source_grn_id, companyId];
     if (branchId) grnParams.push(branchId);
@@ -426,8 +443,8 @@ exports.createBillFromGrn = async (req, res) => {
       });
     }
     const [billResult] = await connection.query(
-      `INSERT INTO bills (vendor_id,bill_number,bill_date,due_date,total_amount,status,company_id,source_purchase_order_id,source_grn_id,stock_posted)
-       VALUES (?,?,?,?,?,'Unpaid',?,?,?,0)`,
+      `INSERT INTO bills (vendor_id,bill_number,bill_date,due_date,total_amount,status,company_id,financial_year_id,source_purchase_order_id,source_grn_id,stock_posted)
+       VALUES (?,?,?,?,?,'Unpaid',?,?,?,?,0)`,
       [
         vendor_id,
         bill_number,
@@ -435,6 +452,7 @@ exports.createBillFromGrn = async (req, res) => {
         due_date || null,
         totalAmount,
         companyId,
+        financialYear.id,
         grn.purchase_order_id,
         grn.id,
       ],
@@ -496,6 +514,7 @@ exports.updateBill = async (req, res) => {
 
   try {
     await ensureBillMrpColumns();
+    rejectClientFinancialYear(req.body);
 
     const { id } = req.params;
     const company_id = req.user.company_id;
@@ -507,6 +526,7 @@ exports.updateBill = async (req, res) => {
 
     await ensureBillStatusColumn();
     await connection.beginTransaction();
+    const financialYear = await requireFinancialYearForDate(company_id, bill_date, connection);
 
     const [billRows] = await connection.query(
       "SELECT id, status, stock_posted, source_grn_id FROM bills WHERE id = ? AND company_id = ?",
@@ -665,7 +685,7 @@ exports.updateBill = async (req, res) => {
 
     await connection.query(
       `UPDATE bills
-       SET vendor_id = ?, bill_number = ?, bill_date = ?, due_date = ?, total_amount = ?, status = ?
+       SET vendor_id = ?, bill_number = ?, bill_date = ?, due_date = ?, total_amount = ?, status = ?, financial_year_id = ?
        WHERE id = ? AND company_id = ?`,
       [
         vendor_id,
@@ -674,6 +694,7 @@ exports.updateBill = async (req, res) => {
         due_date || null,
         total_amount,
         status,
+        financialYear.id,
         id,
         company_id,
       ],
@@ -721,7 +742,11 @@ exports.updateBill = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error("Update bill error:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
+    res.status(error.status || 500).json({
+      message: error.status ? error.message : "Server error",
+      ...(error.code ? { code: error.code } : {}),
+      ...(error.status ? {} : { error: error.message }),
+    });
   } finally {
     connection.release();
   }

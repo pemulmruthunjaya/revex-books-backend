@@ -1,4 +1,5 @@
 const db = require("../db/connection");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
 
 /**
  * GENERATE JOURNAL NUMBER
@@ -41,6 +42,7 @@ const generateJournalNumber = async (company_id) => {
 exports.createJournalEntry = async (req, res) => {
 
     try {
+        rejectClientFinancialYear(req.body);
 
         const {
             journal_date,
@@ -100,6 +102,7 @@ exports.createJournalEntry = async (req, res) => {
          * GENERATE JOURNAL NUMBER
          */
         const journalNo = await generateJournalNumber(company_id);
+        const financialYear = await requireFinancialYearForDate(company_id, journal_date, db);
 
         /**
          * INSERT MASTER ENTRY
@@ -112,9 +115,10 @@ exports.createJournalEntry = async (req, res) => {
                 narration,
                 total_debit,
                 total_credit,
-                company_id
+                company_id,
+                financial_year_id
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             `,
             [
                 journalNo,
@@ -122,7 +126,8 @@ exports.createJournalEntry = async (req, res) => {
                 narration,
                 totalDebit,
                 totalCredit,
-                company_id
+                company_id,
+                financialYear.id
             ]
         );
 
@@ -169,7 +174,7 @@ exports.createJournalEntry = async (req, res) => {
 
         console.log("CREATE JOURNAL ERROR:", error);
 
-        res.status(500).json({
+        res.status(error.status || 500).json({
             success: false,
             message: error.message
         });

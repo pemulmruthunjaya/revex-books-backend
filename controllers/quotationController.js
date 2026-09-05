@@ -1,4 +1,6 @@
 const db = require("../db/connection");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
+const { postSalesInvoiceJournal } = require("../services/salesInvoiceAccountingService");
 
 let quotationTablesReady = false;
 
@@ -243,7 +245,10 @@ exports.createQuotation = async (req, res) => {
       return res.status(409).json({ message: "Quotation number already exists" });
     }
 
-    res.status(500).json({ message: error.message || "Server error" });
+    res.status(error.status || 500).json({
+      message: error.status ? error.message : "Server error",
+      ...(error.code ? { code: error.code } : {}),
+    });
   } finally {
     connection.release();
   }
@@ -450,10 +455,12 @@ exports.convertQuotationToInvoice = async (req, res) => {
     await ensureQuotationTables();
 
     const companyId = req.user.company_id;
+    rejectClientFinancialYear(req.body);
     const invoiceDate = req.body.invoice_date || new Date().toISOString().slice(0, 10);
 
     await ensureInvoiceConversionColumns(connection);
     await connection.beginTransaction();
+    const financialYear = await requireFinancialYearForDate(companyId, invoiceDate, connection);
 
     const [quotations] = await connection.query(
       `SELECT *
@@ -536,11 +543,12 @@ exports.convertQuotationToInvoice = async (req, res) => {
 
     const [invoiceResult] = await connection.query(
       `INSERT INTO invoices
-        (company_id, created_by, invoice_number, invoice_date, customer_name,
+        (company_id, financial_year_id, created_by, invoice_number, invoice_date, customer_name,
          subtotal, tax_amount, cgst, sgst, igst, total_amount, status, source_quotation_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'pending', ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'pending', ?)`,
       [
         companyId,
+        financialYear.id,
         req.user.user_id || null,
         invoiceNumber,
         invoiceDate,
@@ -578,6 +586,17 @@ exports.convertQuotationToInvoice = async (req, res) => {
         [item.quantity, item.product_id, companyId]
       );
     }
+
+    await postSalesInvoiceJournal(connection, {
+      id: invoiceId,
+      company_id: companyId,
+      financial_year_id: financialYear.id,
+      created_by: req.user.user_id || null,
+      invoice_number: invoiceNumber,
+      invoice_date: invoiceDate,
+      total_amount: quotation.total_amount,
+      tax_amount: quotation.tax_amount,
+    });
 
     await connection.query(
       "UPDATE quotations SET status = 'Converted' WHERE id = ? AND company_id = ?",

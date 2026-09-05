@@ -1,4 +1,5 @@
 const db = require("../db/connection");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
 
 const userId = (req) => req.user.user_id || req.user.id || null;
 const fail = (message, status = 400) =>
@@ -424,6 +425,7 @@ exports.createBill = async (req, res) => {
   const connection = await db.getConnection();
   try {
     const companyId = req.user.company_id;
+    rejectClientFinancialYear(req.body);
     await connection.beginTransaction();
     const [receipts] = await connection.query(
       "SELECT * FROM goods_receipts WHERE id=? AND company_id=? AND status='Posted' FOR UPDATE",
@@ -462,15 +464,18 @@ exports.createBill = async (req, res) => {
           (1 + Number(item.gst_percent) / 100),
       0,
     );
+    const billDate = req.body.bill_date || new Date().toISOString().slice(0, 10);
+    const financialYear = await requireFinancialYearForDate(companyId, billDate, connection);
     const [bill] = await connection.query(
-      `INSERT INTO bills (vendor_id,bill_number,bill_date,due_date,total_amount,status,company_id,source_purchase_order_id,source_grn_id,stock_posted) VALUES (?,?,?,?,?,'Unpaid',?,?,?,0)`,
+      `INSERT INTO bills (vendor_id,bill_number,bill_date,due_date,total_amount,status,company_id,financial_year_id,source_purchase_order_id,source_grn_id,stock_posted) VALUES (?,?,?,?,?,'Unpaid',?,?,?,?,0)`,
       [
         grn.vendor_id,
         billNumber,
-        req.body.bill_date || new Date().toISOString().slice(0, 10),
+        billDate,
         req.body.due_date || null,
         total,
         companyId,
+        financialYear.id,
         grn.purchase_order_id,
         grn.id,
       ],

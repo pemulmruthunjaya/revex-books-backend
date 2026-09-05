@@ -81,16 +81,22 @@ test("multi allocations are sorted, exact, positive, and reject duplicates", () 
 
 test("multi receipt writes one header, one journal, and one payment per invoice", async () => {
   const connection = makeConnection({ invoices });
-  const result = await postReceipt(connection, customerReceipt(), { company_id: 4, user_id: 13 });
+  const result = await postReceipt(connection, customerReceipt(), { company_id: 4, user_id: 13 }, { financialYear: { id: 2026 } });
   assert.equal(result.allocations.length, 2);
   assert.equal(result.payment_id, null);
   assert.equal(result.invoice_status, null);
   assert.equal(connection.calls.filter(({ sql }) => sql.includes("INSERT INTO receipt_entries")).length, 1);
   assert.equal(connection.calls.filter(({ sql }) => sql.includes("INSERT INTO journal_entries")).length, 1);
   assert.equal(connection.calls.filter(({ sql }) => sql.includes("INSERT INTO payments")).length, 2);
+  const journal = connection.calls.find(({ sql }) => sql.includes("INSERT INTO journal_entries"));
+  assert.equal(journal.params[6], 2026);
+  for (const payment of connection.calls.filter(({ sql }) => sql.includes("INSERT INTO payments"))) {
+    assert.equal(payment.params[2], 2026);
+  }
   const lock = connection.calls.find(({ sql }) => sql.includes("FROM invoices") && sql.includes("FOR UPDATE"));
   assert.deepEqual(lock.params, [4, 11, 22]);
   const receipt = connection.calls.find(({ sql }) => sql.includes("INSERT INTO receipt_entries"));
+  assert.doesNotMatch(receipt.sql, /financial_year_id/);
   assert.equal(receipt.params[4], null);
   const receiptUpdate = connection.calls.find(({ sql }) => sql.includes("SET journal_entry_id"));
   assert.equal(receiptUpdate.params[1], null);
@@ -101,16 +107,16 @@ test("multi receipt writes one header, one journal, and one payment per invoice"
 
 test("allocation validation rejects overpayment, wrong customer, and missing company invoice", async () => {
   await assert.rejects(
-    postReceipt(makeConnection({ invoices, paidRows: [{ invoice_id: 11, amount: 100 }] }), customerReceipt(), { company_id: 4, user_id: 13 }),
+    postReceipt(makeConnection({ invoices, paidRows: [{ invoice_id: 11, amount: 100 }] }), customerReceipt(), { company_id: 4, user_id: 13 }, { financialYear: { id: 2026 } }),
     /cannot exceed outstanding/
   );
   const wrongCustomer = invoices.map((invoice) => ({ ...invoice, customer_id: 9, customer_name: "Other" }));
   await assert.rejects(
-    postReceipt(makeConnection({ invoices: wrongCustomer }), customerReceipt(), { company_id: 4, user_id: 13 }),
+    postReceipt(makeConnection({ invoices: wrongCustomer }), customerReceipt(), { company_id: 4, user_id: 13 }, { financialYear: { id: 2026 } }),
     /does not belong/
   );
   await assert.rejects(
-    postReceipt(makeConnection({ invoices: [invoices[0]] }), customerReceipt(), { company_id: 4, user_id: 13 }),
+    postReceipt(makeConnection({ invoices: [invoices[0]] }), customerReceipt(), { company_id: 4, user_id: 13 }, { financialYear: { id: 2026 } }),
     /not found for this company/
   );
 });
@@ -132,7 +138,7 @@ test("same idempotency key must represent the same header and allocations", asyn
 test("forced failure during allocation propagates to the owning transaction", async () => {
   const connection = makeConnection({ invoices, failOnPayment: 2 });
   await assert.rejects(
-    postReceipt(connection, customerReceipt(), { company_id: 4, user_id: 13 }),
+    postReceipt(connection, customerReceipt(), { company_id: 4, user_id: 13 }, { financialYear: { id: 2026 } }),
     /forced allocation failure/
   );
   assert.equal(connection.calls.filter(({ sql }) => sql.includes("INSERT INTO receipt_entries")).length, 1);

@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
 const db = require("../db/connection");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("./financialYearService");
 
 const RECEIPT_TYPES = Object.freeze(["CUSTOMER", "OTHER", "ADVANCE"]);
 const CREDIT_ACCOUNT_TYPES = new Set(["INCOME", "LIABILITY", "EQUITY", "CAPITAL"]);
@@ -357,7 +358,8 @@ const assertIdempotentReceiptEquivalent = async (executor, existing, body, compa
   }
 };
 
-const postReceipt = async (connection, body, user) => {
+const postReceipt = async (connection, body, user, context = {}) => {
+  rejectClientFinancialYear(body);
   const companyId = Number(user.company_id);
   const createdBy = Number(user.user_id);
   const receiptType = String(body.receipt_type || "").toUpperCase();
@@ -370,6 +372,8 @@ const postReceipt = async (connection, body, user) => {
     : null;
 
   if (!body.receipt_date) throw Object.assign(new Error("Receipt date is required"), { status: 400 });
+  const financialYear = context.financialYear ||
+    await requireFinancialYearForDate(companyId, body.receipt_date, connection);
   if (!RECEIPT_TYPES.includes(receiptType)) {
     throw Object.assign(new Error("Valid receipt type is required"), { status: 400 });
   }
@@ -566,8 +570,8 @@ const postReceipt = async (connection, body, user) => {
     const [journalResult] = await connection.query(
       `INSERT INTO journal_entries
        (journal_no, journal_date, narration, total_debit, total_credit, company_id,
-        source_type, source_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        financial_year_id, source_type, source_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         receiptNumber,
         body.receipt_date,
@@ -575,6 +579,7 @@ const postReceipt = async (connection, body, user) => {
         amount,
         amount,
         companyId,
+        financialYear.id,
         receiptJournalSourceType(receiptType),
         receiptId,
       ]
@@ -606,12 +611,13 @@ const postReceipt = async (connection, body, user) => {
       for (const invoice of invoices) {
         const [paymentResult] = await connection.query(
           `INSERT INTO payments
-           (invoice_id, company_id, amount, payment_date, payment_method,
+           (invoice_id, company_id, financial_year_id, amount, payment_date, payment_method,
             reference_number, receipt_entry_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             invoice.id,
             companyId,
+            financialYear.id,
             invoice.allocation.amount,
             body.receipt_date,
             paymentMethod,

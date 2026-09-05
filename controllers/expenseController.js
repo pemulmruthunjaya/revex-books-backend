@@ -1,10 +1,12 @@
 const db = require("../db/connection");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
 
 /**
  * CREATE EXPENSE
  */
 exports.createExpense = async (req, res) => {
   try {
+    rejectClientFinancialYear(req.body);
     const { title, category, amount, expense_date, notes } = req.body;
     const company_id = req.user.company_id;
 
@@ -13,12 +15,13 @@ exports.createExpense = async (req, res) => {
         message: "Title, amount and expense date are required"
       });
     }
+    const financialYear = await requireFinancialYearForDate(company_id, expense_date, db);
 
     const [result] = await db.query(
       `INSERT INTO expenses 
-      (title, category, amount, expense_date, notes, company_id)
-      VALUES (?, ?, ?, ?, ?, ?)`,
-      [title, category, amount, expense_date, notes, company_id]
+      (title, category, amount, expense_date, notes, company_id, financial_year_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [title, category, amount, expense_date, notes, company_id, financialYear.id]
     );
 
     res.status(201).json({
@@ -28,8 +31,8 @@ exports.createExpense = async (req, res) => {
 
   } catch (error) {
     console.error("Create expense error:", error);
-    res.status(500).json({
-      message: "Failed to create expense"
+    res.status(error.status || 500).json({
+      message: error.status ? error.message : "Failed to create expense"
     });
   }
 };

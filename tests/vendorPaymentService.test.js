@@ -20,6 +20,7 @@ const run = async () => {
     release: () => {},
     query: async (sql, params) => {
       calls.push({ sql, params });
+      if (sql.includes("FROM financial_years")) return [[{ id: 2026, company_id: 2, code: "FY26", name: "FY 2026", start_date: "2026-04-01", end_date: "2027-03-31", status: "OPEN", is_default: 1, source: "MANUAL", created_by: 3 }]];
       if (sql.includes("SELECT id,journal_entry_id FROM vendor_payments")) return [[]];
       if (sql.includes("FROM bills b INNER JOIN vendors")) {
         return [[{ id: 13, vendor_id: 7, bill_number: "BILL-0013", total_amount: 784, vendor_name: "PKD Traders" }]];
@@ -73,7 +74,12 @@ const run = async () => {
   assert(journalCall, "journal entry should be inserted");
   assert(!journalCall.sql.includes("created_by"), "journal insert must match the existing schema");
   assert(!journalCall.sql.includes("status"), "journal insert must not require a status column");
-  assert.strictEqual(journalCall.params.length, 8);
+  assert.strictEqual(journalCall.params.length, 9);
+  assert.strictEqual(journalCall.params[6], 2026);
+  const paymentCall = calls.find(({ sql }) => sql.includes("INSERT INTO vendor_payments"));
+  const ledgerCall = calls.find(({ sql }) => sql.includes("INSERT INTO ledger_entries"));
+  assert.strictEqual(paymentCall.params[9], 2026);
+  assert.strictEqual(ledgerCall.params[1], 2026);
 
   db.query = originalQuery;
   db.getConnection = originalGetConnection;

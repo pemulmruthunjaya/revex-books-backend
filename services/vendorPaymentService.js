@@ -1,5 +1,6 @@
 const db = require("../db/connection");
 const { isCashBankAccount } = require("./receiptEntryService");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("./financialYearService");
 
 const METHODS = ["Cash", "Bank Transfer", "UPI", "Cheque", "Card", "Other"];
 let schemaReady = false;
@@ -102,6 +103,7 @@ const findPayableAccount = async (connection, companyId) => {
 };
 
 const recordVendorPayment = async (body, user) => {
+  rejectClientFinancialYear(body);
   await ensureVendorPaymentSchema();
   const companyId = user.company_id;
   const createdBy = user.user_id || user.id || null;
@@ -118,6 +120,7 @@ const recordVendorPayment = async (body, user) => {
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
+    const financialYear = await requireFinancialYearForDate(companyId, body.payment_date, connection);
     const [duplicate] = await connection.query(
       `SELECT id,journal_entry_id FROM vendor_payments
        WHERE company_id=? AND idempotency_key=? LIMIT 1`,
@@ -161,21 +164,21 @@ const recordVendorPayment = async (body, user) => {
     const [paymentResult] = await connection.query(
       `INSERT INTO vendor_payments
        (vendor_id,bill_id,amount,payment_date,payment_method,paid_from_account_id,
-        reference_number,notes,company_id,created_by,idempotency_key,status)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,'SUCCESS')`,
+        reference_number,notes,company_id,financial_year_id,created_by,idempotency_key,status)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'SUCCESS')`,
       [bill.vendor_id,bill.id,amount,body.payment_date,body.payment_method,
        body.paid_from_account_id,String(body.reference_number||"").trim()||null,
-       String(body.notes||"").trim()||null,companyId,createdBy,idempotencyKey]
+       String(body.notes||"").trim()||null,companyId,financialYear.id,createdBy,idempotencyKey]
     );
     const paymentId = paymentResult.insertId;
     const narration = `Vendor payment to ${bill.vendor_name} against ${bill.bill_number}`;
     const [journalResult] = await connection.query(
       `INSERT INTO journal_entries
        (journal_no,journal_date,narration,total_debit,total_credit,
-        company_id,vendor_id,source_type,source_id)
-       VALUES (?,?,?,?,?,?,?,'vendor_payment',?)`,
+        company_id,financial_year_id,vendor_id,source_type,source_id)
+       VALUES (?,?,?,?,?,?,?,?,'vendor_payment',?)`,
       [`VPAY-${String(paymentId).padStart(5,"0")}`,body.payment_date,narration,
-       amount,amount,companyId,bill.vendor_id,paymentId]
+       amount,amount,companyId,financialYear.id,bill.vendor_id,paymentId]
     );
     const journalId = journalResult.insertId;
     await connection.query(
@@ -186,9 +189,9 @@ const recordVendorPayment = async (body, user) => {
     );
     await connection.query(
       `INSERT INTO ledger_entries
-       (company_id,entity_type,entity_id,reference_type,reference_id,debit,credit,transaction_date)
-       VALUES (?,'vendor',?,'vendor_payment',?,0,?,?)`,
-      [companyId,bill.vendor_id,paymentId,amount,body.payment_date]
+       (company_id,financial_year_id,entity_type,entity_id,reference_type,reference_id,debit,credit,transaction_date)
+       VALUES (?,?,'vendor',?,'vendor_payment',?,0,?,?)`,
+      [companyId,financialYear.id,bill.vendor_id,paymentId,amount,body.payment_date]
     );
     await connection.query(
       "UPDATE vendor_payments SET journal_entry_id=? WHERE id=? AND company_id=?",

@@ -2,6 +2,7 @@ const db = require("../db/connection");
 const crypto = require("node:crypto");
 const { ensureReceiptEntrySchema, normalizePaymentMethod, postReceipt } = require("../services/receiptEntryService");
 const { postSalesInvoiceJournal } = require("../services/salesInvoiceAccountingService");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
 
 let invoiceStatusColumnReady = false;
 let invoiceMrpColumnsReady = false;
@@ -455,6 +456,7 @@ const ensureInvoiceCreationSchema = async () => {
 
 const createInvoiceRecord = async ({ body, user, connection = db }) => {
     await ensureInvoiceCreationSchema();
+    rejectClientFinancialYear(body);
 
     const { invoice_date, items } = body;
     const company_id = user.company_id;
@@ -464,6 +466,7 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
     if (!invoice_date || !items?.length) {
       throw invoiceCreationError("Missing required fields");
     }
+    const financialYear = await requireFinancialYearForDate(company_id, invoice_date, connection);
 
     if (requestId) {
       const [existing] = await connection.query(
@@ -560,14 +563,15 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
     // ✅ INSERT INVOICE
     const [invoiceResult] = await connection.query(
       `INSERT INTO invoices 
-      (company_id, created_by, invoice_number, invoice_date, invoice_type, customer_id, customer_name, customer_phone,
+      (company_id, financial_year_id, created_by, invoice_number, invoice_date, invoice_type, customer_id, customer_name, customer_phone,
        cash_customer_name, cash_customer_mobile, credit_days, due_date, shipping_address,
        subtotal, discount_amount, tax_amount, cgst, sgst, igst,
        overall_discount_type, overall_discount_value, overall_discount_amount, additional_discount_type, additional_discount_value, additional_discount_amount, round_off_amount, total_amount,
        request_id,payment_status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         company_id,
+        financialYear.id,
         created_by,
         invoice_number,
         invoice_date,
@@ -646,6 +650,7 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
       invoice_date,
       total_amount,
       tax_amount,
+      financial_year_id: financialYear.id,
     });
 
     let receipt = null;
@@ -661,7 +666,7 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
         reference_number: settlement.referenceNumber,
         narration: `Settlement for ${invoice_number}`,
         idempotency_key: settlementIdempotencyKey(requestId, company_id, invoice_id),
-      }, user);
+      }, user, { financialYear });
     }
 
     return {
@@ -993,6 +998,7 @@ exports.updateInvoice = async (req, res) => {
   try {
     await ensureInvoiceMrpColumns();
     await ensureInvoiceDiscountColumns();
+    rejectClientFinancialYear(req.body);
 
     const { id } = req.params;
     const company_id = req.user.company_id;
@@ -1029,6 +1035,7 @@ exports.updateInvoice = async (req, res) => {
         message: "A financially posted invoice cannot be edited; a reversal workflow is required",
       });
     }
+    const financialYear = await requireFinancialYearForDate(company_id, invoice_date, connection);
 
     const party = await resolveInvoicePersistence({
       body: req.body,
@@ -1146,7 +1153,7 @@ exports.updateInvoice = async (req, res) => {
        SET invoice_date=?, invoice_type=?, customer_id=?, customer_name=?, customer_phone=?,
            cash_customer_name=?, cash_customer_mobile=?, credit_days=?, due_date=?, shipping_address=?,
            subtotal=?, discount_amount=?, tax_amount=?, cgst=?, sgst=?, igst=?,
-           overall_discount_type=?, overall_discount_value=?, overall_discount_amount=?, additional_discount_type=?, additional_discount_value=?, additional_discount_amount=?, round_off_amount=?, total_amount=?, status=?
+           overall_discount_type=?, overall_discount_value=?, overall_discount_amount=?, additional_discount_type=?, additional_discount_value=?, additional_discount_amount=?, round_off_amount=?, total_amount=?, status=?, financial_year_id=?
        WHERE id=? AND company_id=?`,
       [
         invoice_date,
@@ -1174,6 +1181,7 @@ exports.updateInvoice = async (req, res) => {
         invoiceLevel.roundOff,
         total_amount,
         status,
+        financialYear.id,
         id,
         company_id
       ]

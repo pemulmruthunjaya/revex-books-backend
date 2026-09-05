@@ -1,4 +1,5 @@
 const db = require("../db/connection");
+const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
 
 let purchaseOrderTablesReady = false;
 
@@ -260,7 +261,10 @@ exports.createPurchaseOrder = async (req, res) => {
       return res.status(409).json({ message: "Purchase order number already exists" });
     }
 
-    res.status(500).json({ message: error.message || "Server error" });
+    res.status(error.status || 500).json({
+      message: error.status ? error.message : "Server error",
+      ...(error.code ? { code: error.code } : {}),
+    });
   } finally {
     connection.release();
   }
@@ -498,11 +502,13 @@ exports.convertPurchaseOrderToBill = async (req, res) => {
 
     const companyId = req.user.company_id;
     const { id } = req.params;
+    rejectClientFinancialYear(req.body);
     const billDate = req.body.bill_date || new Date().toISOString().slice(0, 10);
     const dueDate = req.body.due_date || null;
 
     await ensureBillConversionColumns(connection);
     await connection.beginTransaction();
+    const financialYear = await requireFinancialYearForDate(companyId, billDate, connection);
 
     const [orders] = await connection.query(
       `SELECT po.*, v.id AS valid_vendor_id
@@ -576,8 +582,8 @@ exports.convertPurchaseOrderToBill = async (req, res) => {
 
     const [billResult] = await connection.query(
       `INSERT INTO bills
-        (vendor_id, bill_number, bill_date, due_date, total_amount, status, company_id, source_purchase_order_id)
-       VALUES (?, ?, ?, ?, ?, 'Unpaid', ?, ?)`,
+        (vendor_id, bill_number, bill_date, due_date, total_amount, status, company_id, financial_year_id, source_purchase_order_id)
+       VALUES (?, ?, ?, ?, ?, 'Unpaid', ?, ?, ?)`,
       [
         order.vendor_id,
         billNumber,
@@ -585,6 +591,7 @@ exports.convertPurchaseOrderToBill = async (req, res) => {
         dueDate,
         order.total_amount,
         companyId,
+        financialYear.id,
         id,
       ]
     );

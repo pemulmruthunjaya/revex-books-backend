@@ -1808,6 +1808,14 @@ exports.importTransactions = async (req, res) => {
     return res.status(400).json({ message: "Invalid transaction import type" });
   }
 
+  if (["sales_invoices", "purchase_bills", "customer_payments", "vendor_payments"].includes(type)) {
+    return res.status(409).json({
+      code: "OPERATIONAL_IMPORT_ACCOUNTING_PATH_REQUIRED",
+      message:
+        "This transaction import type is temporarily unavailable because financial and accounting integrity requires the controlled transaction workflow.",
+    });
+  }
+
   const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
   const affectStock = Boolean(req.body.affectStock);
   const fileName = String(req.body.fileName || "").slice(0, 255);

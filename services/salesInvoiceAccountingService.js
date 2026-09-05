@@ -56,8 +56,8 @@ const postSalesInvoiceJournal = async (connection, invoice) => {
   const [journalResult] = await connection.query(
     `INSERT INTO journal_entries
      (journal_no,journal_date,narration,total_debit,total_credit,created_by,
-      company_id,source_type,source_id)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
+      company_id,financial_year_id,source_type,source_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
     [
       journalNo,
       invoice.invoice_date,
@@ -66,6 +66,7 @@ const postSalesInvoiceJournal = async (connection, invoice) => {
       total,
       Number(invoice.created_by),
       companyId,
+      Number(invoice.financial_year_id),
       "sales_invoice",
       invoiceId,
     ]
