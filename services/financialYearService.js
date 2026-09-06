@@ -195,9 +195,16 @@ const resolveFinancialYearForDate = async (companyId, businessDate, executor = d
   const normalizedCompanyId = positiveId(companyId, "companyId");
   const normalizedDate = accountingDate(businessDate, "businessDate");
   const [rows] = await executor.query(
-    `${FY_SELECT} WHERE company_id=? AND ? BETWEEN start_date AND end_date LIMIT 1`,
+    `${FY_SELECT} WHERE company_id=? AND ? BETWEEN start_date AND end_date ORDER BY id LIMIT 2`,
     [normalizedCompanyId, normalizedDate]
   );
+  if (rows.length > 1) {
+    fail(
+      "FINANCIAL_YEAR_AMBIGUOUS",
+      "Multiple financial years cover the transaction date for this company",
+      409
+    );
+  }
   return rowShape(rows[0]);
 };
 

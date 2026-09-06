@@ -76,7 +76,22 @@ test("date resolution is company-scoped, inclusive, and returns null when absent
   assert.equal(first.status, "OPEN");
   assert.equal(outside, null);
   assert.match(calls[0].sql, /company_id=\? AND \? BETWEEN start_date AND end_date/);
+  assert.match(calls[0].sql, /ORDER BY id LIMIT 2/);
   assert.deepEqual(calls[0].params, [4, "2026-04-01"]);
+});
+
+test("date resolution fails closed when multiple financial years match", async () => {
+  const executor = {
+    query: async () => [[
+      fyRow({ id: 21, start_date: "2026-04-01", end_date: "2027-03-31" }),
+      fyRow({ id: 22, start_date: "2026-06-01", end_date: "2027-05-31" }),
+    ]],
+  };
+
+  await assert.rejects(
+    resolveFinancialYearForDate(4, "2026-08-12", executor),
+    { code: "FINANCIAL_YEAR_AMBIGUOUS", status: 409 }
+  );
 });
 
 const fyRow = (overrides = {}) => ({

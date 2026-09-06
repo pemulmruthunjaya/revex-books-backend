@@ -4,11 +4,11 @@ const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../s
 /**
  * GENERATE JOURNAL NUMBER
  */
-const generateJournalNumber = async (company_id) => {
+const generateJournalNumber = async (company_id, executor = db) => {
 
     try {
 
-        const [rows] = await db.execute(`
+        const [rows] = await executor.execute(`
             SELECT id
             FROM journal_entries
             WHERE company_id = ?
@@ -40,6 +40,9 @@ const generateJournalNumber = async (company_id) => {
  * CREATE JOURNAL ENTRY
  */
 exports.createJournalEntry = async (req, res) => {
+
+    let connection;
+    let transactionStarted = false;
 
     try {
         rejectClientFinancialYear(req.body);
@@ -101,13 +104,17 @@ exports.createJournalEntry = async (req, res) => {
         /**
          * GENERATE JOURNAL NUMBER
          */
-        const journalNo = await generateJournalNumber(company_id);
-        const financialYear = await requireFinancialYearForDate(company_id, journal_date, db);
+        connection = await db.getConnection();
+        await connection.beginTransaction();
+        transactionStarted = true;
+
+        const journalNo = await generateJournalNumber(company_id, connection);
+        const financialYear = await requireFinancialYearForDate(company_id, journal_date, connection);
 
         /**
          * INSERT MASTER ENTRY
          */
-        const [journalResult] = await db.execute(
+        const [journalResult] = await connection.execute(
             `
             INSERT INTO journal_entries (
                 journal_no,
@@ -138,7 +145,7 @@ exports.createJournalEntry = async (req, res) => {
          */
         for (const item of entries) {
 
-            await db.execute(
+            await connection.execute(
                 `
                 INSERT INTO journal_entry_details (
                     journal_entry_id,
@@ -163,6 +170,9 @@ exports.createJournalEntry = async (req, res) => {
         /**
          * SUCCESS RESPONSE
          */
+        await connection.commit();
+        transactionStarted = false;
+
         res.status(201).json({
             success: true,
             message: "Journal entry created successfully",
@@ -172,6 +182,10 @@ exports.createJournalEntry = async (req, res) => {
 
     } catch (error) {
 
+        if (transactionStarted) {
+            try { await connection.rollback(); } catch { /* preserve original error */ }
+        }
+
         console.log("CREATE JOURNAL ERROR:", error);
 
         res.status(error.status || 500).json({
@@ -179,6 +193,8 @@ exports.createJournalEntry = async (req, res) => {
             message: error.message
         });
 
+    } finally {
+        if (connection && typeof connection.release === "function") connection.release();
     }
 
 };
