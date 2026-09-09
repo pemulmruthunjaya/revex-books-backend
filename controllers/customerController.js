@@ -1,5 +1,6 @@
 const db = require("../db/connection");
 const { ensureCustomerPartySchema } = require("../services/customerPartyService");
+const { rejectClientFinancialYear } = require("../services/financialYearService");
 const {
   recordOpeningBalanceEvent,
   resolvePartyControlAccount,
@@ -34,6 +35,7 @@ exports.createCustomer = async (req, res) => {
   let connection;
 
   try {
+    rejectClientFinancialYear(req.body);
     if (!req.user?.company_id) {
       return res.status(401).json({ message: "Invalid token or company not found" });
     }
@@ -159,9 +161,9 @@ exports.createCustomer = async (req, res) => {
   } catch (error) {
     if (connection) await connection.rollback();
     console.error("Create customer error:", error);
-    return res.status(500).json({
-      message: "Failed to create customer",
-      error: error.message,
+    return res.status(error.status || 500).json({
+      message: error.status ? error.message : "Failed to create customer",
+      ...(error.code ? { code: error.code } : {}),
     });
   } finally {
     if (connection) connection.release();
@@ -307,6 +309,7 @@ exports.updateCustomer = async (req, res) => {
   let connection;
 
   try {
+    rejectClientFinancialYear(req.body);
     if (!req.user?.company_id) {
       return res.status(401).json({ message: "Invalid token" });
     }
@@ -470,8 +473,8 @@ exports.updateCustomer = async (req, res) => {
     if (connection) await connection.rollback();
     console.error("Update customer error:", error);
     return res.status(error.status || 500).json({
-      message: "Failed to update customer",
-      error: error.message,
+      message: error.status ? error.message : "Failed to update customer",
+      ...(error.code ? { code: error.code } : {}),
     });
   } finally {
     if (connection) connection.release();

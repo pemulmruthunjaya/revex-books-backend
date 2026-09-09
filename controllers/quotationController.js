@@ -1,5 +1,5 @@
 const db = require("../db/connection");
-const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
+const { requireFinancialYearForPosting, rejectClientFinancialYear } = require("../services/financialYearService");
 const { postSalesInvoiceJournal } = require("../services/salesInvoiceAccountingService");
 
 let quotationTablesReady = false;
@@ -460,7 +460,7 @@ exports.convertQuotationToInvoice = async (req, res) => {
 
     await ensureInvoiceConversionColumns(connection);
     await connection.beginTransaction();
-    const financialYear = await requireFinancialYearForDate(companyId, invoiceDate, connection);
+    const financialYear = await requireFinancialYearForPosting(companyId, invoiceDate, connection);
 
     const [quotations] = await connection.query(
       `SELECT *
@@ -617,7 +617,10 @@ exports.convertQuotationToInvoice = async (req, res) => {
       return res.status(409).json({ message: "Invoice number already exists" });
     }
 
-    res.status(500).json({ message: error.message || "Server error" });
+    res.status(error.status || 500).json({
+      message: error.status ? error.message : "Server error",
+      ...(error.code ? { code: error.code } : {}),
+    });
   } finally {
     connection.release();
   }

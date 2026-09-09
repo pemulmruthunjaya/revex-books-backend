@@ -2,6 +2,10 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db/connection");
 const authMiddleware = require("../middleware/authMiddleware");
+const {
+  assertUnchangedProductStock,
+  assertZeroInitialStock,
+} = require("../services/productStockSafety");
 
 let productColumnsReady = false;
 
@@ -100,6 +104,7 @@ router.get("/", authMiddleware, async (req, res) => {
 /* ================= ADD PRODUCT ================= */
 router.post("/", authMiddleware, async (req, res) => {
   try {
+    assertZeroInitialStock(req.body);
     await ensureProductColumns();
 
     const product = normalizeProductPayload(req.body);
@@ -143,9 +148,9 @@ router.post("/", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("❌ ADD PRODUCT ERROR:", err);
 
-    res.status(500).json({
-      error: "Failed to create product",
-      details: err.message,
+    res.status(err.status || 500).json({
+      error: err.status ? err.message : "Failed to create product",
+      ...(err.code ? { code: err.code } : {}),
     });
   }
 });
@@ -166,6 +171,15 @@ router.put("/:id", authMiddleware, async (req, res) => {
       });
     }
 
+    const [existingRows] = await db.query(
+      "SELECT id,stock,opening_stock FROM products WHERE id=? AND company_id=? LIMIT 1",
+      [id, req.user.company_id]
+    );
+    if (!existingRows.length) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+    assertUnchangedProductStock(req.body, existingRows[0]);
+
     const [result] = await db.query(
       `UPDATE products
        SET name=?,
@@ -181,8 +195,6 @@ router.put("/:id", authMiddleware, async (req, res) => {
            purchase_price=?,
            sellingPrice=?,
            mrp=?,
-           opening_stock=?,
-           stock=?,
            reorder_level=?,
            status=?
        WHERE id=? AND company_id=?`,
@@ -200,8 +212,6 @@ router.put("/:id", authMiddleware, async (req, res) => {
         product.purchase_price,
         product.sellingPrice,
         product.mrp,
-        product.opening_stock,
-        product.stock,
         product.reorder_level,
         product.status,
         id,
@@ -217,9 +227,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("❌ UPDATE ERROR:", err);
 
-    res.status(500).json({
-      error: "Failed to update product",
-      details: err.message,
+    res.status(err.status || 500).json({
+      error: err.status ? err.message : "Failed to update product",
+      ...(err.code ? { code: err.code } : {}),
     });
   }
 });

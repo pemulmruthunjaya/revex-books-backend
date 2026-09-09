@@ -1,4 +1,5 @@
 const SOURCE_TYPE = "opening_balance";
+const { requireFinancialYearForPosting, requireFinancialYearForMutation } = require("./financialYearService");
 const BALANCE_SHEET_TYPES = new Set(["ASSET", "LIABILITY", "EQUITY"]);
 
 const money = (value) => Math.round(Number(value || 0) * 100) / 100;
@@ -90,6 +91,27 @@ const recordOpeningBalanceEvent = async ({
   const delta = money(newSignedAmount - previousSignedAmount);
   if (!delta) return { posted: false, delta: 0 };
 
+  const [[dateRow]] = await connection.query("SELECT DATE_FORMAT(CURRENT_DATE,'%Y-%m-%d') opening_date");
+  const openingDate = dateRow.opening_date;
+  if (previousSignedAmount) {
+    const [existingRows] = await connection.query(
+      `SELECT je.financial_year_id
+       FROM opening_balance_events obe
+       INNER JOIN journal_entries je ON je.id=obe.journal_entry_id AND je.company_id=obe.company_id
+       WHERE obe.company_id=? AND obe.entity_type=? AND obe.entity_id=?
+       ORDER BY obe.sequence_no DESC LIMIT 1 FOR UPDATE`,
+      [companyId, entityType, entityId]
+    );
+    if (!existingRows.length) {
+      const error = new Error("Existing opening balance accounting history was not found");
+      error.status = 409;
+      error.code = "OPENING_BALANCE_HISTORY_NOT_FOUND";
+      throw error;
+    }
+    await requireFinancialYearForMutation(companyId, existingRows[0].financial_year_id, connection);
+  }
+  const financialYear = await requireFinancialYearForPosting(companyId, openingDate, connection);
+
   const equity = await ensureOpeningBalanceEquity(connection, companyId);
   if (Number(equity.id) === Number(targetAccount.id)) {
     const error = new Error("Opening Balance Equity cannot carry its own opening balance");
@@ -115,9 +137,9 @@ const recordOpeningBalanceEvent = async ({
   const narration = `${eventKind === "initial" ? "Opening balance" : "Opening balance adjustment"} - ${targetAccount.account_name}`;
   const [journalResult] = await connection.query(
     `INSERT INTO journal_entries
-     (journal_no,journal_date,narration,total_debit,total_credit,created_by,company_id,source_type,source_id)
-     VALUES (?,CURRENT_DATE,?,?,?,?,?,?,?)`,
-    [`OB-${companyId}-${eventId}`, narration, amount, amount, createdBy, companyId, SOURCE_TYPE, eventId]
+     (journal_no,journal_date,narration,total_debit,total_credit,created_by,company_id,financial_year_id,source_type,source_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [`OB-${companyId}-${eventId}`, openingDate, narration, amount, amount, createdBy, companyId, financialYear.id, SOURCE_TYPE, eventId]
   );
   const journalId = journalResult.insertId;
   const debitAccount = delta > 0 ? targetAccount.id : equity.id;

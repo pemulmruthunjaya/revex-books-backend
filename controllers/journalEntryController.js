@@ -1,5 +1,5 @@
 const db = require("../db/connection");
-const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
+const { requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("../services/financialYearService");
 
 /**
  * GENERATE JOURNAL NUMBER
@@ -109,7 +109,7 @@ exports.createJournalEntry = async (req, res) => {
         transactionStarted = true;
 
         const journalNo = await generateJournalNumber(company_id, connection);
-        const financialYear = await requireFinancialYearForDate(company_id, journal_date, connection);
+        const financialYear = await requireFinancialYearForPosting(company_id, journal_date, connection);
 
         /**
          * INSERT MASTER ENTRY
@@ -369,13 +369,21 @@ exports.getSingleJournalEntry = async (req, res) => {
  * DELETE JOURNAL ENTRY
  */
 exports.deleteJournalEntry = async (req, res) => {
-
+    let connection;
     try {
 
         const { id } = req.params;
         const company_id = req.user.company_id;
 
-        const [result] = await db.execute(
+        connection = await db.getConnection();
+        await connection.beginTransaction();
+        const [journalRows] = await connection.execute(
+            "SELECT id,financial_year_id FROM journal_entries WHERE id=? AND company_id=? FOR UPDATE",
+            [id, company_id]
+        );
+        if (!journalRows.length) { await connection.rollback(); return res.status(404).json({ success: false, message: "Journal entry not found" }); }
+        await requireFinancialYearForMutation(company_id, journalRows[0].financial_year_id, connection);
+        const [result] = await connection.execute(
             `
             DELETE FROM journal_entries
             WHERE id = ?
@@ -385,12 +393,14 @@ exports.deleteJournalEntry = async (req, res) => {
         );
 
         if (result.affectedRows === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 success: false,
                 message: "Journal entry not found"
             });
         }
 
+        await connection.commit();
         res.status(200).json({
             success: true,
             message: "Journal entry deleted successfully"
@@ -398,13 +408,17 @@ exports.deleteJournalEntry = async (req, res) => {
 
     } catch (error) {
 
+        if (connection) await connection.rollback();
+
         console.log("DELETE JOURNAL ERROR:", error);
 
-        res.status(500).json({
+        res.status(error.status || 500).json({
             success: false,
-            message: error.message
+            message: error.status ? error.message : "Server error",
+            ...(error.code ? { code: error.code } : {})
         });
-
+    } finally {
+        if (connection && typeof connection.release === "function") connection.release();
     }
 
 };

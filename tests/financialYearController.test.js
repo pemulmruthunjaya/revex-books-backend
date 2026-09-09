@@ -90,12 +90,12 @@ test("authorized create passes only approved fields and server identity", async 
   const controller = createFinancialYearController({ service, logger: { error() {} } });
   const result = await invoke(controller.create, request({ body: {
     code: "FY26", name: "FY 2026-27", start_date: "2026-04-01",
-    end_date: "2027-03-31", status: "OPEN", is_default: true,
+    end_date: "2027-03-31", status: "DRAFT", is_default: true,
   } }));
   assert.equal(result.status[0], 201);
   assert.deepEqual(input, {
     companyId: 4, code: "FY26", name: "FY 2026-27", startDate: "2026-04-01",
-    endDate: "2027-03-31", status: "OPEN", isDefault: true, source: "API",
+    endDate: "2027-03-31", status: "DRAFT", isDefault: true, source: "API",
     actorUserId: 13, reason: "Financial year created",
   });
 });
@@ -200,4 +200,26 @@ test("unexpected service failures never expose database internals", async () => 
   assert.equal(result.body[0].code, "FINANCIAL_YEAR_OPERATION_FAILED");
   assert.doesNotMatch(JSON.stringify(result.body[0]), /SELECT|password|secret_table/i);
   assert.equal(logs.length, 1);
+});
+
+test("transition is company scoped, strictly shaped, and returns no-op metadata", async () => {
+  let input;
+  const service = { transitionFinancialYear: async (value) => { input=value; return {financialYear:year(),changed:false,event:null}; } };
+  const controller=createFinancialYearController({service,logger:{error(){}}});
+  const result=await invoke(controller.transition,request({params:{id:"21"},body:{target_status:"OPEN",reason:"reviewed",confirmation:null}}));
+  assert.equal(result.body[0].changed,false);
+  assert.deepEqual(input,{companyId:4,financialYearId:"21",targetStatus:"OPEN",reason:"reviewed",confirmation:null,actorUserId:13});
+  const rejected=await invoke(controller.transition,request({params:{id:"21"},body:{target_status:"OPEN",company_id:9}}));
+  assert.equal(rejected.status[0],400);
+  assert.equal(rejected.body[0].code,"UNSUPPORTED_FIELD");
+});
+
+test("transition errors retain stable safe status and code", async () => {
+  for (const [code,status] of [["FINANCIAL_YEAR_TRANSITION_NOT_ALLOWED",409],["FINANCIAL_YEAR_LOCK_CONFIRMATION_REQUIRED",400],["ACTOR_COMPANY_MISMATCH",403],["FINANCIAL_YEAR_NOT_FOUND",404]]) {
+    const service={transitionFinancialYear:async()=>{throw new FinancialYearServiceError(code,"internal detail",status);}};
+    const result=await invoke(createFinancialYearController({service,logger:{error(){}}}).transition,request({params:{id:"21"},body:{target_status:"LOCKED"}}));
+    assert.equal(result.status[0],status);
+    assert.equal(result.body[0].code,code);
+    assert.doesNotMatch(JSON.stringify(result.body[0]),/internal detail/);
+  }
 });

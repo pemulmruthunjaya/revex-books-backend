@@ -23,7 +23,7 @@ const run = async () => {
       if (sql.includes("FROM financial_years")) return [[{ id: 2026, company_id: 2, code: "FY26", name: "FY 2026", start_date: "2026-04-01", end_date: "2027-03-31", status: "OPEN", is_default: 1, source: "MANUAL", created_by: 3 }]];
       if (sql.includes("SELECT id,journal_entry_id FROM vendor_payments")) return [[]];
       if (sql.includes("FROM bills b INNER JOIN vendors")) {
-        return [[{ id: 13, vendor_id: 7, bill_number: "BILL-0013", total_amount: 784, vendor_name: "PKD Traders" }]];
+        return [[{ id: 13, vendor_id: 7, bill_number: "BILL-0013", total_amount: 784, financial_year_id: 2026, vendor_name: "PKD Traders" }]];
       }
       if (sql.includes("COALESCE(SUM(amount),0) paid")) return [[{ paid: 0 }]];
       if (sql.includes("FROM accounts a LEFT JOIN accounts p")) {

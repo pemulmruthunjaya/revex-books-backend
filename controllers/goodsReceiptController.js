@@ -1,5 +1,5 @@
 const db = require("../db/connection");
-const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
+const { requireFinancialYearForPosting, rejectClientFinancialYear } = require("../services/financialYearService");
 
 const userId = (req) => req.user.user_id || req.user.id || null;
 const fail = (message, status = 400) =>
@@ -67,6 +67,7 @@ async function postReceipt(connection, req, receiptId) {
   const receipt = receipts[0];
   if (receipt.stock_posted || receipt.status === "Posted")
     throw fail("GRN stock has already been posted", 409);
+  await requireFinancialYearForPosting(companyId, receipt.grn_date, connection);
   const { items: poItems } = await loadPoForReceipt(
     connection,
     companyId,
@@ -267,6 +268,7 @@ exports.getBillable = async (req, res) => {
 exports.create = async (req, res) => {
   const connection = await db.getConnection();
   try {
+    rejectClientFinancialYear(req.body);
     const companyId = req.user.company_id,
       {
         purchase_order_id,
@@ -358,6 +360,7 @@ exports.create = async (req, res) => {
       message: error.message,
     });
     res.status(error.code === "ER_DUP_ENTRY" ? 409 : error.status || 500).json({
+      ...(error.code && error.code !== "ER_DUP_ENTRY" ? { code: error.code } : {}),
       message:
         error.code === "ER_DUP_ENTRY"
           ? "GRN number already exists"
@@ -372,6 +375,7 @@ exports.create = async (req, res) => {
 exports.post = async (req, res) => {
   const connection = await db.getConnection();
   try {
+    rejectClientFinancialYear(req.body);
     await connection.beginTransaction();
     await postReceipt(connection, req, req.params.id);
     await connection.commit();
@@ -386,7 +390,10 @@ exports.post = async (req, res) => {
     });
     res
       .status(error.status || 500)
-      .json({ message: error.status ? error.message : "Unable to post GRN" });
+      .json({
+        ...(error.code ? { code: error.code } : {}),
+        message: error.status ? error.message : "Unable to post GRN",
+      });
   } finally {
     connection.release();
   }
@@ -427,6 +434,8 @@ exports.createBill = async (req, res) => {
     const companyId = req.user.company_id;
     rejectClientFinancialYear(req.body);
     await connection.beginTransaction();
+    const billDate = req.body.bill_date || new Date().toISOString().slice(0, 10);
+    const financialYear = await requireFinancialYearForPosting(companyId, billDate, connection);
     const [receipts] = await connection.query(
       "SELECT * FROM goods_receipts WHERE id=? AND company_id=? AND status='Posted' FOR UPDATE",
       [req.params.id, companyId],
@@ -464,8 +473,6 @@ exports.createBill = async (req, res) => {
           (1 + Number(item.gst_percent) / 100),
       0,
     );
-    const billDate = req.body.bill_date || new Date().toISOString().slice(0, 10);
-    const financialYear = await requireFinancialYearForDate(companyId, billDate, connection);
     const [bill] = await connection.query(
       `INSERT INTO bills (vendor_id,bill_number,bill_date,due_date,total_amount,status,company_id,financial_year_id,source_purchase_order_id,source_grn_id,stock_posted) VALUES (?,?,?,?,?,'Unpaid',?,?,?,?,0)`,
       [
@@ -515,10 +522,11 @@ exports.createBill = async (req, res) => {
     });
     res.status(error.status || 500).json({
       message: error.status ? error.message : "Unable to create bill from GRN",
+      ...(error.code ? { code: error.code } : {}),
     });
   } finally {
     connection.release();
   }
 };
 
-exports._private = { loadPoForReceipt, refreshPoStatus, nextNumber };
+exports._private = { loadPoForReceipt, postReceipt, refreshPoStatus, nextNumber };

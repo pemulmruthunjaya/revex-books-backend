@@ -87,6 +87,8 @@ test("sales invoice journal posts balanced receivable, sales and GST lines once"
   const connection = {
     async query(sql, params) {
       calls.push({ sql, params });
+      if (sql.includes("FROM invoices") && sql.includes("financial_year_id") && sql.includes("FOR UPDATE")) return [[{ id: 7, financial_year_id: 2026 }]];
+      if (sql.includes("FROM financial_years") && sql.includes("FOR SHARE")) return [[{ id: 2026, company_id: 4, status: "OPEN" }]];
       if (sql.includes("FROM journal_entries") && sql.includes("source_type='sales_invoice'")) return [[]];
       if (sql.includes("FROM accounts") && sql.includes("LOWER(account_name)")) {
         const type = params[1] === "Accounts Receivable" ? "ASSET" : params[1] === "Sales" ? "INCOME" : "LIABILITY";
@@ -99,7 +101,7 @@ test("sales invoice journal posts balanced receivable, sales and GST lines once"
   };
   const result = await postSalesInvoiceJournal(connection, {
     id: 7, company_id: 4, created_by: 13, invoice_number: "INV-0007",
-    invoice_date: "2026-08-26", total_amount: 1180, tax_amount: 180,
+    invoice_date: "2026-08-26", total_amount: 1180, tax_amount: 180, financial_year_id: 2026,
   });
   assert.equal(result.debit, 1180);
   assert.equal(result.credit, 1180);
@@ -115,11 +117,12 @@ test("walk-in Cash invoice can settle directly by invoice without a dummy custom
   const connection = {
     async query(sql, params) {
       calls.push({ sql, params });
+      if (sql.includes("FROM financial_years") && sql.includes("FOR SHARE")) return [[{ id: 2026, company_id: 4, status: "OPEN" }]];
       if (sql.includes("FROM receipt_entries")) return [[]];
       if (sql.includes("SELECT a.*") && sql.includes("parent_account_name")) return [[account("Cash in Hand")]];
       if (sql.includes("SELECT id, invoice_number")) return [[{
         id: 44, invoice_number: "INV-0044", total_amount: 950,
-        status: "pending", customer_id: null, customer_name: "Walk In",
+        status: "pending", customer_id: null, customer_name: "Walk In", financial_year_id: 2026,
       }]];
       if (sql.includes("SELECT invoice_id, amount") && sql.includes("FROM payments")) {
         return [[]];
@@ -327,6 +330,8 @@ test("invoice and journal idempotency wiring precedes stock effects", async () =
   let inserts = 0;
   const duplicateConnection = {
     async query(sql) {
+      if (sql.includes("FROM invoices") && sql.includes("financial_year_id") && sql.includes("FOR UPDATE")) return [[{ id: 7, financial_year_id: 2026 }]];
+      if (sql.includes("FROM financial_years") && sql.includes("FOR SHARE")) return [[{ id: 2026, company_id: 4, status: "OPEN" }]];
       if (sql.includes("FROM journal_entries")) return [[{ id: 91, journal_no: "SINV-4-7" }]];
       inserts += 1;
       return [{ insertId: 1 }];
@@ -334,7 +339,7 @@ test("invoice and journal idempotency wiring precedes stock effects", async () =
   };
   const duplicate = await postSalesInvoiceJournal(duplicateConnection, {
     id: 7, company_id: 4, created_by: 13, invoice_number: "INV-0007",
-    invoice_date: "2026-08-26", total_amount: 1180, tax_amount: 180,
+    invoice_date: "2026-08-26", total_amount: 1180, tax_amount: 180, financial_year_id: 2026,
   });
   assert.equal(duplicate.duplicate, true);
   assert.equal(inserts, 0);

@@ -2,7 +2,7 @@ const db = require("../db/connection");
 const crypto = require("node:crypto");
 const { ensureReceiptEntrySchema, normalizePaymentMethod, postReceipt } = require("../services/receiptEntryService");
 const { postSalesInvoiceJournal } = require("../services/salesInvoiceAccountingService");
-const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
+const { requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("../services/financialYearService");
 
 let invoiceStatusColumnReady = false;
 let invoiceMrpColumnsReady = false;
@@ -466,7 +466,7 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
     if (!invoice_date || !items?.length) {
       throw invoiceCreationError("Missing required fields");
     }
-    const financialYear = await requireFinancialYearForDate(company_id, invoice_date, connection);
+    const financialYear = await requireFinancialYearForPosting(company_id, invoice_date, connection);
 
     if (requestId) {
       const [existing] = await connection.query(
@@ -935,33 +935,38 @@ exports.getInvoiceById = async (req, res) => {
  * ===============================
  */
 exports.deleteInvoice = async (req, res) => {
+  const connection = await db.getConnection();
   try {
     const { id } = req.params;
     const company_id = req.user.company_id;
 
-    const [invoice] = await db.query(
-      "SELECT id FROM invoices WHERE id=? AND company_id=?",
+    await connection.beginTransaction();
+    const [invoice] = await connection.query(
+      "SELECT id,financial_year_id FROM invoices WHERE id=? AND company_id=? FOR UPDATE",
       [id, company_id]
     );
 
     if (!invoice.length) {
+      await connection.rollback();
       return res.status(404).json({ message: "Invoice not found" });
     }
+    await requireFinancialYearForMutation(company_id, invoice[0].financial_year_id, connection);
 
-    const [financialLinks] = await db.query(
+    const [financialLinks] = await connection.query(
       `SELECT
          EXISTS(SELECT 1 FROM journal_entries WHERE company_id=? AND source_type='sales_invoice' AND source_id=?) has_sales_journal,
          EXISTS(SELECT 1 FROM payments WHERE company_id=? AND invoice_id=?) has_payments`,
       [company_id, id, company_id, id]
     );
     if (financialLinks[0]?.has_sales_journal || financialLinks[0]?.has_payments) {
+      await connection.rollback();
       return res.status(409).json({
         code: "POSTED_INVOICE_DELETE_NOT_ALLOWED",
         message: "A financially posted invoice cannot be deleted; a reversal workflow is required",
       });
     }
 
-    const [items] = await db.query(
+    const [items] = await connection.query(
       "SELECT * FROM invoice_items WHERE invoice_id=? AND company_id=?",
       [id, company_id]
     );
@@ -969,21 +974,25 @@ exports.deleteInvoice = async (req, res) => {
     // 🔁 RESTORE STOCK
     for (let item of items) {
       if (item.product_id) {
-        await db.query("UPDATE products SET stock = stock + ? WHERE id=? AND company_id=?", [item.quantity, item.product_id, company_id]);
+        await connection.query("UPDATE products SET stock = stock + ? WHERE id=? AND company_id=?", [item.quantity, item.product_id, company_id]);
       } else {
-        await db.query("UPDATE products SET stock = stock + ? WHERE name=? AND company_id=?", [item.quantity, item.item_name, company_id]);
+        await connection.query("UPDATE products SET stock = stock + ? WHERE name=? AND company_id=?", [item.quantity, item.item_name, company_id]);
       }
     }
 
-    await db.query(
+    await connection.query(
       "DELETE FROM invoices WHERE id=? AND company_id=?",
       [id, company_id]
     );
 
+    await connection.commit();
     res.json({ message: "Invoice deleted & stock restored ✅" });
 
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    await connection.rollback();
+    res.status(error.status || 500).json({ message: error.status ? error.message : "Server error", ...(error.code ? { code: error.code } : {}) });
+  } finally {
+    connection.release();
   }
 };
 
@@ -1013,7 +1022,8 @@ exports.updateInvoice = async (req, res) => {
 
     const [invoiceRows] = await connection.query(
       `SELECT id, status, invoice_type, customer_id, customer_name, customer_phone,
-              cash_customer_name, cash_customer_mobile, credit_days, due_date, shipping_address
+              cash_customer_name, cash_customer_mobile, credit_days, due_date, shipping_address,
+              financial_year_id
        FROM invoices WHERE id=? AND company_id=? FOR UPDATE`,
       [id, company_id]
     );
@@ -1022,6 +1032,8 @@ exports.updateInvoice = async (req, res) => {
       await connection.rollback();
       return res.status(404).json({ message: "Invoice not found" });
     }
+
+    await requireFinancialYearForMutation(company_id, invoiceRows[0].financial_year_id, connection);
 
     const [postedRows] = await connection.query(
       `SELECT id FROM journal_entries
@@ -1035,7 +1047,7 @@ exports.updateInvoice = async (req, res) => {
         message: "A financially posted invoice cannot be edited; a reversal workflow is required",
       });
     }
-    const financialYear = await requireFinancialYearForDate(company_id, invoice_date, connection);
+    const financialYear = await requireFinancialYearForPosting(company_id, invoice_date, connection);
 
     const party = await resolveInvoicePersistence({
       body: req.body,
@@ -1277,23 +1289,37 @@ exports.updateInvoiceStatus = async (req, res) => {
     return res.status(400).json({ message: "Invalid invoice status" });
   }
 
-  await ensureInvoiceStatusColumn();
+  const connection = await db.getConnection();
+  try {
+    await ensureInvoiceStatusColumn();
+    await connection.beginTransaction();
+    const [invoiceRows] = await connection.query(
+      "SELECT id,financial_year_id FROM invoices WHERE id=? AND company_id=? FOR UPDATE",
+      [id, company_id]
+    );
+    if (!invoiceRows.length) { await connection.rollback(); return res.status(404).json({ message: "Invoice not found" }); }
+    await requireFinancialYearForMutation(company_id, invoiceRows[0].financial_year_id, connection);
+    const [result] = await connection.query(
+      "UPDATE invoices SET status=? WHERE id=? AND company_id=? AND payment_status IS NULL",
+      [status, id, company_id]
+    );
 
-  const [result] = await db.query(
-    "UPDATE invoices SET status=? WHERE id=? AND company_id=? AND payment_status IS NULL",
-    [status, id, company_id]
-  );
+    if (result.affectedRows === 0) {
+      await connection.rollback();
+      return res.status(409).json({
+        code: "PAYMENT_STATUS_MANUAL_UPDATE_NOT_ALLOWED",
+        message: "Payment status for a classified invoice is derived from settlement records",
+      });
+    }
 
-  if (result.affectedRows === 0) {
-    const [rows] = await db.query("SELECT id FROM invoices WHERE id=? AND company_id=?", [id, company_id]);
-    if (!rows.length) return res.status(404).json({ message: "Invoice not found" });
-    return res.status(409).json({
-      code: "PAYMENT_STATUS_MANUAL_UPDATE_NOT_ALLOWED",
-      message: "Payment status for a classified invoice is derived from settlement records",
-    });
+    await connection.commit();
+    res.json({ message: "Status updated" });
+  } catch (error) {
+    await connection.rollback();
+    res.status(error.status || 500).json({ message: error.status ? error.message : "Server error", ...(error.code ? { code: error.code } : {}) });
+  } finally {
+    connection.release();
   }
-
-  res.json({ message: "Status updated" });
 };
 
 /**

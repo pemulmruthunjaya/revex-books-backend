@@ -11,5 +11,6 @@ router.get("/:id/events", controller.events);
 router.get("/:id", controller.getOne);
 router.post("/", ownerOnly, controller.create);
 router.post("/:id/default", ownerOnly, controller.setDefault);
+router.post("/:id/transitions", ownerOnly, controller.transition);
 
 module.exports = router;

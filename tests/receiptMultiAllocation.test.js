@@ -38,6 +38,7 @@ const makeConnection = ({ invoices, paidRows = [], failOnPayment = 0 } = {}) => 
       }
       if (sql.includes("FROM customers") && sql.includes("FOR UPDATE")) return [[{ id: 1, name: "Ramki" }]];
       if (sql.includes("FROM invoices") && sql.includes("ORDER BY id") && sql.includes("FOR UPDATE")) return [invoices];
+      if (sql.includes("FROM financial_years") && sql.includes("FOR SHARE")) return [[{ id: 2026, company_id: 4, status: "OPEN" }]];
       if (sql.includes("SELECT invoice_id, amount") && sql.includes("FROM payments")) return [paidRows];
       if (sql.includes("FROM accounts") && sql.includes("LOWER(account_name)")) {
         return [[{ id: 30, account_code: "1100", account_name: "Accounts Receivable", account_type: "ASSET" }]];
@@ -56,8 +57,8 @@ const makeConnection = ({ invoices, paidRows = [], failOnPayment = 0 } = {}) => 
 };
 
 const invoices = [
-  { id: 11, invoice_number: "INV-11", total_amount: "2000.00", status: "pending", customer_id: 1, customer_name: "Ramki" },
-  { id: 22, invoice_number: "INV-22", total_amount: "4000.00", status: "pending", customer_id: 1, customer_name: "Ramki" },
+  { id: 11, invoice_number: "INV-11", total_amount: "2000.00", status: "pending", customer_id: 1, customer_name: "Ramki", financial_year_id: 2026 },
+  { id: 22, invoice_number: "INV-22", total_amount: "4000.00", status: "pending", customer_id: 1, customer_name: "Ramki", financial_year_id: 2026 },
 ];
 
 test("money normalization is exact to two decimal minor units", () => {

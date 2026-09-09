@@ -1,5 +1,5 @@
 const db = require("../db/connection");
-const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
+const { requireFinancialYearForPosting, rejectClientFinancialYear } = require("../services/financialYearService");
 
 let purchaseOrderTablesReady = false;
 
@@ -508,7 +508,7 @@ exports.convertPurchaseOrderToBill = async (req, res) => {
 
     await ensureBillConversionColumns(connection);
     await connection.beginTransaction();
-    const financialYear = await requireFinancialYearForDate(companyId, billDate, connection);
+    const financialYear = await requireFinancialYearForPosting(companyId, billDate, connection);
 
     const [orders] = await connection.query(
       `SELECT po.*, v.id AS valid_vendor_id
@@ -652,7 +652,7 @@ exports.convertPurchaseOrderToBill = async (req, res) => {
       return res.status(409).json({ message: "Bill number already exists" });
     }
 
-    res.status(500).json({ message: error.message || "Server error" });
+    res.status(error.status || 500).json({ message: error.status ? error.message : "Server error", ...(error.code ? { code: error.code } : {}) });
   } finally {
     connection.release();
   }

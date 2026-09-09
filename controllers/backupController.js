@@ -2,6 +2,7 @@ const db = require("../db/connection");
 const { ensureAuditLogTable } = require("../services/auditLogService");
 const { ensurePayrollTables } = require("../services/payrollService");
 const { ensureUserAccessColumns } = require("../services/userAccessService");
+const { assertSafeProductImportRows } = require("../services/productStockSafety");
 
 const productInventoryColumns = [
   { name: "mrp", definition: "DECIMAL(10,2) NOT NULL DEFAULT 0" },
@@ -475,6 +476,21 @@ const rollbackTables = new Set([
   "vendors",
 ]);
 
+const restrictedRollbackTables = new Set([
+  "accounts",
+  "bill_items",
+  "bills",
+  "expenses",
+  "invoice_items",
+  "invoices",
+  "journal_entries",
+  "journal_entry_details",
+  "ledger_entries",
+  "payments",
+  "products",
+  "vendor_payments",
+]);
+
 const ensureDataHistoryTables = async (connection) => {
   await connection.query(
     `CREATE TABLE IF NOT EXISTS data_import_batches (
@@ -638,21 +654,14 @@ const mapImportRow = (row, config) => {
     mapped.mrp = toNumber(mapped.mrp, 0);
     mapped.reorder_level = toNumber(mapped.reorder_level, 0);
 
-    const stock = Object.prototype.hasOwnProperty.call(mapped, "stock")
-      ? mapped.stock
-      : mapped.opening_stock;
-    const openingStock = Object.prototype.hasOwnProperty.call(mapped, "opening_stock")
-      ? mapped.opening_stock
-      : stock;
-
-    mapped.stock = toNumber(stock, 0);
-    mapped.opening_stock = toNumber(openingStock, mapped.stock);
+    delete mapped.stock;
+    delete mapped.opening_stock;
   } else if (config.table === "accounts") {
     mapped.account_code = String(mapped.account_code || "").trim();
     mapped.account_name = String(mapped.account_name || "").trim();
     mapped.account_type = String(mapped.account_type || "").trim().toUpperCase();
     mapped.balance_type = String(mapped.balance_type || "DEBIT").trim().toUpperCase();
-    mapped.opening_balance = toNumber(mapped.opening_balance, 0);
+    delete mapped.opening_balance;
     mapped.status = String(mapped.status || "Active").trim().toLowerCase() === "inactive" ? 0 : 1;
   } else {
     mapped.name = String(mapped.name || "").trim();
@@ -662,6 +671,30 @@ const mapImportRow = (row, config) => {
   }
 
   return mapped;
+};
+
+const validateAccountImportRows = (rows) => {
+  for (const row of rows) {
+    const normalized = normalizeRow(row);
+    const clientFinancialYearKeys = ["financial year id", "financialyearid", "fy id", "fy"];
+    if (clientFinancialYearKeys.some((key) => Object.prototype.hasOwnProperty.call(normalized, key))) {
+      const error = new Error("Financial year cannot be selected through account master import");
+      error.status = 409;
+      error.code = "ACCOUNT_IMPORT_FINANCIAL_YEAR_NOT_ALLOWED";
+      throw error;
+    }
+    const opening = getAliasedValue(normalized, importConfigs.accounts.aliases.opening_balance);
+    if (opening === undefined) continue;
+    const parsed = Number(String(opening).replace(/[₹,]/g, "").trim());
+    if (!Number.isFinite(parsed) || parsed !== 0) {
+      const error = new Error(
+        "Opening balances cannot be imported as account master data; use the dedicated opening-balance workflow"
+      );
+      error.status = 409;
+      error.code = "ACCOUNT_IMPORT_OPENING_BALANCE_RESTRICTED";
+      throw error;
+    }
+  }
 };
 
 const cleanDbValue = (value) => {
@@ -1716,6 +1749,27 @@ exports.importMasterData = async (req, res) => {
     });
   }
 
+  if (type === "accounts") {
+    try {
+      validateAccountImportRows(rows);
+    } catch (error) {
+      return res.status(error.status || 409).json({
+        code: error.code,
+        message: error.message,
+      });
+    }
+  }
+  if (type === "products") {
+    try {
+      assertSafeProductImportRows(rows);
+    } catch (error) {
+      return res.status(error.status || 409).json({
+        code: error.code,
+        message: error.message,
+      });
+    }
+  }
+
   const connection = await db.getConnection();
 
   try {
@@ -1948,6 +2002,17 @@ exports.rollbackImport = async (req, res) => {
 
     if (!changes.length) {
       return res.status(400).json({ message: "No rollback details found for this import" });
+    }
+
+    if (changes.some((change) =>
+      restrictedRollbackTables.has(change.table_name) ||
+      (change.action === "created" && ["customers", "vendors"].includes(change.table_name))
+    )) {
+      return res.status(409).json({
+        code: "IMPORT_ROLLBACK_FINANCIAL_HISTORY_RESTRICTED",
+        message:
+          "This import cannot be rolled back because it could change protected financial, opening-balance, or stock history",
+      });
     }
 
     await connection.beginTransaction();

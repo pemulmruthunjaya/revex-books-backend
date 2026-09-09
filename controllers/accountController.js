@@ -1,4 +1,5 @@
 const db = require("../db/connection");
+const { rejectClientFinancialYear } = require("../services/financialYearService");
 const {
   naturalSide,
   recordOpeningBalanceEvent,
@@ -35,12 +36,17 @@ const sendAccountError = (res, error) => {
   if (error.code === "ER_DUP_ENTRY") {
     return res.status(400).json({ success: false, message: "Account code or opening event already exists" });
   }
-  return res.status(error.status || 500).json({ success: false, message: error.message || "Server error" });
+  return res.status(error.status || 500).json({
+    success: false,
+    message: error.status ? error.message : "Server error",
+    ...(error.code ? { code: error.code } : {}),
+  });
 };
 
 exports.createAccount = async (req, res) => {
   let connection;
   try {
+    rejectClientFinancialYear(req.body);
     if (!req.user?.company_id) return res.status(401).json({ success: false, message: "Invalid token" });
     const companyId = req.user.company_id;
     const values = accountValues(req.body);
@@ -104,6 +110,7 @@ exports.getSingleAccount = async (req, res) => {
 exports.updateAccount = async (req, res) => {
   let connection;
   try {
+    rejectClientFinancialYear(req.body);
     if (!req.user?.company_id) return res.status(401).json({ success: false, message: "Invalid token" });
     const companyId = req.user.company_id;
     const values = accountValues(req.body);

@@ -1,6 +1,6 @@
 const db = require("../db/connection");
 const { isCashBankAccount } = require("./receiptEntryService");
-const { requireFinancialYearForDate, rejectClientFinancialYear } = require("./financialYearService");
+const { requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("./financialYearService");
 
 const METHODS = ["Cash", "Bank Transfer", "UPI", "Cheque", "Card", "Other"];
 let schemaReady = false;
@@ -120,7 +120,7 @@ const recordVendorPayment = async (body, user) => {
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
-    const financialYear = await requireFinancialYearForDate(companyId, body.payment_date, connection);
+    const financialYear = await requireFinancialYearForPosting(companyId, body.payment_date, connection);
     const [duplicate] = await connection.query(
       `SELECT id,journal_entry_id FROM vendor_payments
        WHERE company_id=? AND idempotency_key=? LIMIT 1`,
@@ -131,7 +131,7 @@ const recordVendorPayment = async (body, user) => {
       return { payment_id: duplicate[0].id, journal_entry_id: duplicate[0].journal_entry_id, duplicate: true };
     }
     const [billRows] = await connection.query(
-      `SELECT b.id,b.vendor_id,b.bill_number,b.total_amount,v.name vendor_name
+      `SELECT b.id,b.vendor_id,b.bill_number,b.total_amount,b.financial_year_id,v.name vendor_name
        FROM bills b INNER JOIN vendors v
          ON v.id=b.vendor_id AND v.company_id=b.company_id
        WHERE b.id=? AND b.vendor_id=? AND b.company_id=?
@@ -141,6 +141,7 @@ const recordVendorPayment = async (body, user) => {
     );
     if (!billRows.length) throw paymentError("Bill not found for this vendor and company", 404);
     const bill = billRows[0];
+    await requireFinancialYearForMutation(companyId, bill.financial_year_id, connection);
     const [paidRows] = await connection.query(
       `SELECT COALESCE(SUM(amount),0) paid
        FROM vendor_payments WHERE bill_id=? AND company_id=? AND status='SUCCESS'`,

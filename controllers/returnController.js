@@ -387,3 +387,21 @@ exports.deleteReturn = async (req, res) => {
     connection.release();
   }
 };
+
+// Product Returns currently carry valued/GST semantics and move stock, but they
+// do not link to source documents or reverse accounting and settlement. Keep
+// historical reads available while preventing new or destructive pseudo-
+// financial activity until the complete controlled workflow exists.
+exports.createReturn = async (_req, res) =>
+  res.status(409).json({
+    code: "RETURN_ACCOUNTING_WORKFLOW_REQUIRED",
+    message:
+      "Sales and Purchase Returns are temporarily unavailable until the controlled return-accounting workflow is available",
+  });
+
+exports.deleteReturn = async (_req, res) =>
+  res.status(409).json({
+    code: "RETURN_HISTORICAL_MUTATION_RESTRICTED",
+    message:
+      "Existing Returns cannot be deleted because their stock and financial history must remain intact",
+  });

@@ -1,4 +1,5 @@
 const { ensureSystemAccount } = require("./receiptEntryService");
+const { requireFinancialYearForMutation } = require("./financialYearService");
 
 const money = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
@@ -36,6 +37,20 @@ const postSalesInvoiceJournal = async (connection, invoice) => {
   const total = money(invoice.total_amount);
   const tax = money(invoice.tax_amount);
   const salesAmount = money(total - tax);
+  const [invoiceRows] = await connection.query(
+    "SELECT id,financial_year_id FROM invoices WHERE id=? AND company_id=? LIMIT 1 FOR UPDATE",
+    [invoiceId, companyId]
+  );
+  if (!invoiceRows.length) {
+    throw Object.assign(new Error("Invoice not found for sales accounting"), { status: 404, code: "INVOICE_NOT_FOUND" });
+  }
+  if (Number(invoiceRows[0].financial_year_id) !== Number(invoice.financial_year_id)) {
+    throw Object.assign(new Error("Invoice financial year does not match the persisted transaction"), {
+      status: 409,
+      code: "FINANCIAL_YEAR_CONTEXT_MISMATCH",
+    });
+  }
+  await requireFinancialYearForMutation(companyId, invoiceRows[0].financial_year_id, connection);
 
   if (!(total >= 0) || tax < 0 || salesAmount < 0) {
     throw Object.assign(new Error("Invoice totals cannot be posted safely to Sales and GST ledgers"), {

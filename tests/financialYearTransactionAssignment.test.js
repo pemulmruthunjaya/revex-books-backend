@@ -46,16 +46,16 @@ test("missing, invalid and cross-company dates fail without accepting a client F
 
 test("approved write paths store only server-resolved financial years", () => {
   const expectations = {
-    "controllers/invoiceController.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear", "{ financialYear }"],
+    "controllers/invoiceController.js": ["financial_year_id", "requireFinancialYearForPosting", "requireFinancialYearForMutation", "rejectClientFinancialYear", "{ financialYear }"],
     "services/salesInvoiceAccountingService.js": ["financial_year_id", "invoice.financial_year_id"],
-    "services/receiptEntryService.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear"],
-    "controllers/billController.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear"],
-    "controllers/purchaseOrderController.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear"],
-    "controllers/goodsReceiptController.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear"],
-    "controllers/quotationController.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear", "postSalesInvoiceJournal"],
-    "services/vendorPaymentService.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear"],
-    "controllers/expenseController.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear"],
-    "controllers/journalEntryController.js": ["financial_year_id", "requireFinancialYearForDate", "rejectClientFinancialYear"],
+    "services/receiptEntryService.js": ["financial_year_id", "requireFinancialYearForPosting", "requireFinancialYearForMutation", "rejectClientFinancialYear"],
+    "controllers/billController.js": ["financial_year_id", "requireFinancialYearForPosting", "requireFinancialYearForMutation", "rejectClientFinancialYear"],
+    "controllers/purchaseOrderController.js": ["financial_year_id", "requireFinancialYearForPosting", "rejectClientFinancialYear"],
+    "controllers/goodsReceiptController.js": ["financial_year_id", "requireFinancialYearForPosting", "rejectClientFinancialYear"],
+    "controllers/quotationController.js": ["financial_year_id", "requireFinancialYearForPosting", "rejectClientFinancialYear", "postSalesInvoiceJournal"],
+    "services/vendorPaymentService.js": ["financial_year_id", "requireFinancialYearForPosting", "requireFinancialYearForMutation", "rejectClientFinancialYear"],
+    "controllers/expenseController.js": ["financial_year_id", "requireFinancialYearForPosting", "requireFinancialYearForMutation", "rejectClientFinancialYear"],
+    "controllers/journalEntryController.js": ["financial_year_id", "requireFinancialYearForPosting", "requireFinancialYearForMutation", "rejectClientFinancialYear"],
     "services/recurringInvoiceService.js": ["createInvoiceRecord"],
   };
   for (const [file, needles] of Object.entries(expectations)) {

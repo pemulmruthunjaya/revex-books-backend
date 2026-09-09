@@ -1,5 +1,6 @@
 const db = require("../db/connection");
 const { ensureVendorPartySchema } = require("../services/vendorPartyService");
+const { rejectClientFinancialYear } = require("../services/financialYearService");
 const {
   recordOpeningBalanceEvent,
   resolvePartyControlAccount,
@@ -81,6 +82,7 @@ const saveBanks = async (connection, vendorId, companyId, bankAccounts) => {
 exports.createVendor = async (req, res) => {
   let connection;
   try {
+    rejectClientFinancialYear(req.body);
     await ensureVendorPartySchema();
     const party = normalize(req.body);
     const error = validate(party);
@@ -127,7 +129,10 @@ exports.createVendor = async (req, res) => {
   } catch (error) {
     if (connection) await connection.rollback();
     console.error("Create vendor error:", error);
-    return res.status(500).json({ message: "Failed to create vendor" });
+    return res.status(error.status || 500).json({
+      message: error.status ? error.message : "Failed to create vendor",
+      ...(error.code ? { code: error.code } : {}),
+    });
   } finally {
     if (connection) connection.release();
   }
@@ -205,6 +210,7 @@ exports.getVendorById = async (req, res) => {
 exports.updateVendor = async (req, res) => {
   let connection;
   try {
+    rejectClientFinancialYear(req.body);
     await ensureVendorPartySchema();
     const party = normalize(req.body);
     const error = validate(party);
@@ -277,7 +283,10 @@ exports.updateVendor = async (req, res) => {
   } catch (error) {
     if (connection) await connection.rollback();
     console.error("Update vendor error:", error);
-    return res.status(error.status || 500).json({ message: error.message || "Failed to update vendor" });
+    return res.status(error.status || 500).json({
+      message: error.status ? error.message : "Failed to update vendor",
+      ...(error.code ? { code: error.code } : {}),
+    });
   } finally {
     if (connection) connection.release();
   }

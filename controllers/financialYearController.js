@@ -8,6 +8,7 @@ const CREATE_FIELDS = new Set([
   "status",
   "is_default",
 ]);
+const TRANSITION_FIELDS = new Set(["target_status", "reason", "confirmation"]);
 
 const ERROR_RESPONSES = {
   INVALID_ID: [400, "Invalid identifier"],
@@ -15,6 +16,9 @@ const ERROR_RESPONSES = {
   INVALID_DATE_RANGE: [400, "Financial year start date must be on or before end date"],
   INVALID_INPUT: [400, "Invalid financial year details"],
   INVALID_STATUS: [400, "Invalid financial year status"],
+  FINANCIAL_YEAR_INITIAL_STATUS_INVALID: [400, "New financial years must start in Draft status"],
+  FINANCIAL_YEAR_TRANSITION_REASON_REQUIRED: [400, "A reason is required for this transition"],
+  FINANCIAL_YEAR_LOCK_CONFIRMATION_REQUIRED: [400, "Type LOCK to confirm this transition"],
   COMPANY_NOT_FOUND: [404, "Company not found"],
   FINANCIAL_YEAR_NOT_FOUND: [404, "Financial year not found"],
   ACTOR_COMPANY_MISMATCH: [403, "User is not authorized for this company"],
@@ -22,6 +26,13 @@ const ERROR_RESPONSES = {
   DUPLICATE_FINANCIAL_YEAR_CODE: [409, "Financial year code already exists"],
   DUPLICATE_FINANCIAL_YEAR_DATES: [409, "Financial year date range already exists"],
   DEFAULT_FINANCIAL_YEAR_CONFLICT: [409, "Unable to change the default financial year"],
+  FINANCIAL_YEAR_TRANSITION_NOT_ALLOWED: [409, "This financial year transition is not allowed"],
+  FINANCIAL_YEAR_TRANSITION_CONFLICT: [409, "Financial year changed during transition"],
+  FINANCIAL_YEAR_DRAFT: [409, "Financial year is still in Draft status"],
+  FINANCIAL_YEAR_RECONCILIATION_RESTRICTED: [409, "Financial year is under reconciliation"],
+  FINANCIAL_YEAR_CLOSING_RESTRICTED: [409, "Financial year is being closed"],
+  FINANCIAL_YEAR_CLOSED: [409, "Financial year is closed"],
+  FINANCIAL_YEAR_LOCKED: [409, "Financial year is locked"],
 };
 
 const companyContext = (req) => {
@@ -186,11 +197,32 @@ const createFinancialYearController = ({ service = financialYearService, logger 
     }
   };
 
-  return { create, events, getDefault, getOne, list, resolve, setDefault };
+  const transition = async (req, res) => {
+    const companyId = requireCompany(req, res);
+    if (!companyId) return;
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    if (Object.keys(body).some((key) => !TRANSITION_FIELDS.has(key))) {
+      return res.status(400).json({ success: false, code: "UNSUPPORTED_FIELD", message: "Request contains unsupported transition fields" });
+    }
+    try {
+      const result = await service.transitionFinancialYear({
+        companyId,
+        financialYearId: req.params.id,
+        targetStatus: body.target_status,
+        reason: body.reason,
+        confirmation: body.confirmation,
+        actorUserId: actorContext(req),
+      });
+      return res.json({ success: true, data: result.financialYear, changed: result.changed, event: result.event });
+    } catch (error) { return sendError(res, error, logger); }
+  };
+
+  return { create, events, getDefault, getOne, list, resolve, setDefault, transition };
 };
 
 module.exports = {
   CREATE_FIELDS,
+  TRANSITION_FIELDS,
   createFinancialYearController,
   ...createFinancialYearController(),
 };

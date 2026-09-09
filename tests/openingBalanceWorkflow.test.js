@@ -12,6 +12,9 @@ const workflowConnection = ({ sequence = 0, eventError = null } = {}) => {
     async query(sql, params = []) {
       const text = String(sql);
       calls.push({ sql: text, params });
+      if (text.includes("DATE_FORMAT(CURRENT_DATE")) return [[{ opening_date: "2026-08-12" }]];
+      if (text.includes("FROM financial_years")) return [[{ id: 2026, company_id: 4, status: "OPEN" }]];
+      if (text.includes("FROM opening_balance_events obe")) return [[{ financial_year_id: 2026 }]];
       if (text.includes("FROM accounts")) {
         return [[{ id: 99, account_code: "SYS-OBE-4", account_name: "Opening Balance Equity", account_type: "EQUITY" }]];
       }
@@ -76,7 +79,7 @@ const run = async () => {
   await assert.rejects(() => post(duplicate), /duplicate/);
   assert.equal(duplicate.calls.some(({ sql }) => sql.includes("INSERT INTO journal_entries")), false);
 
-  for (const { sql, params } of asset.calls.filter(({ sql }) => /SELECT|UPDATE/.test(sql))) {
+  for (const { sql, params } of asset.calls.filter(({ sql }) => /SELECT|UPDATE/.test(sql) && !sql.includes("CURRENT_DATE"))) {
     assert.match(sql, /company_id\s*=\s*\?/i, "opening workflow reads and updates must be company scoped");
     assert.ok(params.includes(4));
   }

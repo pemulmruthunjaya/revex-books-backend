@@ -2,7 +2,7 @@ const db = require("../db/connection");
 const {
   ensureVendorPaymentSchema,
 } = require("../services/vendorPaymentService");
-const { requireFinancialYearForDate, rejectClientFinancialYear } = require("../services/financialYearService");
+const { requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("../services/financialYearService");
 
 let billStatusColumnReady = false;
 let billMrpColumnsReady = false;
@@ -111,7 +111,7 @@ exports.createBill = async (req, res) => {
 
     await connection.beginTransaction();
     transactionStarted = true;
-    const financialYear = await requireFinancialYearForDate(company_id, bill_date, connection);
+    const financialYear = await requireFinancialYearForPosting(company_id, bill_date, connection);
 
     /* ================= INSERT BILL ================= */
     const [billResult] = await connection.query(
@@ -352,7 +352,7 @@ exports.createBillFromGrn = async (req, res) => {
         });
     }
     await connection.beginTransaction();
-    const financialYear = await requireFinancialYearForDate(companyId, bill_date, connection);
+    const financialYear = await requireFinancialYearForPosting(companyId, bill_date, connection);
     const branchFilter = branchId ? " AND gr.branch_id=?" : "";
     const grnParams = [source_grn_id, companyId];
     if (branchId) grnParams.push(branchId);
@@ -500,6 +500,7 @@ exports.createBillFromGrn = async (req, res) => {
             : error.status
               ? error.message
               : "Unable to create bill from GRN",
+        ...(error.code && error.code !== "ER_DUP_ENTRY" ? { code: error.code } : {}),
       });
   } finally {
     connection.release();
@@ -526,10 +527,8 @@ exports.updateBill = async (req, res) => {
 
     await ensureBillStatusColumn();
     await connection.beginTransaction();
-    const financialYear = await requireFinancialYearForDate(company_id, bill_date, connection);
-
     const [billRows] = await connection.query(
-      "SELECT id, status, stock_posted, source_grn_id FROM bills WHERE id = ? AND company_id = ?",
+      "SELECT id, status, stock_posted, source_grn_id, financial_year_id FROM bills WHERE id = ? AND company_id = ? FOR UPDATE",
       [id, company_id],
     );
 
@@ -537,6 +536,8 @@ exports.updateBill = async (req, res) => {
       await connection.rollback();
       return res.status(404).json({ message: "Bill not found" });
     }
+    await requireFinancialYearForMutation(company_id, billRows[0].financial_year_id, connection);
+    const financialYear = await requireFinancialYearForPosting(company_id, bill_date, connection);
 
     const [oldItems] = await connection.query(
       `SELECT bi.product_id, bi.product_name, bi.quantity, bi.source_grn_item_id
@@ -766,29 +767,33 @@ exports.updateBillStatus = async (req, res) => {
  * ================= DELETE BILL =================
  */
 exports.deleteBill = async (req, res) => {
+  const connection = await db.getConnection();
   try {
     const { id } = req.params;
     const company_id = req.user.company_id;
 
-    const [bill] = await db.query(
-      "SELECT id, stock_posted FROM bills WHERE id = ? AND company_id = ?",
+    await connection.beginTransaction();
+    const [bill] = await connection.query(
+      "SELECT id, stock_posted, financial_year_id FROM bills WHERE id = ? AND company_id = ? FOR UPDATE",
       [id, company_id],
     );
 
     if (!bill.length) {
+      await connection.rollback();
       return res.status(404).json({ message: "Bill not found" });
     }
+    await requireFinancialYearForMutation(company_id, bill[0].financial_year_id, connection);
 
-    const [items] = await db.query(
-      "SELECT product_id, quantity FROM bill_items WHERE bill_id = ?",
-      [id],
+    const [items] = await connection.query(
+      "SELECT product_id, quantity FROM bill_items WHERE bill_id = ? AND company_id = ?",
+      [id, company_id],
     );
 
     for (const item of Number(bill[0].stock_posted) === 1 ? items : []) {
       const quantity = Number(item.quantity || 0);
 
       if (item.product_id && quantity > 0) {
-        await db.query(
+        await connection.query(
           `UPDATE products
            SET stock = GREATEST(stock - ?, 0)
            WHERE id = ? AND company_id = ?`,
@@ -797,16 +802,20 @@ exports.deleteBill = async (req, res) => {
       }
     }
 
-    await db.query("DELETE FROM bill_items WHERE bill_id = ?", [id]);
-    await db.query("DELETE FROM bills WHERE id = ? AND company_id = ?", [
+    await connection.query("DELETE FROM bill_items WHERE bill_id = ? AND company_id = ?", [id, company_id]);
+    await connection.query("DELETE FROM bills WHERE id = ? AND company_id = ?", [
       id,
       company_id,
     ]);
 
+    await connection.commit();
     res.json({ message: "Bill deleted" });
   } catch (error) {
+    await connection.rollback();
     console.error(error);
-    res.status(500).json({ message: "Server error" });
+    res.status(error.status || 500).json({ message: error.status ? error.message : "Server error", ...(error.code ? { code: error.code } : {}) });
+  } finally {
+    connection.release();
   }
 };
 

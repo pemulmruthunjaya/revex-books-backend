@@ -1,6 +1,6 @@
 const crypto = require("node:crypto");
 const db = require("../db/connection");
-const { requireFinancialYearForDate, rejectClientFinancialYear } = require("./financialYearService");
+const { requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("./financialYearService");
 
 const RECEIPT_TYPES = Object.freeze(["CUSTOMER", "OTHER", "ADVANCE"]);
 const CREDIT_ACCOUNT_TYPES = new Set(["INCOME", "LIABILITY", "EQUITY", "CAPITAL"]);
@@ -372,8 +372,13 @@ const postReceipt = async (connection, body, user, context = {}) => {
     : null;
 
   if (!body.receipt_date) throw Object.assign(new Error("Receipt date is required"), { status: 400 });
-  const financialYear = context.financialYear ||
-    await requireFinancialYearForDate(companyId, body.receipt_date, connection);
+  const financialYear = await requireFinancialYearForPosting(companyId, body.receipt_date, connection);
+  if (context.financialYear && Number(context.financialYear.id) !== Number(financialYear.id)) {
+    throw Object.assign(new Error("Receipt financial year does not match its authoritative date"), {
+      status: 409,
+      code: "FINANCIAL_YEAR_CONTEXT_MISMATCH",
+    });
+  }
   if (!RECEIPT_TYPES.includes(receiptType)) {
     throw Object.assign(new Error("Valid receipt type is required"), { status: 400 });
   }
@@ -445,7 +450,7 @@ const postReceipt = async (connection, body, user, context = {}) => {
       const invoiceIds = allocationPlan.allocations.map((allocation) => allocation.invoiceId);
       const placeholders = invoiceIds.map(() => "?").join(",");
       const [lockedInvoices] = await connection.query(
-        `SELECT id, invoice_number, total_amount, status, customer_id, customer_name
+        `SELECT id, invoice_number, total_amount, status, customer_id, customer_name, financial_year_id
          FROM invoices
          WHERE company_id = ? AND id IN (${placeholders})
          ORDER BY id
@@ -454,6 +459,9 @@ const postReceipt = async (connection, body, user, context = {}) => {
       );
       if (lockedInvoices.length !== invoiceIds.length) {
         throw Object.assign(new Error("One or more invoices were not found for this company"), { status: 404 });
+      }
+      for (const invoice of lockedInvoices) {
+        await requireFinancialYearForMutation(companyId, invoice.financial_year_id, connection);
       }
       const invoiceById = new Map(lockedInvoices.map((invoice) => [Number(invoice.id), invoice]));
       invoices = allocationPlan.allocations.map((allocation) => {

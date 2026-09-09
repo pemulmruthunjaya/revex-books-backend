@@ -9,6 +9,33 @@ const FY_STATUSES = new Set([
   "LOCKED",
 ]);
 
+const TRANSITION_MATRIX = Object.freeze({
+  DRAFT: new Set(["OPEN"]),
+  OPEN: new Set(["RECONCILIATION"]),
+  RECONCILIATION: new Set(["OPEN", "CLOSING"]),
+  CLOSING: new Set(["RECONCILIATION", "CLOSED"]),
+  CLOSED: new Set(["LOCKED"]),
+  LOCKED: new Set(),
+});
+
+const TRANSITION_EVENTS = Object.freeze({
+  "DRAFT:OPEN": "OPEN",
+  "OPEN:RECONCILIATION": "BEGIN_RECONCILIATION",
+  "RECONCILIATION:OPEN": "REOPEN",
+  "RECONCILIATION:CLOSING": "BEGIN_CLOSE",
+  "CLOSING:RECONCILIATION": "REOPEN",
+  "CLOSING:CLOSED": "CLOSE",
+  "CLOSED:LOCKED": "LOCK",
+});
+
+const STATUS_ERROR = Object.freeze({
+  DRAFT: ["FINANCIAL_YEAR_DRAFT", "Financial year is still in draft"],
+  RECONCILIATION: ["FINANCIAL_YEAR_RECONCILIATION_RESTRICTED", "Financial year is under reconciliation"],
+  CLOSING: ["FINANCIAL_YEAR_CLOSING_RESTRICTED", "Financial year is being closed"],
+  CLOSED: ["FINANCIAL_YEAR_CLOSED", "Financial year is closed"],
+  LOCKED: ["FINANCIAL_YEAR_LOCKED", "Financial year is locked"],
+});
+
 class FinancialYearServiceError extends Error {
   constructor(code, message, status = 409) {
     super(message);
@@ -220,6 +247,39 @@ const requireFinancialYearForDate = async (companyId, businessDate, executor = d
   return financialYear;
 };
 
+const requireOpenStatus = (financialYear) => {
+  if (!financialYear) fail("FINANCIAL_YEAR_NOT_FOUND", "Financial year not found", 404);
+  if (financialYear.status === "OPEN") return financialYear;
+  const [code, message] = STATUS_ERROR[financialYear.status] || ["FINANCIAL_YEAR_TRANSITION_NOT_ALLOWED", "Financial year does not permit this operation"];
+  fail(code, message, 409);
+};
+
+const requireFinancialYearForPosting = async (companyId, businessDate, executor = db) => {
+  const normalizedCompanyId = positiveId(companyId, "companyId");
+  const normalizedDate = accountingDate(businessDate, "businessDate");
+  const [rows] = await executor.query(
+    `${FY_SELECT} WHERE company_id=? AND ? BETWEEN start_date AND end_date ORDER BY id LIMIT 2 FOR SHARE`,
+    [normalizedCompanyId, normalizedDate]
+  );
+  if (rows.length > 1) {
+    fail("FINANCIAL_YEAR_AMBIGUOUS", "Multiple financial years cover the transaction date for this company", 409);
+  }
+  if (!rows.length) {
+    fail("FINANCIAL_YEAR_NOT_FOUND_FOR_DATE", "No financial year covers the transaction date for this company", 409);
+  }
+  return requireOpenStatus(rowShape(rows[0]));
+};
+
+const requireFinancialYearForMutation = async (companyId, financialYearId, executor = db) => {
+  const normalizedCompanyId = positiveId(companyId, "companyId");
+  const normalizedYearId = positiveId(financialYearId, "financialYearId");
+  const [rows] = await executor.query(
+    `${FY_SELECT} WHERE company_id=? AND id=? LIMIT 1 FOR SHARE`,
+    [normalizedCompanyId, normalizedYearId]
+  );
+  return requireOpenStatus(rowShape(rows[0]));
+};
+
 const rejectClientFinancialYear = (input) => {
   if (input && Object.prototype.hasOwnProperty.call(input, "financial_year_id")) {
     fail(
@@ -284,6 +344,9 @@ const createFinancialYear = async (input, executor = db) => {
   };
   if (values.startDate > values.endDate) {
     fail("INVALID_DATE_RANGE", "startDate must be on or before endDate", 400);
+  }
+  if (values.status !== "DRAFT") {
+    fail("FINANCIAL_YEAR_INITIAL_STATUS_INVALID", "New financial years must start in DRAFT status", 400);
   }
 
   try {
@@ -352,6 +415,62 @@ const createFinancialYear = async (input, executor = db) => {
   }
 };
 
+const transitionFinancialYear = async (input, executor = db, hooks = {}) => {
+  if (!input?.targetStatus) {
+    fail("INVALID_STATUS", "targetStatus is required", 400);
+  }
+  const values = {
+    companyId: positiveId(input?.companyId, "companyId"),
+    financialYearId: positiveId(input?.financialYearId, "financialYearId"),
+    targetStatus: normalizeStatus(input?.targetStatus),
+    actorUserId: input?.actorUserId === null || input?.actorUserId === undefined ? null : positiveId(input.actorUserId, "actorUserId"),
+    reason: normalizeText(input?.reason, "reason", 500),
+    confirmation: normalizeText(input?.confirmation, "confirmation", 80),
+  };
+  try {
+    return await withTransaction(executor, async (connection) => {
+      await lockCompany(connection, values.companyId);
+      const [rows] = await connection.query(
+        `${FY_SELECT} WHERE id=? AND company_id=? LIMIT 1 FOR UPDATE`,
+        [values.financialYearId, values.companyId]
+      );
+      if (!rows.length) fail("FINANCIAL_YEAR_NOT_FOUND", "Financial year not found", 404);
+      await validateActor(connection, values.companyId, values.actorUserId);
+      const current = rowShape(rows[0]);
+      if (current.status === values.targetStatus) return { financialYear: current, changed: false, event: null };
+      if (!TRANSITION_MATRIX[current.status]?.has(values.targetStatus)) {
+        fail("FINANCIAL_YEAR_TRANSITION_NOT_ALLOWED", `Transition from ${current.status} to ${values.targetStatus} is not allowed`, 409);
+      }
+      const key = `${current.status}:${values.targetStatus}`;
+      if (["RECONCILIATION:OPEN", "CLOSING:RECONCILIATION", "CLOSED:LOCKED"].includes(key) && !values.reason) {
+        fail("FINANCIAL_YEAR_TRANSITION_REASON_REQUIRED", "A reason is required for this transition", 400);
+      }
+      if (key === "CLOSED:LOCKED" && values.confirmation !== "LOCK") {
+        fail("FINANCIAL_YEAR_LOCK_CONFIRMATION_REQUIRED", "Type LOCK to confirm this transition", 400);
+      }
+      if (key === "RECONCILIATION:CLOSING" && hooks.beforeBeginClose) await hooks.beforeBeginClose(connection, current);
+      if (key === "CLOSING:CLOSED" && hooks.beforeClose) await hooks.beforeClose(connection, current);
+      const [updated] = await connection.query(
+        "UPDATE financial_years SET status=? WHERE id=? AND company_id=? AND status=?",
+        [values.targetStatus, values.financialYearId, values.companyId, current.status]
+      );
+      if (updated.affectedRows !== 1) fail("FINANCIAL_YEAR_TRANSITION_CONFLICT", "Financial year changed during transition", 409);
+      await insertEvent(connection, {
+        companyId: values.companyId,
+        financialYearId: values.financialYearId,
+        eventType: TRANSITION_EVENTS[key],
+        previousStatus: current.status,
+        newStatus: values.targetStatus,
+        reason: values.reason,
+        actorUserId: values.actorUserId,
+        metadata: {},
+      });
+      const [finalRows] = await connection.query(`${FY_SELECT} WHERE id=? AND company_id=?`, [values.financialYearId, values.companyId]);
+      return { financialYear: rowShape(finalRows[0]), changed: true, event: TRANSITION_EVENTS[key] };
+    });
+  } catch (error) { throw mapDatabaseError(error); }
+};
+
 const setDefaultFinancialYear = async ({ companyId, financialYearId, actorUserId = null, reason = null }, executor = db) => {
   const normalizedCompanyId = positiveId(companyId, "companyId");
   const normalizedYearId = positiveId(financialYearId, "financialYearId");
@@ -405,6 +524,7 @@ const setDefaultFinancialYear = async ({ companyId, financialYearId, actorUserId
 module.exports = {
   FinancialYearServiceError,
   FY_STATUSES,
+  TRANSITION_MATRIX,
   accountingDate,
   createFinancialYear,
   getDefaultFinancialYear,
@@ -413,6 +533,10 @@ module.exports = {
   listFinancialYearEvents,
   resolveFinancialYearForDate,
   requireFinancialYearForDate,
+  requireFinancialYearForMutation,
+  requireFinancialYearForPosting,
+  requireOpenStatus,
   rejectClientFinancialYear,
   setDefaultFinancialYear,
+  transitionFinancialYear,
 };

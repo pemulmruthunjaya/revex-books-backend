@@ -1,5 +1,9 @@
 const db = require("../db/connection");
 const {
+  rejectClientFinancialYear,
+  requireFinancialYearForPosting,
+} = require("../services/financialYearService");
+const {
   ACTIONS,
   STATUSES,
   addWorkflowHistory,
@@ -18,6 +22,15 @@ const parseAmount = (value) => {
   return Number.isFinite(amount) && amount > 0 ? amount : null;
 };
 
+const sendKnownError = (error, res, next) => {
+  if (!error.status) return next(error);
+  return res.status(error.status).json({
+    success: false,
+    code: error.code,
+    message: error.message,
+  });
+};
+
 const serializeTransaction = (row) => ({
   ...row,
   amount: Number(row.amount || 0),
@@ -29,7 +42,7 @@ const canViewTransaction = (row, req) =>
   req.pettyCashPermissions?.view_all ||
   Number(row.created_by) === Number(req.user.user_id);
 
-const findTransaction = async (id, companyId, connection = db) => {
+const findTransaction = async (id, companyId, connection = db, { forUpdate = false } = {}) => {
   const [rows] = await connection.query(
     `SELECT t.*, u.name AS created_by_name,
             (SELECT COUNT(*) FROM petty_cash_attachments a
@@ -37,7 +50,7 @@ const findTransaction = async (id, companyId, connection = db) => {
      FROM petty_cash_transactions t
      LEFT JOIN users u ON u.id = t.created_by AND u.company_id = t.company_id
      WHERE t.id = ? AND t.company_id = ?
-     LIMIT 1`,
+     LIMIT 1${forUpdate ? " FOR UPDATE" : ""}`,
     [id, companyId]
   );
   return rows[0] || null;
@@ -229,6 +242,7 @@ exports.getTransaction = async (req, res, next) => {
 exports.createTransaction = async (req, res, next) => {
   const connection = await db.getConnection();
   try {
+    rejectClientFinancialYear(req.body);
     await ensurePettyCashSchema();
     const type = String(req.body.transaction_type || "EXPENSE").toUpperCase();
     const amount = parseAmount(req.body.amount);
@@ -275,7 +289,7 @@ exports.createTransaction = async (req, res, next) => {
     });
   } catch (error) {
     await connection.rollback();
-    next(error);
+    sendKnownError(error, res, next);
   } finally {
     connection.release();
   }
@@ -284,6 +298,7 @@ exports.createTransaction = async (req, res, next) => {
 exports.updateTransaction = async (req, res, next) => {
   const connection = await db.getConnection();
   try {
+    rejectClientFinancialYear(req.body);
     await ensurePettyCashSchema();
     await connection.beginTransaction();
     const transaction = await findTransaction(req.params.id, req.user.company_id, connection);
@@ -331,7 +346,7 @@ exports.updateTransaction = async (req, res, next) => {
     res.json({ success: true, message: "Draft updated" });
   } catch (error) {
     await connection.rollback();
-    next(error);
+    sendKnownError(error, res, next);
   } finally {
     connection.release();
   }
@@ -432,10 +447,29 @@ exports.rejectTransaction = async (req, res, next) => {
 exports.postTransaction = async (req, res, next) => {
   const connection = await db.getConnection();
   try {
+    rejectClientFinancialYear(req.body);
     await ensurePettyCashSchema();
     await connection.beginTransaction();
-    const transaction = await findTransaction(req.params.id, req.user.company_id, connection);
+    const candidate = await findTransaction(req.params.id, req.user.company_id, connection);
+    if (!candidate) return res.status(404).json({ message: "Transaction not found" });
+    await requireFinancialYearForPosting(
+      req.user.company_id,
+      candidate.transaction_date,
+      connection
+    );
+    const transaction = await findTransaction(
+      req.params.id,
+      req.user.company_id,
+      connection,
+      { forUpdate: true }
+    );
     if (!transaction) return res.status(404).json({ message: "Transaction not found" });
+    if (String(transaction.transaction_date) !== String(candidate.transaction_date)) {
+      const error = new Error("Petty Cash transaction date changed while posting; retry the request");
+      error.status = 409;
+      error.code = "PETTY_CASH_TRANSACTION_CHANGED";
+      throw error;
+    }
     if (transaction.status !== STATUSES.ACCOUNTS_APPROVED) {
       return res.status(409).json({ message: "Accounts approval is required before posting" });
     }
@@ -477,7 +511,7 @@ exports.postTransaction = async (req, res, next) => {
     res.json({ success: true, message: "Transaction posted", status: STATUSES.POSTED });
   } catch (error) {
     await connection.rollback();
-    next(error);
+    sendKnownError(error, res, next);
   } finally {
     connection.release();
   }
@@ -563,10 +597,36 @@ exports.getSettings = async (req, res, next) => {
 };
 
 exports.updateSettings = async (req, res, next) => {
+  const connection = await db.getConnection();
   try {
     await ensurePettyCashSchema();
-    const opening = Math.max(0, Number(req.body.opening_balance) || 0);
-    await db.query(
+    const openingInput = req.body.opening_balance;
+    const opening = openingInput === undefined || openingInput === null || openingInput === ""
+      ? 0
+      : Number(openingInput);
+    await connection.beginTransaction();
+    const [existing] = await connection.query(
+      "SELECT opening_balance FROM petty_cash_settings WHERE company_id=? FOR UPDATE",
+      [req.user.company_id]
+    );
+    if (!existing.length && (!Number.isFinite(opening) || opening !== 0)) {
+      const error = new Error(
+        "Petty Cash opening balance requires a dedicated dated opening-balance workflow"
+      );
+      error.status = 409;
+      error.code = "PETTY_CASH_OPENING_BALANCE_WORKFLOW_REQUIRED";
+      throw error;
+    }
+    if (
+      existing.length &&
+      (!Number.isFinite(opening) || opening !== Number(existing[0].opening_balance || 0))
+    ) {
+      const error = new Error("Petty Cash opening balance cannot be changed through settings");
+      error.status = 409;
+      error.code = "PETTY_CASH_OPENING_BALANCE_UPDATE_RESTRICTED";
+      throw error;
+    }
+    await connection.query(
       `INSERT INTO petty_cash_settings
        (company_id, fund_name, opening_balance, current_balance, imprest_limit,
         manager_approval_limit, currency_code, is_active)
@@ -586,9 +646,13 @@ exports.updateSettings = async (req, res, next) => {
         req.body.is_active === false ? 0 : 1,
       ]
     );
+    await connection.commit();
     res.json({ success: true, message: "Petty Cash settings saved" });
   } catch (error) {
-    next(error);
+    await connection.rollback();
+    sendKnownError(error, res, next);
+  } finally {
+    connection.release();
   }
 };
 

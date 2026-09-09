@@ -1,4 +1,10 @@
 const db = require("../db/connection");
+const {
+  rejectClientFinancialYear,
+  requireFinancialYearForDate,
+  requireFinancialYearForMutation,
+  requireFinancialYearForPosting,
+} = require("../services/financialYearService");
 
 let deliveryChallanTablesReady = false;
 
@@ -192,6 +198,7 @@ exports.createChallan = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    rejectClientFinancialYear(req.body);
     await ensureDeliveryChallanTables();
 
     const companyId = req.user.company_id;
@@ -237,6 +244,7 @@ exports.createChallan = async (req, res) => {
     }
 
     await connection.beginTransaction();
+    await requireFinancialYearForPosting(companyId, challan_date, connection);
 
     const challanNumber = await getNextChallanNumber(companyId, type);
 
@@ -316,7 +324,11 @@ exports.createChallan = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error("Create delivery challan error:", error);
-    res.status(500).json({ message: "Failed to create delivery challan", error: error.message });
+    res.status(error.status || 500).json({
+      ...(error.code ? { code: error.code } : {}),
+      message: error.status ? error.message : "Failed to create delivery challan",
+      ...(error.status ? {} : { error: error.message }),
+    });
   } finally {
     connection.release();
   }
@@ -326,6 +338,7 @@ exports.deleteChallan = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    rejectClientFinancialYear(req.body);
     await ensureDeliveryChallanTables();
 
     const companyId = req.user.company_id;
@@ -334,7 +347,7 @@ exports.deleteChallan = async (req, res) => {
     await connection.beginTransaction();
 
     const [challans] = await connection.query(
-      "SELECT * FROM delivery_challans WHERE id = ? AND company_id = ?",
+      "SELECT * FROM delivery_challans WHERE id = ? AND company_id = ? FOR UPDATE",
       [id, companyId]
     );
 
@@ -344,6 +357,16 @@ exports.deleteChallan = async (req, res) => {
     }
 
     const challan = challans[0];
+    const sourceFinancialYear = await requireFinancialYearForDate(
+      companyId,
+      challan.challan_date,
+      connection
+    );
+    await requireFinancialYearForMutation(
+      companyId,
+      sourceFinancialYear.id,
+      connection
+    );
     const [items] = await connection.query(
       "SELECT * FROM delivery_challan_items WHERE challan_id = ? AND company_id = ?",
       [id, companyId]
@@ -387,7 +410,10 @@ exports.deleteChallan = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error("Delete delivery challan error:", error);
-    res.status(500).json({ message: "Failed to delete delivery challan" });
+    res.status(error.status || 500).json({
+      ...(error.code ? { code: error.code } : {}),
+      message: error.status ? error.message : "Failed to delete delivery challan",
+    });
   } finally {
     connection.release();
   }

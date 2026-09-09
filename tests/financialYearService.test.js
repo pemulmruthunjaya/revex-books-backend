@@ -24,7 +24,7 @@ test("create validates range before opening a transaction and does not mutate in
     code: "FY 2026-27",
     startDate: "2027-03-31",
     endDate: "2026-04-01",
-    status: "OPEN",
+    status: "DRAFT",
   };
   const snapshot = structuredClone(input);
   let connections = 0;
@@ -137,7 +137,7 @@ test("create is transactional, company-scoped, writes CREATE/default events, and
     name: "FY 2026-27",
     startDate: "2026-04-01",
     endDate: "2027-03-31",
-    status: "RECONCILIATION",
+    status: "DRAFT",
     isDefault: true,
     source: "MIGRATION",
     actorUserId: 13,
