@@ -1,13 +1,28 @@
 const db = require("../db/connection");
 const { ensurePayrollTables } = require("../services/payrollService");
+const {
+  FinancialYearServiceError,
+  requireFinancialYearForDate,
+  requireFinancialYearForMutation,
+  requireFinancialYearForPosting,
+  rejectClientFinancialYear,
+} = require("../services/financialYearService");
 
 const money = (value) => Math.round(Number(value || 0) * 100) / 100;
 const allowedStatuses = ["Unpaid", "Paid"];
 
 const normalizeMonth = (value) => {
   const month = String(value || "").trim();
-  return /^\d{4}-\d{2}$/.test(month) ? month : "";
+  return /^\d{4}-(0[1-9]|1[0-2])$/.test(month) ? month : "";
 };
+
+const payrollDateForMonth = (month) => `${month}-01`;
+
+const sendPayrollMutationError = (res, error, fallbackMessage) =>
+  res.status(error.status || 500).json({
+    message: error.status ? error.message : fallbackMessage,
+    ...(error.code ? { code: error.code } : {}),
+  });
 
 const normalizeKey = (key) =>
   String(key || "")
@@ -301,8 +316,10 @@ exports.getPayrollEntries = async (req, res) => {
 };
 
 exports.createPayrollEntry = async (req, res) => {
+  let connection;
   try {
     await ensurePayrollTables();
+    rejectClientFinancialYear(req.body);
 
     const {
       employee_id,
@@ -326,14 +343,21 @@ exports.createPayrollEntry = async (req, res) => {
       return res.status(400).json({ message: "Employee and payroll month are required" });
     }
 
+    const companyId = req.user.company_id;
+    const payrollDate = payrollDateForMonth(month);
     const normalizedStatus = allowedStatuses.includes(status) ? status : "Unpaid";
 
-    const [employees] = await db.query(
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    await requireFinancialYearForPosting(companyId, payrollDate, connection);
+
+    const [employees] = await connection.query(
       "SELECT id, name, monthly_salary FROM payroll_employees WHERE id = ? AND company_id = ? LIMIT 1",
-      [employee_id, req.user.company_id]
+      [employee_id, companyId]
     );
 
     if (!employees.length) {
+      await connection.rollback();
       return res.status(404).json({ message: "Employee not found" });
     }
 
@@ -342,7 +366,7 @@ exports.createPayrollEntry = async (req, res) => {
     const deductionAmount = money(deductions);
     const netAmount = money(Math.max(basic + allowanceAmount - deductionAmount, 0));
 
-    const [result] = await db.query(
+    const [result] = await connection.query(
       `INSERT INTO payroll_entries
         (company_id, employee_id, employee_name, payroll_month, payroll_date,
          salary_mode, working_days, present_days, absent_days, total_hours,
@@ -350,11 +374,11 @@ exports.createPayrollEntry = async (req, res) => {
          notes, created_by)
        VALUES (?, ?, ?, ?, ?, 'Manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        req.user.company_id,
+        companyId,
         employee_id,
         employees[0].name,
         month,
-        `${month}-01`,
+        payrollDate,
         money(working_days),
         money(present_days),
         money(absent_days),
@@ -372,31 +396,43 @@ exports.createPayrollEntry = async (req, res) => {
       ]
     );
 
+    await connection.commit();
     res.status(201).json({
       message: "Payroll entry created",
       payroll_entry_id: result.insertId,
     });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error("Create payroll entry error:", error);
 
     if (error.code === "ER_DUP_ENTRY") {
       return res.status(409).json({ message: "Payroll already exists for this employee and month" });
     }
 
-    res.status(500).json({ message: "Server error" });
+    sendPayrollMutationError(res, error, "Server error");
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 exports.importAttendance = async (req, res) => {
-  const connection = await db.getConnection();
+  let connection;
 
   try {
     await ensurePayrollTables();
+    rejectClientFinancialYear(req.body);
 
     const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
-    const fallbackMonth = normalizeMonth(req.body.payroll_month) || new Date().toISOString().slice(0, 7);
+    const suppliedFallbackMonth = String(req.body.payroll_month || "").trim();
+    const fallbackMonth = suppliedFallbackMonth
+      ? normalizeMonth(suppliedFallbackMonth)
+      : new Date().toISOString().slice(0, 7);
     const standardHoursPerDay = Math.max(numberValue(req.body.standard_hours_per_day), 1) || 8;
     const fileName = String(req.body.fileName || "").slice(0, 255);
+
+    if (!fallbackMonth) {
+      return res.status(400).json({ message: "Payroll month must use YYYY-MM with a valid month" });
+    }
 
     if (!rows.length) {
       return res.status(400).json({ message: "No attendance rows found" });
@@ -409,6 +445,7 @@ exports.importAttendance = async (req, res) => {
     const summary = { total: rows.length, created: 0, updated: 0, skipped: 0 };
     const errors = [];
 
+    connection = await db.getConnection();
     await connection.beginTransaction();
 
     const [importResult] = await connection.query(
@@ -433,7 +470,7 @@ exports.importAttendance = async (req, res) => {
 
       try {
         if (!row.payroll_month) {
-          throw new Error("Payroll month is required");
+          throw new Error("Payroll month must use YYYY-MM with a valid month");
         }
 
         if (!row.employee_code && !row.employee_name) {
@@ -466,6 +503,34 @@ exports.importAttendance = async (req, res) => {
         }
 
         const employee = employees[0];
+        const targetPayrollDate = payrollDateForMonth(row.payroll_month);
+        const [existingEntries] = await connection.query(
+          `SELECT id, payroll_date
+           FROM payroll_entries
+           WHERE company_id = ? AND employee_id = ? AND payroll_month = ?
+           LIMIT 1 FOR UPDATE`,
+          [req.user.company_id, employee.id, row.payroll_month]
+        );
+
+        if (existingEntries.length) {
+          const sourceFinancialYear = await requireFinancialYearForDate(
+            req.user.company_id,
+            existingEntries[0].payroll_date,
+            connection
+          );
+          await requireFinancialYearForMutation(
+            req.user.company_id,
+            sourceFinancialYear.id,
+            connection
+          );
+        }
+
+        await requireFinancialYearForPosting(
+          req.user.company_id,
+          targetPayrollDate,
+          connection
+        );
+
         const monthWorkingDays = row.working_days || daysInMonth(row.payroll_month);
         const standardHours = money(monthWorkingDays * standardHoursPerDay);
         const totalHours = money(row.total_hours);
@@ -518,7 +583,7 @@ exports.importAttendance = async (req, res) => {
             employee.id,
             employee.name,
             row.payroll_month,
-            `${row.payroll_month}-01`,
+            targetPayrollDate,
             monthWorkingDays,
             presentDays,
             absentDays,
@@ -568,6 +633,8 @@ exports.importAttendance = async (req, res) => {
           ]
         );
       } catch (error) {
+        if (error instanceof FinancialYearServiceError) throw error;
+
         summary.skipped += 1;
         errors.push({ row: rowNumber, message: error.message });
 
@@ -609,17 +676,19 @@ exports.importAttendance = async (req, res) => {
       errors: errors.slice(0, 50),
     });
   } catch (error) {
-    await connection.rollback();
+    if (connection) await connection.rollback();
     console.error("Import payroll attendance error:", error);
-    res.status(500).json({ message: "Failed to import attendance" });
+    sendPayrollMutationError(res, error, "Failed to import attendance");
   } finally {
-    connection.release();
+    if (connection) connection.release();
   }
 };
 
 exports.updatePayrollEntryStatus = async (req, res) => {
+  let connection;
   try {
     await ensurePayrollTables();
+    rejectClientFinancialYear(req.body);
 
     const { id } = req.params;
     const status = allowedStatuses.includes(req.body.status) ? req.body.status : "";
@@ -628,7 +697,30 @@ exports.updatePayrollEntryStatus = async (req, res) => {
       return res.status(400).json({ message: "Invalid payroll status" });
     }
 
-    const [result] = await db.query(
+    const companyId = req.user.company_id;
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    const [entries] = await connection.query(
+      `SELECT id, payroll_date
+       FROM payroll_entries
+       WHERE id = ? AND company_id = ?
+       LIMIT 1 FOR UPDATE`,
+      [id, companyId]
+    );
+
+    if (!entries.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: "Payroll entry not found" });
+    }
+
+    const financialYear = await requireFinancialYearForDate(
+      companyId,
+      entries[0].payroll_date,
+      connection
+    );
+    await requireFinancialYearForMutation(companyId, financialYear.id, connection);
+
+    const [result] = await connection.query(
       `UPDATE payroll_entries
        SET status = ?, payment_date = ?
        WHERE id = ? AND company_id = ?`,
@@ -636,39 +728,73 @@ exports.updatePayrollEntryStatus = async (req, res) => {
         status,
         status === "Paid" ? req.body.payment_date || new Date().toISOString().slice(0, 10) : null,
         id,
-        req.user.company_id,
+        companyId,
       ]
     );
 
     if (result.affectedRows === 0) {
+      await connection.rollback();
       return res.status(404).json({ message: "Payroll entry not found" });
     }
 
+    await connection.commit();
     res.json({ message: "Payroll status updated" });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error("Update payroll status error:", error);
-    res.status(500).json({ message: "Server error" });
+    sendPayrollMutationError(res, error, "Server error");
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 exports.deletePayrollEntry = async (req, res) => {
+  let connection;
   try {
     await ensurePayrollTables();
 
     const { id } = req.params;
+    const companyId = req.user.company_id;
 
-    const [result] = await db.query(
-      "DELETE FROM payroll_entries WHERE id = ? AND company_id = ?",
-      [id, req.user.company_id]
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    const [entries] = await connection.query(
+      `SELECT id, payroll_date
+       FROM payroll_entries
+       WHERE id = ? AND company_id = ?
+       LIMIT 1 FOR UPDATE`,
+      [id, companyId]
     );
 
-    if (result.affectedRows === 0) {
+    if (!entries.length) {
+      await connection.rollback();
       return res.status(404).json({ message: "Payroll entry not found" });
     }
 
+    const financialYear = await requireFinancialYearForDate(
+      companyId,
+      entries[0].payroll_date,
+      connection
+    );
+    await requireFinancialYearForMutation(companyId, financialYear.id, connection);
+
+    const [result] = await connection.query(
+      "DELETE FROM payroll_entries WHERE id = ? AND company_id = ?",
+      [id, companyId]
+    );
+
+    if (result.affectedRows === 0) {
+      await connection.rollback();
+      return res.status(404).json({ message: "Payroll entry not found" });
+    }
+
+    await connection.commit();
     res.json({ message: "Payroll entry deleted" });
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error("Delete payroll entry error:", error);
-    res.status(500).json({ message: "Server error" });
+    sendPayrollMutationError(res, error, "Server error");
+  } finally {
+    if (connection) connection.release();
   }
 };
