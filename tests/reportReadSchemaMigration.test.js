@@ -211,6 +211,56 @@ for (const [target, definition] of payrollEvolution) {
   );
 }
 
+const payrollEmployeeCodeIndex =
+  "CREATE INDEX idx_payroll_employee_code ON payroll_employees (company_id, employee_code)";
+requireFragment("FROM information_schema.STATISTICS", "payroll index metadata guard");
+requireFragment("TABLE_NAME = 'payroll_employees'", "payroll index table guard");
+requireFragment("INDEX_NAME = 'idx_payroll_employee_code'", "payroll index name guard");
+requireFragment("COUNT(*) = 2", "payroll index exact column count");
+requireFragment("SUM(NON_UNIQUE = 1) = 2", "payroll index non-unique check");
+requireFragment(
+  "SUM(SEQ_IN_INDEX = 1 AND COLUMN_NAME = 'company_id') = 1",
+  "payroll index first column"
+);
+requireFragment(
+  "SUM(SEQ_IN_INDEX = 2 AND COLUMN_NAME = 'employee_code') = 1",
+  "payroll index second column"
+);
+requireFragment("THEN 'CREATE' WHEN @rrsf_payroll_employee_code_index_exact = 1 THEN 'NOOP' ELSE 'COLLISION'", "payroll index action classification");
+requireFragment(payrollEmployeeCodeIndex, "payroll employee-code index creation");
+assert.ok(
+  runtimeSource.includes("INDEX idx_payroll_employee_code (company_id, employee_code)"),
+  "migration index must match the non-unique runtime index"
+);
+assert.ok(
+  compact.indexOf("COLUMN_NAME = 'employee_code'") < compact.indexOf("FROM information_schema.STATISTICS"),
+  "employee_code compatibility guard must precede index remediation"
+);
+
+const classifyIndex = (rows) => {
+  if (rows.length === 0) return "CREATE";
+  const exact =
+    rows.length === 2 &&
+    rows.every((row) => row.nonUnique === 1) &&
+    rows.some((row) => row.sequence === 1 && row.column === "company_id") &&
+    rows.some((row) => row.sequence === 2 && row.column === "employee_code");
+  return exact ? "NOOP" : "COLLISION";
+};
+assert.equal(classifyIndex([]), "CREATE", "missing index must be created");
+assert.equal(
+  classifyIndex([
+    { nonUnique: 1, sequence: 1, column: "company_id" },
+    { nonUnique: 1, sequence: 2, column: "employee_code" },
+  ]),
+  "NOOP",
+  "exact index must be an idempotent no-op"
+);
+assert.equal(
+  classifyIndex([{ nonUnique: 0, sequence: 1, column: "employee_code" }]),
+  "COLLISION",
+  "same-name incompatible index must take the safe collision path"
+);
+assert.doesNotMatch(executable, /\bDROP\s+INDEX\b/i, "migration must not drop indexes");
 assert.doesNotMatch(executable, /\bDROP\s+TABLE\b/i, "migration must not drop tables");
 assert.doesNotMatch(executable, /\bTRUNCATE\b/i, "migration must not truncate data");
 assert.doesNotMatch(
@@ -225,11 +275,11 @@ assert.doesNotMatch(executable, /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?custo
 assert.doesNotMatch(executable, /ALTER\s+TABLE\s+payments/i);
 assert.doesNotMatch(executable, /(?:uq|idx)_payments_receipt_entry/i);
 
-const guardedAlterCount = (executable.match(/TABLE_SCHEMA\s*=\s*DATABASE\(\)/gi) || []).length;
+const guardedAlterCount = (executable.match(/FROM information_schema\.COLUMNS/gi) || []).length;
 const dynamicAlterCount = (executable.match(/'ALTER TABLE/gi) || []).length;
 assert.equal(guardedAlterCount, productColumns.size + payrollEvolution.size);
 assert.equal(dynamicAlterCount, guardedAlterCount);
-assert.equal((executable.match(/(?:^|\n)\s*PREPARE rrsf_stmt/gi) || []).length, guardedAlterCount);
-assert.equal((executable.match(/DEALLOCATE PREPARE rrsf_stmt/gi) || []).length, guardedAlterCount);
+assert.equal((executable.match(/(?:^|\n)\s*PREPARE rrsf_stmt/gi) || []).length, guardedAlterCount + 1);
+assert.equal((executable.match(/DEALLOCATE PREPARE rrsf_stmt/gi) || []).length, guardedAlterCount + 1);
 
 console.log("report-read schema migration contract tests passed");

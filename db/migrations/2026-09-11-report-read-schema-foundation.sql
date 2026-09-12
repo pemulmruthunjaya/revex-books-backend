@@ -392,6 +392,43 @@ SET @rrsf_sql = IF(@rrsf_has_column = 0,
   'SELECT 1');
 PREPARE rrsf_stmt FROM @rrsf_sql; EXECUTE rrsf_stmt; DEALLOCATE PREPARE rrsf_stmt;
 
+-- Restore the non-unique employee-code lookup index when payroll_employees was
+-- created before that index became part of the runtime contract. An incompatible
+-- same-name index deliberately reaches CREATE INDEX and fails with duplicate-key
+-- name error; it is never dropped, renamed, or silently replaced.
+SET @rrsf_payroll_employee_code_index_rows = (
+  SELECT COUNT(*)
+  FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'payroll_employees'
+    AND INDEX_NAME = 'idx_payroll_employee_code'
+);
+SET @rrsf_payroll_employee_code_index_exact = (
+  SELECT IF(
+    COUNT(*) = 2
+      AND SUM(NON_UNIQUE = 1) = 2
+      AND SUM(SEQ_IN_INDEX = 1 AND COLUMN_NAME = 'company_id') = 1
+      AND SUM(SEQ_IN_INDEX = 2 AND COLUMN_NAME = 'employee_code') = 1,
+    1,
+    0
+  )
+  FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'payroll_employees'
+    AND INDEX_NAME = 'idx_payroll_employee_code'
+);
+SET @rrsf_payroll_employee_code_index_action = CASE
+  WHEN @rrsf_payroll_employee_code_index_rows = 0 THEN 'CREATE'
+  WHEN @rrsf_payroll_employee_code_index_exact = 1 THEN 'NOOP'
+  ELSE 'COLLISION'
+END;
+SET @rrsf_sql = IF(
+  @rrsf_payroll_employee_code_index_action = 'NOOP',
+  'SELECT 1',
+  'CREATE INDEX idx_payroll_employee_code ON payroll_employees (company_id, employee_code)'
+);
+PREPARE rrsf_stmt FROM @rrsf_sql; EXECUTE rrsf_stmt; DEALLOCATE PREPARE rrsf_stmt;
+
 SET @rrsf_has_column = (
   SELECT COUNT(*) FROM information_schema.COLUMNS
   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'payroll_entries' AND COLUMN_NAME = 'salary_mode'
