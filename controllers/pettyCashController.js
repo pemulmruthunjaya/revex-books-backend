@@ -77,7 +77,6 @@ const saveAttachments = async (connection, transactionId, req) => {
 
 exports.getPermissions = async (req, res, next) => {
   try {
-    await ensurePettyCashSchema();
     res.json({ success: true, permissions: await getUserPermissions(req.user) });
   } catch (error) {
     next(error);
@@ -86,7 +85,6 @@ exports.getPermissions = async (req, res, next) => {
 
 exports.getDashboard = async (req, res, next) => {
   try {
-    await ensurePettyCashSchema();
     const permissions = await getUserPermissions(req.user);
     req.pettyCashPermissions = permissions;
     const scope = permissions.view_all ? "" : "AND created_by = ?";
@@ -158,7 +156,6 @@ exports.getDashboard = async (req, res, next) => {
 
 exports.listTransactions = async (req, res, next) => {
   try {
-    await ensurePettyCashSchema();
     const permissions = await getUserPermissions(req.user);
     req.pettyCashPermissions = permissions;
     const clauses = ["t.company_id = ?"];
@@ -209,7 +206,6 @@ exports.listTransactions = async (req, res, next) => {
 
 exports.getTransaction = async (req, res, next) => {
   try {
-    await ensurePettyCashSchema();
     req.pettyCashPermissions = await getUserPermissions(req.user);
     const transaction = await findTransaction(req.params.id, req.user.company_id);
     if (!transaction) return res.status(404).json({ message: "Transaction not found" });
@@ -519,7 +515,6 @@ exports.postTransaction = async (req, res, next) => {
 
 exports.getAttachment = async (req, res, next) => {
   try {
-    await ensurePettyCashSchema();
     const permissions = await getUserPermissions(req.user);
     const [rows] = await db.query(
       `SELECT a.*, t.created_by
@@ -574,7 +569,6 @@ exports.deleteAttachment = async (req, res, next) => {
 
 exports.getSettings = async (req, res, next) => {
   try {
-    await ensurePettyCashSchema();
     const [rows] = await db.query(
       "SELECT * FROM petty_cash_settings WHERE company_id=? LIMIT 1",
       [req.user.company_id]
@@ -658,7 +652,6 @@ exports.updateSettings = async (req, res, next) => {
 
 exports.listUserPermissions = async (req, res, next) => {
   try {
-    await ensurePettyCashSchema();
     const [rows] = await db.query(
       `SELECT u.id AS user_id, u.name, u.email, u.role, u.access_role,
               COALESCE(p.can_create,0) can_create,
@@ -707,7 +700,6 @@ exports.updateUserPermissions = async (req, res, next) => {
 
 exports.getReports = async (req, res, next) => {
   try {
-    await ensurePettyCashSchema();
     const permissions = await getUserPermissions(req.user);
     const clauses = ["company_id=?"];
     const params = [req.user.company_id];

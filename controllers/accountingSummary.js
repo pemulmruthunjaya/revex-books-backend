@@ -110,9 +110,6 @@ const ensurePayrollTables = async (db) => {
 };
 
 exports.getAccountingSummary = async (db, companyId, filters = {}) => {
-  await ensureReturnTables(db);
-  await ensurePayrollTables(db);
-
   const { from_date, to_date } = filters;
 
   const invoiceParams = [companyId];

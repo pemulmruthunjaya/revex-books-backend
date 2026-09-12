@@ -145,7 +145,6 @@ const fullPermissions = () =>
 const getUserPermissions = async (user) => {
   if (user.role === "owner") return fullPermissions();
 
-  await ensurePettyCashSchema();
   const [rows] = await db.query(
     `SELECT can_create, can_edit_own, can_submit, can_approve,
             can_reject, can_post, can_view_all
@@ -176,6 +175,9 @@ const getUserPermissions = async (user) => {
 
 const requirePermission = (action) => async (req, res, next) => {
   try {
+    if (!["GET", "HEAD", "OPTIONS"].includes(String(req.method || "").toUpperCase())) {
+      await ensurePettyCashSchema();
+    }
     const permissions = await getUserPermissions(req.user);
     req.pettyCashPermissions = permissions;
     if (!permissions[action]) {

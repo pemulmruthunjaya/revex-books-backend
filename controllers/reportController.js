@@ -1,5 +1,4 @@
 const db = require("../db/connection");
-const { ensurePayrollTables } = require("../services/payrollService");
 
 const toNumber = (value) => Number(value || 0);
 const money = (value) => Math.round(toNumber(value) * 100) / 100;
@@ -279,8 +278,6 @@ const getBillTaxRows = async (company_id, query) => {
 };
 
 const getReturnTaxSummary = async (company_id, type, query) => {
-  await ensureReturnTables();
-
   const params = [company_id, type];
   const dateFilter = addDateFilter("return_date", query, params);
 
@@ -359,8 +356,6 @@ exports.getProfit = async (req, res) => {
  */
 exports.getSales = async (req, res) => {
   try {
-    await ensureReturnTables();
-
     const company_id = req.user.company_id;
     const params = [company_id];
     const dateFilter = addDateFilter("i.invoice_date", req.query, params);
@@ -479,8 +474,6 @@ exports.getSales = async (req, res) => {
  */
 exports.getPurchase = async (req, res) => {
   try {
-    await ensureReturnTables();
-
     const company_id = req.user.company_id;
     const params = [company_id];
     const dateFilter = addDateFilter("b.bill_date", req.query, params);
@@ -607,8 +600,6 @@ exports.getPurchase = async (req, res) => {
  */
 exports.getPayrollReport = async (req, res) => {
   try {
-    await ensurePayrollTables();
-
     const company_id = req.user.company_id;
     const params = [company_id];
     const dateFilter = addDateFilter("pe.payroll_date", req.query, params);
@@ -737,8 +728,6 @@ exports.getPayrollReport = async (req, res) => {
  */
 exports.getStock = async (req, res) => {
   try {
-    await ensureProductInventoryColumns();
-
     const company_id = req.user.company_id;
     const [rows] = await db.query(
       `
@@ -826,10 +815,6 @@ exports.getStock = async (req, res) => {
  */
 exports.getStockMovementReport = async (req, res) => {
   try {
-    await ensureProductInventoryColumns();
-    await ensureReturnTables();
-    await ensureDeliveryChallanTables();
-
     const company_id = req.user.company_id;
     const productId = req.query.product_id ? Number(req.query.product_id) : null;
 
@@ -1054,8 +1039,6 @@ exports.getStockMovementReport = async (req, res) => {
  */
 exports.getLowStock = async (req, res) => {
   try {
-    await ensureProductInventoryColumns();
-
     const company_id = req.user.company_id;
 
     const [rows] = await db.query(
@@ -1080,8 +1063,6 @@ exports.getLowStock = async (req, res) => {
  */
 exports.getDeliveryChallanReport = async (req, res) => {
   try {
-    await ensureDeliveryChallanTables();
-
     const company_id = req.user.company_id;
     const type = String(req.query.type || "out").toLowerCase() === "in" ? "in" : "out";
     const params = [company_id, type];
@@ -1146,8 +1127,6 @@ exports.getDeliveryChallanReport = async (req, res) => {
  */
 exports.getReturnReport = async (req, res) => {
   try {
-    await ensureReturnTables();
-
     const company_id = req.user.company_id;
     const type = String(req.query.type || "sales").toLowerCase() === "purchase" ? "purchase" : "sales";
     const params = [company_id, type];
@@ -1473,8 +1452,6 @@ exports.getOutputGstReport = async (req, res) => {
  */
 exports.getHsnReport = async (req, res) => {
   try {
-    await ensureProductInventoryColumns();
-
     const company_id = req.user.company_id;
     const salesParams = [company_id];
     const salesDateFilter = addDateFilter("i.invoice_date", req.query, salesParams);
@@ -1595,9 +1572,6 @@ exports.getHsnReport = async (req, res) => {
  */
 exports.getGstFilingReadiness = async (req, res) => {
   try {
-    await ensureProductInventoryColumns();
-    await ensureReturnTables();
-
     const company_id = req.user.company_id;
     const issues = [];
     const addIssue = ({ severity, area, title, message, count = 0, action, samples = [] }) => {

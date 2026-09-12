@@ -1,5 +1,4 @@
 const db = require("../db/connection");
-const { ensureReceiptEntrySchema } = require("../services/receiptEntryService");
 
 /**
  * =========================================================
@@ -9,7 +8,6 @@ const { ensureReceiptEntrySchema } = require("../services/receiptEntryService");
 
 exports.getCustomerStatement = async (req, res) => {
   try {
-    await ensureReceiptEntrySchema();
     const {
       customer_id,
       from_date,
