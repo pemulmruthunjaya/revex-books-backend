@@ -7,6 +7,16 @@ const { requireFinancialYearForPosting, requireFinancialYearForMutation, rejectC
 let billStatusColumnReady = false;
 let billMrpColumnsReady = false;
 
+const requireBillVendor = async (connection, vendorId, companyId, lock = false) => {
+  const [vendors] = await connection.query(
+    `SELECT id FROM vendors WHERE id = ? AND company_id = ? LIMIT 1${lock ? " FOR SHARE" : ""}`,
+    [vendorId, companyId],
+  );
+  if (!vendors.length) {
+    throw Object.assign(new Error("Vendor not found"), { status: 404 });
+  }
+};
+
 const ensureBillStatusColumn = async () => {
   if (billStatusColumnReady) {
     return;
@@ -68,7 +78,6 @@ exports.createBill = async (req, res) => {
   const connection = await db.getConnection();
   let transactionStarted = false;
   try {
-    await ensureBillMrpColumns();
     rejectClientFinancialYear(req.body);
 
     const { vendor_id, bill_number, bill_date, due_date, items } = req.body;
@@ -79,6 +88,9 @@ exports.createBill = async (req, res) => {
         message: "Missing required fields",
       });
     }
+    // Reject inaccessible vendors before even the legacy schema helpers can write.
+    await requireBillVendor(connection, vendor_id, company_id);
+    await ensureBillMrpColumns();
     let total_amount = 0;
 
     const processedItems = [];
@@ -111,6 +123,8 @@ exports.createBill = async (req, res) => {
 
     await connection.beginTransaction();
     transactionStarted = true;
+    // Revalidate and hold ownership stable through the bill transaction.
+    await requireBillVendor(connection, vendor_id, company_id, true);
     const financialYear = await requireFinancialYearForPosting(company_id, bill_date, connection);
 
     /* ================= INSERT BILL ================= */
@@ -514,7 +528,6 @@ exports.updateBill = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
-    await ensureBillMrpColumns();
     rejectClientFinancialYear(req.body);
 
     const { id } = req.params;
@@ -525,8 +538,11 @@ exports.updateBill = async (req, res) => {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
+    await requireBillVendor(connection, vendor_id, company_id);
+    await ensureBillMrpColumns();
     await ensureBillStatusColumn();
     await connection.beginTransaction();
+    await requireBillVendor(connection, vendor_id, company_id, true);
     const [billRows] = await connection.query(
       "SELECT id, status, stock_posted, source_grn_id, financial_year_id FROM bills WHERE id = ? AND company_id = ? FOR UPDATE",
       [id, company_id],

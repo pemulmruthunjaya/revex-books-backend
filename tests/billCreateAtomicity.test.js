@@ -31,6 +31,7 @@ const connectionFor = (failure = null) => {
     release() { events.push("release"); },
     async query(sql, params) {
       events.push({ sql, params });
+      if (sql.includes("FROM vendors WHERE id = ? AND company_id = ?")) return [[{ id: 7 }]];
       if (sql.includes("FROM financial_years")) {
         if (failure === "fy") return [[]];
         return [[{ id: 2026, company_id: 4, code: "FY26", start_date: "2026-04-01", end_date: "2027-03-31", status: "OPEN", is_default: 1 }]];
