@@ -49,7 +49,7 @@ const req = vendor => ({ user:{company_id:4,user_id:13}, params:{id:81}, body:{
   vendor_id:vendor, company_id:99, bill_number:"TEST", bill_date:"2026-08-12",
   items:[{product_id:9,name:"Item",qty:2,price:100,mrp:120,gst:18}]
 }});
-async function exercise(method, vendor, disappears=false) {
+async function exercise(method, vendor, disappears=false, billDate="2026-08-12", allowVendor=false) {
   const calls=[]; let lookups=0;
   const old={query:db.query,get:db.getConnection,error:console.error};
   db.query=async sql=>{
@@ -70,7 +70,7 @@ async function exercise(method, vendor, disappears=false) {
         assert.match(sql,/WHERE id = \? AND company_id = \?/);
         assert.deepEqual(params,[vendor,4]); // Never use body.company_id.
         lookups++;
-        return [[...(vendor===7&&!(disappears&&lookups===2)?[{id:7}]:[])]];
+        return [[...((vendor===7||allowVendor)&&!(disappears&&lookups===2)?[{id:vendor}]:[])]];
       }
       if(sql.includes("FROM financial_years"))return [[{id:2026,company_id:4,start_date:"2026-04-01",end_date:"2027-03-31",status:"OPEN"}]];
       if(sql.includes("SELECT id, status, stock_posted"))return [[{id:81,status:"Unpaid",stock_posted:1,source_grn_id:null,financial_year_id:2026}]];
@@ -83,10 +83,34 @@ async function exercise(method, vendor, disappears=false) {
   };
   db.getConnection=async()=>c; console.error=()=>{};
   delete require.cache[require.resolve("../controllers/billController")];
-  try {const res=response();await require("../controllers/billController")[method](req(vendor),res);return {calls,res};}
+  try {const res=response();const request=req(vendor);request.body.bill_date=billDate;await require("../controllers/billController")[method](request,res);return {calls,res};}
   finally {db.query=old.query;db.getConnection=old.get;console.error=old.error;}
 }
 for(const method of ["createBill","updateBill"]) {
+  for(const [date,message] of [
+    ["not-a-date","businessDate must use YYYY-MM-DD"],
+    ["2026-02-30","businessDate is not a valid calendar date"],
+  ]) {
+    for(const bypass of [false,true]) test(method+": invalid date rejects before schema/DML with "+(bypass?"simulated vendor guard bypass":"valid vendor")+" ("+date+")",async()=>{
+      const {calls,res}=await exercise(method,bypass?8:7,false,date,bypass);
+      assert.equal(res.statusCode,400);
+      assert.deepEqual(res.body,{message,code:"INVALID_DATE"});
+      // A fresh controller resets schema-ready flags. Every pool/connection SQL is
+      // recorded: only the ownership SELECT may execute, even with guard bypass.
+      const queries=calls.filter(x=>x.sql);
+      assert.equal(queries.length,1);
+      assert.match(queries[0].sql,/FROM vendors/);
+      assert.equal(queries[0].pool,undefined);
+      assert.ok(!calls.some(x=>["begin","commit"].includes(x.event)));
+      assert.equal(calls.at(-1).event,"release");
+    });
+    for(const vendor of [8,999]) test(method+": vendor rejection precedes invalid date for "+vendor+" ("+date+")",async()=>{
+      const {calls,res}=await exercise(method,vendor,false,date);
+      assert.equal(res.statusCode,404);
+      assert.deepEqual(res.body,{message:"Vendor not found"});
+      assert.equal(calls.filter(x=>x.sql).length,1);
+    });
+  }
   test(method+": same-company vendor preserves successful bill/item/stock transaction",async()=>{
     const {calls,res}=await exercise(method,7);
     assert.equal(res.statusCode,method==="createBill"?201:200);

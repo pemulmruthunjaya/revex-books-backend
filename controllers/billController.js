@@ -2,7 +2,7 @@ const db = require("../db/connection");
 const {
   ensureVendorPaymentSchema,
 } = require("../services/vendorPaymentService");
-const { requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("../services/financialYearService");
+const { accountingDate, requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("../services/financialYearService");
 
 let billStatusColumnReady = false;
 let billMrpColumnsReady = false;
@@ -90,6 +90,8 @@ exports.createBill = async (req, res) => {
     }
     // Reject inaccessible vendors before even the legacy schema helpers can write.
     await requireBillVendor(connection, vendor_id, company_id);
+    // Apply the existing posting-date contract before legacy schema helpers can write.
+    accountingDate(bill_date, "businessDate");
     await ensureBillMrpColumns();
     let total_amount = 0;
 
@@ -539,6 +541,8 @@ exports.updateBill = async (req, res) => {
     }
 
     await requireBillVendor(connection, vendor_id, company_id);
+    // Keep vendor rejection first, with an independent pure guard before any DDL.
+    accountingDate(bill_date, "businessDate");
     await ensureBillMrpColumns();
     await ensureBillStatusColumn();
     await connection.beginTransaction();
