@@ -41,6 +41,119 @@ test("typed mutations and ledger commit on leased connection", async () => {
   await a.release();
   assert.equal(f.c.released, 1);
 });
+test("active G1 ledger entries are visible and commit exactly once", async () => {
+  const f = pool(),
+    a = new Fy6MysqlReadAdapter(f.p);
+  await a.beginTransaction("G1");
+  await a.insertVendorCopy({ id: 1, company_id: 1, name: "V" }, 6);
+  await a.updateBillVendor(3, 6, 1, 9);
+
+  const active = await a.getOperationLedger();
+  assert.deepEqual(
+    active.map((x) => [x.sequence, x.groupId, x.operationType, x.state]),
+    [
+      [1, "G1", "VENDOR_INSERT", "ATTEMPTED"],
+      [2, "G1", "BILL_UPDATE", "ATTEMPTED"],
+    ],
+  );
+  active[0].state = "CHANGED";
+  active[1].recordId = 999;
+  assert.deepEqual(
+    (await a.getOperationLedger()).map((x) => [x.recordId, x.state]),
+    [
+      [9, "ATTEMPTED"],
+      [3, "ATTEMPTED"],
+    ],
+  );
+
+  await a.commit();
+  const committed = await a.getOperationLedger();
+  assert.equal(committed.length, 2);
+  assert.deepEqual(
+    committed.map((x) => x.state),
+    ["COMMITTED", "COMMITTED"],
+  );
+  assert.deepEqual(
+    committed.map((x) => x.sequence),
+    [1, 2],
+  );
+  await a.release();
+});
+test("active G2 suffix is visible and rollback replaces attempted state", async () => {
+  const f = pool(),
+    a = new Fy6MysqlReadAdapter(f.p);
+  await a.beginTransaction("G2");
+  await a.insertVendorCopy({ id: 1, company_id: 1, name: "V" }, 7);
+  await a.updateBillVendor(4, 7, 1, 9);
+  await a.updateVendorPaymentVendor(1, 7, 1, 9);
+  await a.updateVendorPaymentVendor(2, 7, 1, 9);
+
+  const active = await a.getOperationLedger();
+  assert.deepEqual(
+    active.map((x) => x.operationType),
+    [
+      "VENDOR_INSERT",
+      "BILL_UPDATE",
+      "VENDOR_PAYMENT_UPDATE",
+      "VENDOR_PAYMENT_UPDATE",
+    ],
+  );
+  assert.ok(active.every((x) => x.groupId === "G2" && x.state === "ATTEMPTED"));
+  active[0].groupId = "CHANGED";
+  assert.equal((await a.getOperationLedger())[0].groupId, "G2");
+
+  await a.rollback();
+  const rolledBack = await a.getOperationLedger();
+  assert.equal(rolledBack.length, 4);
+  assert.ok(rolledBack.every((x) => x.state === "ROLLED_BACK"));
+  assert.deepEqual(
+    rolledBack.map((x) => x.sequence),
+    [1, 2, 3, 4],
+  );
+  await a.release();
+});
+test("later ledger baselines preserve committed and rolled-back history", async () => {
+  const f = pool(),
+    a = new Fy6MysqlReadAdapter(f.p);
+
+  await a.beginTransaction("G1");
+  await a.insertVendorCopy({ id: 1, company_id: 1, name: "V1" }, 6);
+  await a.commit();
+  const committedBaseline = await a.getOperationLedger();
+
+  await a.beginTransaction("G3");
+  await a.insertVendorCopy({ id: 3, company_id: 1, name: "V3" }, 4);
+  await a.rollback();
+  const mixedBaseline = await a.getOperationLedger();
+  assert.deepEqual(
+    mixedBaseline.map((x) => x.state),
+    ["COMMITTED", "ROLLED_BACK"],
+  );
+
+  await a.beginTransaction("G2");
+  await a.insertVendorCopy({ id: 1, company_id: 1, name: "V1" }, 7);
+  const withActive = await a.getOperationLedger();
+  assert.deepEqual(withActive.slice(0, 2), mixedBaseline);
+  assert.deepEqual(committedBaseline, [
+    { ...mixedBaseline[0] },
+  ]);
+  assert.equal(withActive[2].state, "ATTEMPTED");
+  assert.deepEqual(
+    withActive.map((x) => x.sequence),
+    [1, 2, 3],
+  );
+  assert.equal(new Set(withActive.map((x) => x.sequence)).size, 3);
+
+  withActive[0].state = "CHANGED";
+  withActive[2].state = "CHANGED";
+  const unchanged = await a.getOperationLedger();
+  assert.deepEqual(
+    unchanged.map((x) => x.state),
+    ["COMMITTED", "ROLLED_BACK", "ATTEMPTED"],
+  );
+  await a.rollback();
+  await a.release();
+});
 test("rollback marks attempted operations and no retry", async () => {
   const f = pool(),
     a = new Fy6MysqlReadAdapter(f.p);

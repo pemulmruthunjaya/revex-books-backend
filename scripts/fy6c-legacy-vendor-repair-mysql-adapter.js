@@ -230,7 +230,10 @@ class Fy6MysqlReadAdapter {
     return fingerprint(r);
   }
   async getOperationLedger() {
-    return this.ledger.map((x) => ({ ...x }));
+    return [
+      ...this.ledger,
+      ...(this.transaction ? this.transaction.ops : []),
+    ].map((x) => ({ ...x }));
   }
   _requireTx() {
     if (!this.transaction) throw Error("FY6_TX_REQUIRED");
