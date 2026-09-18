@@ -85,8 +85,39 @@ class Fy6MysqlReadAdapter {
     );
     return r[0] || null;
   }
-  async getInitialState() {
-    return { billMismatches: 6, paymentMismatches: 2 };
+  async #getMismatchCounts(manifest) {
+    if (!manifest || !Array.isArray(manifest.groups))
+      throw Error("FY6_MANIFEST_REQUIRED");
+    const records = manifest.groups.flatMap((g) => g.records || []);
+    const billIds = records
+      .filter((r) => r.record_type === "BILL")
+      .map((r) => r.record_id);
+    const paymentIds = records
+      .filter((r) => r.record_type !== "BILL")
+      .map((r) => r.record_id);
+    const count = async (table, alias, ids) => {
+      if (ids.length === 0) return 0;
+      const placeholders = ids.map(() => "?").join(",");
+      const [rows] = await this.#query(
+        `SELECT COUNT(*) AS mismatchCount FROM ${table} ${alias} LEFT JOIN vendors v ON v.id=${alias}.vendor_id WHERE ${alias}.id IN (${placeholders}) AND (v.id IS NULL OR ${alias}.company_id<>v.company_id)`,
+        ids,
+      );
+      const value = Number(rows[0]?.mismatchCount);
+      if (!Number.isInteger(value) || value < 0)
+        throw Error("MISMATCH_COUNT_INVALID");
+      return value;
+    };
+    return {
+      billMismatches: await count("bills", "b", billIds),
+      paymentMismatches: await count(
+        "vendor_payments",
+        "p",
+        paymentIds,
+      ),
+    };
+  }
+  async getInitialState(manifest) {
+    return this.#getMismatchCounts(manifest);
   }
   async getPopulationEvidence(manifest) {
     const bills = [];
@@ -152,9 +183,9 @@ class Fy6MysqlReadAdapter {
         a.groupId.localeCompare(b.groupId) ||
         a.equivalentVendorId - b.equivalentVendorId,
     );
+    const mismatchCounts = await this.#getMismatchCounts(manifest);
     const evidence = {
-      billMismatches: bills.length,
-      paymentMismatches: payments.length,
+      ...mismatchCounts,
       bills,
       payments,
       equivalentTargetVendors,
@@ -163,8 +194,8 @@ class Fy6MysqlReadAdapter {
     evidence.fingerprint = fingerprint(evidence);
     return evidence;
   }
-  async getGlobalPostState() {
-    return { billMismatches: 0, paymentMismatches: 0 };
+  async getGlobalPostState(manifest) {
+    return this.#getMismatchCounts(manifest);
   }
   async getSourceVendorEvidence(id, c) {
     const v = await this.getVendorById(id);

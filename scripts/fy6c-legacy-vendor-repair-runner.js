@@ -313,8 +313,136 @@ function parseArgs(argv) {
 }
 function validateRuntimeCommit(a,env=process.env){const actual=env.FY6_DEPLOYED_RUNTIME_COMMIT;if(!actual||!a.expectedRuntimeCommit)throw Error("RUNTIME_COMMIT_REQUIRED");if(!/^[0-9a-f]{40}$/i.test(actual)||!/^[0-9a-f]{40}$/i.test(a.expectedRuntimeCommit))throw Error("RUNTIME_COMMIT_INVALID");const x=Buffer.from(actual.toLowerCase()),y=Buffer.from(a.expectedRuntimeCommit.toLowerCase());if(x.length!==y.length||!crypto.timingSafeEqual(x,y))throw Error("RUNTIME_COMMIT_MISMATCH");return actual.toLowerCase()}
 function validateBackup(a){if(!a.backup||!a.backupSha)throw Error("BACKUP_REQUIRED");let st;try{st=fs.statSync(a.backup)}catch{throw Error("BACKUP_NOT_FOUND")}if(!st.isFile())throw Error("BACKUP_INVALID");if(st.size<=0)throw Error("BACKUP_EMPTY");if(st.mtimeMs>Date.now()+60000||Date.now()-st.mtimeMs>86400000)throw Error("BACKUP_STALE");const actual=sha(fs.readFileSync(a.backup));if(!/^[0-9a-f]{64}$/i.test(a.backupSha)||actual!==a.backupSha.toLowerCase())throw Error("BACKUP_SHA_MISMATCH");return {path:path.resolve(a.backup),size:st.size,mtime:st.mtime.toISOString(),sha256:actual}}
-function validatePopulationEvidence(e,manifest){if(!e||typeof e!=="object"||Array.isArray(e)||!Array.isArray(e.bills)||!Array.isArray(e.payments)||!Array.isArray(e.equivalentTargetVendors)||!Number.isInteger(e.billMismatches)||!Number.isInteger(e.paymentMismatches)||typeof e.fingerprint!=="string"||!/^[0-9a-f]{64}$/.test(e.fingerprint)||populationFingerprint({...e,fingerprint:null})!==e.fingerprint)throw Object.assign(new Error("POPULATION_EVIDENCE_INVALID"),{code:"POPULATION_EVIDENCE_INVALID"});const bm=manifest.groups.flatMap(g=>g.records.filter(r=>r.record_type==='BILL').map(r=>r.record_id)).sort((a,b)=>a-b),pm=manifest.groups.flatMap(g=>g.records.filter(r=>r.record_type!=='BILL').map(r=>r.record_id)).sort((a,b)=>a-b);if(JSON.stringify(e.bills.map(x=>x.id).sort((a,b)=>a-b))!==JSON.stringify(bm)||JSON.stringify(e.payments.map(x=>x.id).sort((a,b)=>a-b))!==JSON.stringify(pm)||e.payments.some(x=>x.bill_id!==null))throw Object.assign(new Error("POPULATION_MISMATCH"),{code:"POPULATION_MISMATCH"});const by=(id,t)=>manifest.transactions.find(x=>x.record_type===t&&x.record_id===id);if(e.bills.some(x=>{const t=by(x.id,'BILL');return !t||x.company_id!==t.expected_company_id||x.vendor_id!==t.expected_current_vendor_id})||e.payments.some(x=>{const t=by(x.id,'VENDOR_PAYMENT');return !t||x.company_id!==t.expected_company_id||x.vendor_id!==t.expected_current_vendor_id}))throw Object.assign(new Error("POPULATION_MISMATCH"),{code:"POPULATION_MISMATCH"});if(e.billMismatches===6&&e.paymentMismatches===2&&e.equivalentTargetVendors.length===0)return e;throw Object.assign(new Error("POPULATION_MISMATCH"),{code:"POPULATION_MISMATCH"})}
-function classifyPopulation(e,manifest){const pristine=e.billMismatches===6&&e.paymentMismatches===2&&e.bills.length===6&&e.payments.length===2&&e.equivalentTargetVendors.length===0;if(pristine)return "PRISTINE";const expected=new Map(manifest.groups.map(g=>[g.group_id,{sourceVendorId:g.source_vendor_id,targetCompanyId:g.target_company_id}]));const groups=new Set();const valid=e.equivalentTargetVendors.length===5&&e.equivalentTargetVendors.every(v=>{const x=expected.get(v.groupId);if(!x||groups.has(v.groupId)||v.sourceVendorId!==x.sourceVendorId||v.targetCompanyId!==x.targetCompanyId||!Number.isInteger(v.equivalentVendorId)||v.equivalentVendorId<=0)return false;groups.add(v.groupId);return true});const map=new Map(e.equivalentTargetVendors.map(v=>[v.groupId,v.equivalentVendorId]));const rowRefs=valid&&e.bills.every(b=>{const g=manifest.groups.find(g=>g.records.some(r=>r.record_type==='BILL'&&r.record_id===b.id));return g&&b.vendor_id===map.get(g.group_id)})&&e.payments.every(p=>p.vendor_id===map.get('G2')&&p.bill_id===null);const repaired=e.billMismatches===0&&e.paymentMismatches===0&&rowRefs;if(repaired)return "ALREADY_REPAIRED";if(e.equivalentTargetVendors.length>0||e.billMismatches!==6||e.paymentMismatches!==2)return "PARTIAL_PRIOR_RUN";return "POPULATION_MISMATCH"}
+function populationMismatch() {
+  throw Object.assign(new Error("POPULATION_MISMATCH"), {
+    code: "POPULATION_MISMATCH",
+  });
+}
+function analyzePopulation(e, manifest) {
+  const groups = new Map(manifest.groups.map((g) => [g.group_id, g]));
+  const transactions = new Map(
+    manifest.transactions.map((t) => [
+      `${t.record_type}:${t.record_id}`,
+      t,
+    ]),
+  );
+  const expectedBillIds = manifest.transactions
+    .filter((t) => t.record_type === "BILL")
+    .map((t) => t.record_id)
+    .sort((a, b) => a - b);
+  const expectedPaymentIds = manifest.transactions
+    .filter((t) => t.record_type === "VENDOR_PAYMENT")
+    .map((t) => t.record_id)
+    .sort((a, b) => a - b);
+  const actualBillIds = e.bills.map((x) => x?.id).sort((a, b) => a - b);
+  const actualPaymentIds = e.payments
+    .map((x) => x?.id)
+    .sort((a, b) => a - b);
+  if (
+    JSON.stringify(actualBillIds) !== JSON.stringify(expectedBillIds) ||
+    JSON.stringify(actualPaymentIds) !== JSON.stringify(expectedPaymentIds)
+  )
+    populationMismatch();
+
+  const equivalents = new Map();
+  const equivalentIds = new Set();
+  for (const value of e.equivalentTargetVendors) {
+    const group = value && groups.get(value.groupId);
+    if (
+      !group ||
+      equivalents.has(value.groupId) ||
+      !Number.isInteger(value.equivalentVendorId) ||
+      value.equivalentVendorId <= 0 ||
+      value.equivalentVendorId === group.source_vendor_id ||
+      equivalentIds.has(value.equivalentVendorId) ||
+      value.sourceVendorId !== group.source_vendor_id ||
+      value.sourceCompanyId !== group.source_vendor_company_id ||
+      value.targetCompanyId !== group.target_company_id ||
+      typeof value.sourceFingerprint !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.sourceFingerprint) ||
+      value.equivalentFingerprint !== value.sourceFingerprint
+    )
+      populationMismatch();
+    equivalents.set(value.groupId, value.equivalentVendorId);
+    equivalentIds.add(value.equivalentVendorId);
+  }
+
+  let billMismatches = 0;
+  let paymentMismatches = 0;
+  let sourceRows = 0;
+  let equivalentRows = 0;
+  const inspect = (row, recordType) => {
+    if (!row || typeof row !== "object" || Array.isArray(row))
+      populationMismatch();
+    const transaction = transactions.get(`${recordType}:${row.id}`);
+    const group = manifest.groups.find((g) =>
+      g.records.some(
+        (r) => r.record_type === recordType && r.record_id === row.id,
+      ),
+    );
+    if (!transaction || !group || row.company_id !== transaction.expected_company_id)
+      populationMismatch();
+    if (recordType === "VENDOR_PAYMENT" && row.bill_id !== null)
+      populationMismatch();
+    if (row.vendor_id === transaction.expected_current_vendor_id) {
+      sourceRows += 1;
+      if (recordType === "BILL") billMismatches += 1;
+      else paymentMismatches += 1;
+      return;
+    }
+    if (row.vendor_id === equivalents.get(group.group_id)) {
+      equivalentRows += 1;
+      return;
+    }
+    populationMismatch();
+  };
+  e.bills.forEach((row) => inspect(row, "BILL"));
+  e.payments.forEach((row) => inspect(row, "VENDOR_PAYMENT"));
+  if (
+    e.billMismatches !== billMismatches ||
+    e.paymentMismatches !== paymentMismatches
+  )
+    populationMismatch();
+
+  const totalRows = e.bills.length + e.payments.length;
+  if (equivalents.size === 0 && sourceRows === totalRows) return "PRISTINE";
+  if (
+    equivalents.size === groups.size &&
+    equivalentRows === totalRows &&
+    sourceRows === 0
+  )
+    return "ALREADY_REPAIRED";
+  return "PARTIAL_PRIOR_RUN";
+}
+function validatePopulationEvidence(e, manifest) {
+  if (
+    !e ||
+    typeof e !== "object" ||
+    Array.isArray(e) ||
+    !Array.isArray(e.bills) ||
+    !Array.isArray(e.payments) ||
+    !Array.isArray(e.equivalentTargetVendors) ||
+    !Number.isInteger(e.billMismatches) ||
+    e.billMismatches < 0 ||
+    !Number.isInteger(e.paymentMismatches) ||
+    e.paymentMismatches < 0 ||
+    typeof e.fingerprint !== "string" ||
+    !/^[0-9a-f]{64}$/.test(e.fingerprint) ||
+    populationFingerprint({ ...e, fingerprint: null }) !== e.fingerprint
+  )
+    throw Object.assign(new Error("POPULATION_EVIDENCE_INVALID"), {
+      code: "POPULATION_EVIDENCE_INVALID",
+    });
+  analyzePopulation(e, manifest);
+  return e;
+}
+function classifyPopulation(e, manifest) {
+  try {
+    return analyzePopulation(e, manifest);
+  } catch {
+    return "POPULATION_MISMATCH";
+  }
+}
 function validateIdentity(mode, actual, a) {
   if (mode === "production") {
     if (
@@ -404,7 +532,7 @@ async function executeRepair(adapter, manifest, options = {}) {
     throw Error("STOCK_FINGERPRINT_REQUIRED");
   if (strict && typeof adapter.getAccountingFingerprint !== "function")
     throw Error("ACCOUNTING_FINGERPRINT_REQUIRED");
-  const s = await adapter.getInitialState();
+  const s = await adapter.getInitialState(manifest);
   if (s.billMismatches !== 6 || s.paymentMismatches !== 2)
     throw Error("MISMATCH_COUNT");
   for (const g of manifest.groups) {
@@ -670,7 +798,7 @@ async function executeRepair(adapter, manifest, options = {}) {
       throw e;
     }
   }
-  const p = await adapter.getGlobalPostState();
+  const p = await adapter.getGlobalPostState(manifest);
   if (p.billMismatches !== 0 || p.paymentMismatches !== 0)
     throw Error("GLOBAL_POSTCONDITION");
   return adapter.counters || {};
