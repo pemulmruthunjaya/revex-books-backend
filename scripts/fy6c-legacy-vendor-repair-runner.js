@@ -49,7 +49,7 @@ function validateSourceBaseline(e, g) {
     !e.protectedFields ||
     typeof e.protectedFields !== "object" ||
     Array.isArray(e.protectedFields) ||
-    sha(sourceCanonical(e.protectedFields)) !== e.fingerprint
+    populationFingerprint(e.protectedFields) !== e.fingerprint
   )
     throw Object.assign(new Error("SOURCE_VENDOR_DRIFT"), {
       code: "SOURCE_VENDOR_DRIFT",
@@ -70,7 +70,7 @@ function validateBillBaseline(e, t) {
     Array.isArray(e.protectedFields) ||
     typeof e.fingerprint !== "string" ||
     !/^[0-9a-f]{64}$/.test(e.fingerprint) ||
-    sha(sourceCanonical(e.protectedFields)) !== e.fingerprint
+    populationFingerprint(e.protectedFields) !== e.fingerprint
   )
     throw Object.assign(new Error("BILL_EVIDENCE_INVALID"), {
       code: "BILL_EVIDENCE_INVALID",
@@ -117,7 +117,7 @@ function validatePaymentBaseline(e, t) {
     Array.isArray(e.protectedFields) ||
     typeof e.fingerprint !== "string" ||
     !/^[0-9a-f]{64}$/.test(e.fingerprint) ||
-    sha(sourceCanonical(e.protectedFields)) !== e.fingerprint
+    populationFingerprint(e.protectedFields) !== e.fingerprint
   )
     throw Object.assign(new Error("PAYMENT_EVIDENCE_INVALID"), {
       code: "PAYMENT_EVIDENCE_INVALID",
@@ -244,7 +244,7 @@ function validateSourceBaseline(e, g) {
     Array.isArray(e.protectedFields) ||
     typeof e.fingerprint !== "string" ||
     !/^[0-9a-f]{64}$/.test(e.fingerprint) ||
-    sha(sourceCanonical(e.protectedFields)) !== e.fingerprint
+    populationFingerprint(e.protectedFields) !== e.fingerprint
   )
     throw Object.assign(new Error("SOURCE_VENDOR_EVIDENCE_INVALID"), {
       code: "SOURCE_VENDOR_EVIDENCE_INVALID",
@@ -278,7 +278,7 @@ function validateSourceEvidence(e, g) {
     !e.protectedFields ||
     typeof e.protectedFields !== "object" ||
     Array.isArray(e.protectedFields) ||
-    sha(canonicalEvidence(e.protectedFields)) !== e.fingerprint
+    populationFingerprint(e.protectedFields) !== e.fingerprint
   )
     throw Error("SOURCE_VENDOR_EVIDENCE_INVALID");
   return e;
@@ -749,6 +749,9 @@ module.exports = {
   validateIdentity,
   validatePopulationEvidence,
   classifyPopulation,
+  validateSourceBaseline,
+  validateBillBaseline,
+  validatePaymentBaseline,
   executeRepair,
   run,
 };
