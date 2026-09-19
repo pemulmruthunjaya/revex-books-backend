@@ -16,7 +16,7 @@ const statusRouteSource = fs.readFileSync(
 );
 
 const expectedTenantPrefixes = [
-  "/api/users", "/api/staff", "/api/audit-logs", "/api/customers",
+  "/api/users", "/api/staff", "/api/audit-logs", "/api/financial-years", "/api/customers",
   "/api/invoices", "/api/recurring-invoices", "/api/invoice-settings",
   "/api/quotations", "/api/products", "/api/barcodes", "/api/vendors",
   "/api/vendor-payments", "/api/purchase-orders", "/api/bills",

@@ -44,5 +44,3 @@ StatefulFakeAdapter.prototype.getSourceVendorEvidence=async function(id,company)
   if(cfg&&cfg.groupId===this.activeTransaction?.groupId&&cfg.sourceVendorId===id&&cfg.phase===phase){if(cfg.mode==='throw')throw Object.assign(Error('SOURCE_VENDOR_DRIFT'),{code:'SOURCE_VENDOR_DRIFT'});if(cfg.mode==='disappear')return undefined;const e=await _timedSourceEvidence.call(this,id,company);if(cfg.mode==='wrong_vendor')e.vendorId=999;if(cfg.mode==='wrong_company')e.companyId=999;if(cfg.mode==='malformed')return {};if(cfg.mode==='fingerprint_drift')e.fingerprint='f'.repeat(64);if(cfg.mode==='protected_field_drift')e.protectedFields.name='drift';if(cfg.mode==='fingerprint_mismatch')e.protectedFields.name='drift';return e;}
   return _timedSourceEvidence.call(this,id,company);
 };
-
-
