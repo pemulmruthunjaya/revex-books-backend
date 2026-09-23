@@ -196,14 +196,15 @@ class Fy6MysqlReadAdapter {
     return r[0] || null;
   }
   async getBillForRepair(id) {
-    const [r] = await this.#query("SELECT * FROM bills WHERE id=? LIMIT 1", [
-      id,
-    ]);
+    const [r] = await this.#query(
+      "SELECT b.id,b.company_id,b.vendor_id,v.company_id AS vendor_company_id,DATE_FORMAT(b.bill_date,'%Y-%m-%d') AS transaction_date,b.status,b.financial_year_id FROM bills b LEFT JOIN vendors v ON v.id=b.vendor_id WHERE b.id=? LIMIT 1",
+      [id],
+    );
     return r[0] || null;
   }
   async getVendorPaymentForRepair(id) {
     const [r] = await this.#query(
-      "SELECT * FROM vendor_payments WHERE id=? LIMIT 1",
+      "SELECT p.id,p.company_id,p.vendor_id,v.company_id AS vendor_company_id,DATE_FORMAT(p.payment_date,'%Y-%m-%d') AS transaction_date,p.bill_id,p.status,p.financial_year_id FROM vendor_payments p LEFT JOIN vendors v ON v.id=p.vendor_id WHERE p.id=? LIMIT 1",
       [id],
     );
     return r[0] || null;
@@ -344,7 +345,11 @@ class Fy6MysqlReadAdapter {
     };
   }
   async getBillEvidence(id) {
-    const b = await this.getBillForRepair(id);
+    const [rows] = await this.#query(
+      "SELECT id,bill_number,DATE_FORMAT(bill_date,'%Y-%m-%d') AS bill_date,DATE_FORMAT(due_date,'%Y-%m-%d') AS due_date,CAST(total_amount AS CHAR) AS total_amount,CAST(paid_amount AS CHAR) AS paid_amount,CAST(due_amount AS CHAR) AS due_amount,status,company_id,DATE_FORMAT(created_at,'%Y-%m-%dT%H:%i:%s.%f') AS created_at,vendor_id,source_purchase_order_id,source_grn_id,CAST(stock_posted AS SIGNED) AS stock_posted,financial_year_id FROM bills WHERE id=? LIMIT 1",
+      [id],
+    );
+    const b = rows[0] || null;
     if (!b) return null;
     const p = { ...b };
     delete p.vendor_id;
@@ -358,7 +363,11 @@ class Fy6MysqlReadAdapter {
     };
   }
   async getPaymentEvidence(id) {
-    const p = await this.getVendorPaymentForRepair(id);
+    const [rows] = await this.#query(
+      "SELECT id,vendor_id,bill_id,CAST(amount AS CHAR) AS amount,DATE_FORMAT(payment_date,'%Y-%m-%d') AS payment_date,payment_method,paid_from_account_id,reference_number,notes,company_id,created_by,journal_entry_id,idempotency_key,status,DATE_FORMAT(created_at,'%Y-%m-%dT%H:%i:%s.%f') AS created_at,financial_year_id FROM vendor_payments WHERE id=? LIMIT 1",
+      [id],
+    );
+    const p = rows[0] || null;
     if (!p) return null;
     const x = { ...p };
     delete x.vendor_id;

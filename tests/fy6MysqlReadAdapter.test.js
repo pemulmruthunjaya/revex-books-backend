@@ -53,6 +53,64 @@ test("FY6 read adapter leases one connection and releases once", async () => {
   assert.ok(f.calls.every((x) => x.args));
   assert.deepEqual(await a.getOperationLedger(), []);
 });
+test("production repair getters normalize bill and payment identities", async () => {
+  const calls = [];
+  const rows = {
+    bill: {
+      id: 3,
+      company_id: 6,
+      vendor_id: 1,
+      vendor_company_id: 1,
+      transaction_date: "2026-03-03",
+      status: "Unpaid",
+      financial_year_id: 10,
+    },
+    payment: {
+      id: 1,
+      company_id: 7,
+      vendor_id: 1,
+      vendor_company_id: 1,
+      transaction_date: "2026-03-04",
+      bill_id: null,
+      status: "SUCCESS",
+      financial_year_id: 12,
+    },
+  };
+  const conn = {
+    async query(sql, args) {
+      calls.push([sql, args]);
+      if (sql.includes("FROM bills b LEFT JOIN vendors v")) return [[rows.bill]];
+      if (sql.includes("FROM vendor_payments p LEFT JOIN vendors v"))
+        return [[rows.payment]];
+      return [[]];
+    },
+    release() {},
+  };
+  const adapter = new Fy6MysqlReadAdapter({ getConnection: async () => conn });
+  assert.deepEqual(await adapter.getBillForRepair(3), rows.bill);
+  assert.deepEqual(await adapter.getVendorPaymentForRepair(1), rows.payment);
+  assert.equal((await adapter.getVendorPaymentForRepair(1)).bill_id, null);
+  assert.ok(
+    calls.every(
+      ([sql, args]) =>
+        sql.startsWith("SELECT ") &&
+        !sql.includes("SELECT *") &&
+        sql.includes("LEFT JOIN vendors v ON v.id=") &&
+        sql.includes("DATE_FORMAT(") &&
+        sql.endsWith("WHERE " + (sql.includes("FROM bills b") ? "b" : "p") + ".id=? LIMIT 1") &&
+        args.length === 1 &&
+        Number.isInteger(args[0]),
+    ),
+  );
+
+  rows.bill = { ...rows.bill, vendor_company_id: null };
+  rows.payment = { ...rows.payment, vendor_company_id: null, bill_id: 3 };
+  assert.equal((await adapter.getBillForRepair(3)).vendor_company_id, null);
+  const linked = await adapter.getVendorPaymentForRepair(1);
+  assert.equal(linked.vendor_company_id, null);
+  assert.equal(linked.bill_id, 3);
+  await adapter.release();
+});
 test("FY6 evidence fingerprints are deterministic", async () => {
   const f = fake(),
     a = new Fy6MysqlReadAdapter(f.pool);
@@ -125,9 +183,9 @@ test("dynamic mismatch counts are consistent for pristine repaired and missing-v
         }).length;
         return [[{ mismatchCount }]];
       }
-      if (sql === "SELECT * FROM bills WHERE id=? LIMIT 1")
+      if (sql.includes("FROM bills b LEFT JOIN vendors v"))
         return [[bills.get(args[0])].filter(Boolean)];
-      if (sql === "SELECT * FROM vendor_payments WHERE id=? LIMIT 1")
+      if (sql.includes("FROM vendor_payments p LEFT JOIN vendors v"))
         return [[payments.get(args[0])].filter(Boolean)];
       if (sql === "SELECT * FROM vendors WHERE id=? LIMIT 1")
         return [[vendors.get(args[0])].filter(Boolean)];
@@ -223,9 +281,9 @@ function productionFingerprintFake() {
       calls.push([sql, args]);
       if (sql.includes("COUNT(*) AS mismatchCount"))
         return [[{ mismatchCount: sql.includes("FROM bills b") ? 6 : 2 }]];
-      if (sql === "SELECT * FROM bills WHERE id=? LIMIT 1")
+      if (sql.includes("FROM bills b LEFT JOIN vendors v"))
         return [[state.bills.find((row) => row.id === args[0])].filter(Boolean)];
-      if (sql === "SELECT * FROM vendor_payments WHERE id=? LIMIT 1")
+      if (sql.includes("FROM vendor_payments p LEFT JOIN vendors v"))
         return [[state.vendor_payments.find((row) => row.id === args[0])].filter(Boolean)];
       if (sql === "SELECT * FROM vendors WHERE id=? LIMIT 1")
         return [[vendors.get(args[0])].filter(Boolean)];
