@@ -161,6 +161,30 @@ class Fy6MysqlReadAdapter {
     await this.#query("START TRANSACTION", []);
     this.transaction = { groupId, ops: [] };
   }
+  async getProductionIdentityEvidence() {
+    const [rows] = await this.#query(
+      "SELECT @@hostname AS host,@@port AS port,@@version AS version,DATABASE() AS db",
+      [],
+    );
+    const identity = rows && rows[0];
+    if (
+      !identity ||
+      typeof identity.host !== "string" ||
+      identity.host.length === 0 ||
+      !Number.isInteger(Number(identity.port)) ||
+      typeof identity.version !== "string" ||
+      identity.version.length === 0 ||
+      typeof identity.db !== "string" ||
+      identity.db.length === 0
+    )
+      throw Error("PRODUCTION_LIVE_IDENTITY_REQUIRED");
+    return {
+      host: identity.host,
+      port: Number(identity.port),
+      version: identity.version,
+      db: identity.db,
+    };
+  }
   async commit() {
     if (!this.transaction) throw Error("FY6_TX_REQUIRED");
     await this.#query("COMMIT", []);

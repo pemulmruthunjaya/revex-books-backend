@@ -221,6 +221,29 @@ test("mutation SQL allowlist is parameterized", async () => {
   await a.rollback();
   await a.release();
 });
+test("production identity evidence uses the leased connection and exact projection", async () => {
+  const f = pool();
+  f.c.query = async (sql, args) => {
+    f.calls.push([sql, args]);
+    return [[{ host: "7102d71a58ff", port: 3306, version: "9.7.2", db: "railway" }]];
+  };
+  const a = new Fy6MysqlReadAdapter(f.p);
+  assert.deepEqual(await a.getProductionIdentityEvidence(), {
+    host: "7102d71a58ff", port: 3306, version: "9.7.2", db: "railway",
+  });
+  assert.equal(f.calls.length, 1);
+  assert.match(f.calls[0][0], /^SELECT @@hostname AS host,@@port AS port,@@version AS version,DATABASE\(\) AS db$/);
+  assert.deepEqual(f.calls[0][1], []);
+  await a.release();
+});
+test("production identity evidence rejects missing fields", async () => {
+  for (const row of [null, {}, { host: "h", port: 3306, version: "", db: "railway" }]) {
+    const c = { query: async () => [[row].filter(Boolean)], release() {} };
+    const a = new Fy6MysqlReadAdapter({ getConnection: async () => c });
+    await assert.rejects(a.getProductionIdentityEvidence(), /PRODUCTION_LIVE_IDENTITY_REQUIRED/);
+    await a.release();
+  }
+});
 test("invalid insert ids fail closed", async () => {
   for (const val of [undefined, 0, -1, 1.5]) {
     const calls = [];

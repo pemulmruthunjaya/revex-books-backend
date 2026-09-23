@@ -12,8 +12,13 @@ const MANIFEST_PATH = path.join(
   ),
   AUTH = "FY6C-6D-EXPLICIT-REPAIR-AUTH",
   EXPECTED_DB = "railway",
-  EXPECTED_HOST = "55457156b444",
-  EXPECTED_MYSQL = "9.4.0",
+  EXPECTED_PRODUCTION_PORT = 3306,
+  EXPECTED_MYSQL_MAJOR = 9,
+  EXPECTED_DB_HOST = "mysql.railway.internal",
+  EXPECTED_RAILWAY_PROJECT_ID = "ad98950f-48d4-4349-9aaf-026bd30a6d2a",
+  EXPECTED_RAILWAY_ENVIRONMENT_ID = "ff88ca7b-c8c3-43c7-8b67-4b3710ebc4c9",
+  EXPECTED_RAILWAY_SERVICE_ID = "37a33f8f-61e3-4560-a85d-564e4f358523",
+  EXPECTED_DATABASE_SERVICE_ID = "29a5fb78-45a0-4781-a1d1-b2e3668efe85",
   DISPOSABLE_PREFIX = "revex_fy6c6e_vendor_repair_dryrun_",
   DISPOSABLE_REGEX =
     /^revex_fy6c6e_vendor_repair_dryrun_[a-z0-9][a-z0-9_-]{0,47}$/;
@@ -297,10 +302,13 @@ function parseArgs(argv) {
   return {
     execute: argv.includes("--execute"),
     auth: get("--authorization="),
+    productionExecutionToken: get("--production-execution-token="),
     db: get("--expected-db="),
     manifestSha: get("--manifest-sha="),
     runtimeCommit: get("--runtime-commit="),
     expectedRuntimeCommit: get("--expected-runtime-commit="),
+    expectedLiveHostname: get("--expected-live-hostname="),
+    expectedLiveVersion: get("--expected-live-version="),
     backup: get("--backup="),
     backupSha: get("--backup-sha="),
     mode: get("--identity-mode="),
@@ -310,6 +318,46 @@ function parseArgs(argv) {
     disposableVersion: get("--disposable-version="),
     allowDisposable: argv.includes("--allow-disposable-proof"),
   };
+}
+function timingSafeTextEqual(actual, expected) {
+  if (typeof actual !== "string" || typeof expected !== "string") return false;
+  const left = Buffer.from(actual), right = Buffer.from(expected);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+function validateProductionContext(a, env = process.env) {
+  if (a.mode !== "production") return null;
+  if (!env.RAILWAY_PROJECT_ID || !env.RAILWAY_ENVIRONMENT_ID || !env.RAILWAY_SERVICE_ID)
+    throw Error("PRODUCTION_RAILWAY_CONTEXT_REQUIRED");
+  if (env.RAILWAY_PROJECT_ID !== EXPECTED_RAILWAY_PROJECT_ID)
+    throw Error("PRODUCTION_PROJECT_MISMATCH");
+  if (env.RAILWAY_ENVIRONMENT_ID !== EXPECTED_RAILWAY_ENVIRONMENT_ID)
+    throw Error("PRODUCTION_ENVIRONMENT_MISMATCH");
+  if (env.RAILWAY_SERVICE_ID !== EXPECTED_RAILWAY_SERVICE_ID)
+    throw Error("PRODUCTION_SERVICE_MISMATCH");
+  if (!env.FY6_CANONICAL_DATABASE_SERVICE_ID)
+    throw Error("PRODUCTION_DB_SERVICE_ID_REQUIRED");
+  if (env.FY6_CANONICAL_DATABASE_SERVICE_ID !== EXPECTED_DATABASE_SERVICE_ID)
+    throw Error("PRODUCTION_DB_SERVICE_ID_MISMATCH");
+  if (env.DB_HOST !== EXPECTED_DB_HOST)
+    throw Error("PRODUCTION_DB_ENDPOINT_MISMATCH");
+  if (env.DB_NAME !== EXPECTED_DB || a.db !== EXPECTED_DB)
+    throw Error("PRODUCTION_DB_NAME_MISMATCH");
+  if (!/^\d+$/.test(String(env.DB_PORT || "")) || Number(env.DB_PORT) !== EXPECTED_PRODUCTION_PORT)
+    throw Error("PRODUCTION_DB_PORT_MISMATCH");
+  if (!env.FY6_PRODUCTION_EXECUTION_TOKEN || !a.productionExecutionToken ||
+      !timingSafeTextEqual(env.FY6_PRODUCTION_EXECUTION_TOKEN, a.productionExecutionToken))
+    throw Error("EXECUTION_AUTHORIZATION_FAILED");
+  if (!a.expectedLiveHostname || /\s/.test(a.expectedLiveHostname) || !a.expectedLiveVersion)
+    throw Error("PRODUCTION_LIVE_IDENTITY_REQUIRED");
+  const major = /^([0-9]+)\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z._-]+)?$/.exec(a.expectedLiveVersion);
+  if (!major || Number(major[1]) !== EXPECTED_MYSQL_MAJOR)
+    throw Error("PRODUCTION_MYSQL_MAJOR_UNSUPPORTED");
+  return Object.freeze({
+    host: a.expectedLiveHostname,
+    port: EXPECTED_PRODUCTION_PORT,
+    version: a.expectedLiveVersion,
+    db: EXPECTED_DB,
+  });
 }
 function validateRuntimeCommit(a,env=process.env){const actual=env.FY6_DEPLOYED_RUNTIME_COMMIT;if(!actual||!a.expectedRuntimeCommit)throw Error("RUNTIME_COMMIT_REQUIRED");if(!/^[0-9a-f]{40}$/i.test(actual)||!/^[0-9a-f]{40}$/i.test(a.expectedRuntimeCommit))throw Error("RUNTIME_COMMIT_INVALID");const x=Buffer.from(actual.toLowerCase()),y=Buffer.from(a.expectedRuntimeCommit.toLowerCase());if(x.length!==y.length||!crypto.timingSafeEqual(x,y))throw Error("RUNTIME_COMMIT_MISMATCH");return actual.toLowerCase()}
 function validateBackup(a){if(!a.backup||!a.backupSha)throw Error("BACKUP_REQUIRED");let st;try{st=fs.statSync(a.backup)}catch{throw Error("BACKUP_NOT_FOUND")}if(!st.isFile())throw Error("BACKUP_INVALID");if(st.size<=0)throw Error("BACKUP_EMPTY");if(st.mtimeMs>Date.now()+60000||Date.now()-st.mtimeMs>86400000)throw Error("BACKUP_STALE");const actual=sha(fs.readFileSync(a.backup));if(!/^[0-9a-f]{64}$/i.test(a.backupSha)||actual!==a.backupSha.toLowerCase())throw Error("BACKUP_SHA_MISMATCH");return {path:path.resolve(a.backup),size:st.size,mtime:st.mtime.toISOString(),sha256:actual}}
@@ -448,10 +496,11 @@ function validateIdentity(mode, actual, a) {
     if (
       a.db !== EXPECTED_DB ||
       actual.db !== EXPECTED_DB ||
-      actual.host !== EXPECTED_HOST ||
-      String(actual.version) !== EXPECTED_MYSQL
+      actual.host !== a.expectedLiveHostname ||
+      Number(actual.port) !== EXPECTED_PRODUCTION_PORT ||
+      String(actual.version) !== a.expectedLiveVersion
     )
-      throw Error("IDENTITY_MISMATCH");
+      throw Error("PRODUCTION_LIVE_IDENTITY_MISMATCH");
     return;
   }
   if (mode !== "disposable") throw Error("IDENTITY_MODE_REQUIRED");
@@ -474,6 +523,8 @@ function validateIdentity(mode, actual, a) {
     throw Error("DISPOSABLE_IDENTITY_MISMATCH");
 }
 async function executeRepair(adapter, manifest, options = {}) {
+  if (options.productionIdentity && typeof adapter.getProductionIdentityEvidence !== "function")
+    throw Error("PRODUCTION_LIVE_IDENTITY_REQUIRED");
   const typed = options.requireTypedEvidence === true;
   if (
     typed &&
@@ -549,6 +600,13 @@ async function executeRepair(adapter, manifest, options = {}) {
     if (schemaStrict && (typeof schemaBaseline !== "string" || !schemaBaseline))
       throw Error("SCHEMA_FINGERPRINT_INVALID");
     try {
+      if (options.productionIdentity) {
+        const afterBegin = await adapter.getProductionIdentityEvidence();
+        if (!sameProductionIdentity(afterBegin, options.productionIdentity))
+          throw Object.assign(new Error("PRODUCTION_DB_IDENTITY_DRIFT"), {
+            code: "PRODUCTION_DB_IDENTITY_DRIFT",
+          });
+      }
       const billBaselines = {},
         paymentBaselines = {},
         ledgerBaseline =
@@ -792,9 +850,20 @@ async function executeRepair(adapter, manifest, options = {}) {
           throw Error("SCHEMA_FINGERPRINT_INVALID");
         if (schemaCurrent !== schemaBaseline) throw Error("SCHEMA_DRIFT");
       }
+      if (options.productionIdentity) {
+        const beforeCommit = await adapter.getProductionIdentityEvidence();
+        if (!sameProductionIdentity(beforeCommit, options.productionIdentity))
+          throw Object.assign(new Error("PRODUCTION_DB_IDENTITY_DRIFT"), {
+            code: "PRODUCTION_DB_IDENTITY_DRIFT",
+          });
+      }
       await adapter.commit();
     } catch (e) {
-      await adapter.rollback();
+      try {
+        await adapter.rollback();
+      } catch (rollbackError) {
+        e.rollbackError = rollbackError;
+      }
       throw e;
     }
   }
@@ -802,6 +871,11 @@ async function executeRepair(adapter, manifest, options = {}) {
   if (p.billMismatches !== 0 || p.paymentMismatches !== 0)
     throw Error("GLOBAL_POSTCONDITION");
   return adapter.counters || {};
+}
+function sameProductionIdentity(actual, expected) {
+  return !!actual && typeof actual === "object" && !Array.isArray(actual) &&
+    actual.host === expected.host && Number(actual.port) === expected.port &&
+    String(actual.version) === expected.version && actual.db === expected.db;
 }
 async function run({
   db,
@@ -825,22 +899,36 @@ async function run({
     return { mode: "preview", manifestHash: hash };
   }
   if (!a.mode) throw Error("IDENTITY_MODE_REQUIRED");
-  const [identity] = await db.query(
-    "SELECT @@hostname host,@@port port,@@version version,DATABASE() db",
-  );
-  validateIdentity(a.mode, identity[0], a);
-  if (a.auth !== AUTH || a.manifestSha !== hash)
+  const env = runtimeEnv || process.env;
+  const productionIdentity = validateProductionContext(a, env);
+  let disposableIdentity = null;
+  if (a.mode === "disposable") {
+    disposableIdentity = (await db.query(
+      "SELECT @@hostname host,@@port port,@@version version,DATABASE() db",
+    ))[0][0];
+    validateIdentity(a.mode, disposableIdentity, a);
+  }
+  if (a.mode === "disposable" && a.auth !== AUTH)
     throw Error("EXECUTION_AUTHORIZATION_FAILED");
-  if (typeof db.getAccountingFingerprint !== "function")
-    throw Error("ACCOUNTING_FINGERPRINT_REQUIRED");
-  if (typeof db.getSchemaFingerprint !== "function") throw Error("SCHEMA_FINGERPRINT_REQUIRED");
-  const runtimeCommit = validateRuntimeCommit(a, runtimeEnv || process.env);
+  if (a.manifestSha !== hash)
+    throw Error("EXECUTION_AUTHORIZATION_FAILED");
+  const runtimeCommit = validateRuntimeCommit(a, env);
   const backupEvidence = validateBackup(a);
   const adapter = adapterFactory ? adapterFactory(db) : new Fy6MysqlReadAdapter(db);
   let executionError, released = false;
   try {
+    if (typeof adapter.getProductionIdentityEvidence !== "function" && a.mode === "production")
+      throw Error("PRODUCTION_LIVE_IDENTITY_REQUIRED");
+    const identity = a.mode === "production"
+      ? await adapter.getProductionIdentityEvidence()
+      : disposableIdentity;
+    validateIdentity(a.mode, identity, a);
     if (typeof adapter.getPopulationEvidence !== "function") throw Object.assign(new Error("POPULATION_EVIDENCE_REQUIRED"),{code:"POPULATION_EVIDENCE_REQUIRED"});
     const popA=validatePopulationEvidence(await adapter.getPopulationEvidence(manifest),manifest); const popB=validatePopulationEvidence(await adapter.getPopulationEvidence(manifest),manifest); if (popA.fingerprint!==popB.fingerprint) throw Object.assign(new Error("POPULATION_DRIFT"),{code:"POPULATION_DRIFT"}); const cls=classifyPopulation(popA,manifest); if(cls==="ALREADY_REPAIRED") throw Error("ALREADY_REPAIRED"); if(cls==="PARTIAL_PRIOR_RUN") throw Error("PARTIAL_PRIOR_RUN"); if(cls!=="PRISTINE") throw Error("POPULATION_MISMATCH");
+    if (typeof adapter.getAccountingFingerprint !== "function")
+      throw Error("ACCOUNTING_FINGERPRINT_REQUIRED");
+    if (typeof adapter.getSchemaFingerprint !== "function")
+      throw Error("SCHEMA_FINGERPRINT_REQUIRED");
     const result = await executeRepair(adapter, manifest, {
       requireTypedEvidence: true,
       requireBillPostState: true,
@@ -849,6 +937,7 @@ async function run({
       requireAccountingFingerprint: true,
       requireStockFingerprint: true,
       requireSchemaFingerprint: true,
+      productionIdentity,
     });
     try { released = true; await adapter.release(); } catch (releaseError) { throw releaseError; }
     return { ...result, runtimeCommit, backup: backupEvidence };
@@ -875,6 +964,9 @@ module.exports = {
   assertManifest,
   parseArgs,
   validateIdentity,
+  validateProductionContext,
+  validateRuntimeCommit,
+  sameProductionIdentity,
   validatePopulationEvidence,
   classifyPopulation,
   validateSourceBaseline,
