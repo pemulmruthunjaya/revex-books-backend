@@ -44,3 +44,18 @@ StatefulFakeAdapter.prototype.getSourceVendorEvidence=async function(id,company)
   if(cfg&&cfg.groupId===this.activeTransaction?.groupId&&cfg.sourceVendorId===id&&cfg.phase===phase){if(cfg.mode==='throw')throw Object.assign(Error('SOURCE_VENDOR_DRIFT'),{code:'SOURCE_VENDOR_DRIFT'});if(cfg.mode==='disappear')return undefined;const e=await _timedSourceEvidence.call(this,id,company);if(cfg.mode==='wrong_vendor')e.vendorId=999;if(cfg.mode==='wrong_company')e.companyId=999;if(cfg.mode==='malformed')return {};if(cfg.mode==='fingerprint_drift')e.fingerprint='f'.repeat(64);if(cfg.mode==='protected_field_drift')e.protectedFields.name='drift';if(cfg.mode==='fingerprint_mismatch')e.protectedFields.name='drift';return e;}
   return _timedSourceEvidence.call(this,id,company);
 };
+
+class ProductionStatefulFakeAdapter extends StatefulFakeAdapter {
+  constructor(...args) {
+    super(...args);
+    this.state.accounts=[{id:1,company_id:4,account_code:"A1",account_name:"Expense",account_type:"EXPENSE",opening_balance:"0.00",status:1}];
+    this.state.goodsReceipts=[{id:1,company_id:4,purchase_order_id:1,vendor_id:1,grn_number:"G1",grn_date:"2026-03-03",status:"Posted",stock_posted:1}];
+    this.state.goodsReceiptItems=[{id:1,company_id:4,goods_receipt_id:1,purchase_order_item_id:1,product_id:1,received_qty:"1.00",rejected_qty:"0.00",accepted_qty:"1.00"}];
+    const scope={bills:new Set(),payments:new Set()};
+    for(const group of this.m.groups)for(const record of group.records)(record.record_type==="BILL"?scope.bills:scope.payments).add(record.record_id);
+    const normalize=(rows,ids)=>Object.values(rows||{}).map(row=>{const copy=deepClone(row);delete copy.vendor_company_id;if(ids.has(row.id))copy.vendor_id=null;return copy;}).sort((a,b)=>a.id-b.id);
+    this.getAccountingFingerprint=()=>digest({contractVersion:1,tables:{accounts:deepClone(this.state.accounts),bill_items:Object.values(this.state.billItems).flat().map(deepClone).sort((a,b)=>a.id-b.id),bills:normalize(this.state.bills,scope.bills),journal_entries:deepClone(this.state.journalEntries),journal_entry_details:deepClone(this.state.journalEntryDetails),ledger_entries:deepClone(this.state.ledgerEntries),vendor_payments:normalize(this.state.vendorPayments,scope.payments)}});
+    this.getStockFingerprint=()=>digest({contractVersion:1,tables:{bill_items:Object.values(this.state.billItems).flat().map(deepClone).sort((a,b)=>a.id-b.id),bills:normalize(this.state.bills,scope.bills),goods_receipt_items:deepClone(this.state.goodsReceiptItems),goods_receipts:deepClone(this.state.goodsReceipts),inventory_transactions:deepClone(this.state.inventoryTransactions),products:deepClone(this.state.products)}});
+  }
+}
+module.exports.StatefulFakeAdapter=ProductionStatefulFakeAdapter;

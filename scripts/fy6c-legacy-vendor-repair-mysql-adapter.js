@@ -10,6 +10,128 @@ function canonical(v) {
 }
 const fingerprint = (v) =>
   crypto.createHash("sha256").update(canonical(v)).digest("hex");
+const bundledManifest = require("./fy6c-legacy-vendor-repair-manifest.json");
+const CONTRACT_VERSION = 1;
+const column = (name, type = "value") => Object.freeze({ name, type });
+const TABLE_CONTRACTS = Object.freeze({
+  accounting: Object.freeze({
+    journal_entries: Object.freeze([
+      column("id"), column("journal_no"), column("journal_date", "date"),
+      column("narration"), column("total_debit", "decimal"),
+      column("total_credit", "decimal"), column("created_by"),
+      column("status", "boolean"), column("created_at", "timestamp"),
+      column("updated_at", "timestamp"), column("company_id"),
+      column("vendor_id"), column("source_type"), column("source_id"),
+      column("financial_year_id"),
+    ]),
+    journal_entry_details: Object.freeze([
+      column("id"), column("journal_entry_id"), column("account_id"),
+      column("debit", "decimal"), column("credit", "decimal"),
+      column("description"), column("created_at", "timestamp"),
+    ]),
+    ledger_entries: Object.freeze([
+      column("id"), column("company_id"), column("entity_type"),
+      column("entity_id"), column("reference_type"), column("reference_id"),
+      column("debit", "decimal"), column("credit", "decimal"),
+      column("transaction_date", "date"), column("created_at", "timestamp"),
+      column("financial_year_id"),
+    ]),
+    accounts: Object.freeze([
+      column("id"), column("account_code"), column("account_name"),
+      column("account_type"), column("parent_account_id"),
+      column("opening_balance", "decimal"), column("balance_type"),
+      column("description"), column("status", "boolean"),
+      column("created_at", "timestamp"), column("updated_at", "timestamp"),
+      column("company_id"),
+    ]),
+    bills: Object.freeze([
+      column("id"), column("bill_number"), column("bill_date", "date"),
+      column("due_date", "date"), column("total_amount", "decimal"),
+      column("paid_amount", "decimal"), column("due_amount", "decimal"),
+      column("status"), column("company_id"), column("created_at", "timestamp"),
+      column("vendor_id", "controlledVendor"), column("source_purchase_order_id"),
+      column("source_grn_id"), column("stock_posted", "boolean"),
+      column("financial_year_id"),
+    ]),
+    bill_items: Object.freeze([
+      column("id"), column("bill_id"), column("source_grn_item_id"),
+      column("product_id"), column("product_name"), column("quantity"),
+      column("price", "decimal"), column("total", "decimal"),
+      column("gst_percent", "decimal"), column("cgst", "decimal"),
+      column("sgst", "decimal"), column("mrp", "decimal"),
+    ]),
+    vendor_payments: Object.freeze([
+      column("id"), column("vendor_id", "controlledVendor"), column("bill_id"),
+      column("amount", "decimal"), column("payment_date", "date"),
+      column("payment_method"), column("paid_from_account_id"),
+      column("reference_number"), column("notes"), column("company_id"),
+      column("created_by"), column("journal_entry_id"), column("idempotency_key"),
+      column("status"), column("created_at", "timestamp"),
+      column("financial_year_id"),
+    ]),
+  }),
+  stock: {
+    products: Object.freeze([
+      column("id"), column("name"), column("sellingPrice", "decimal"),
+      column("stock"), column("created_at", "timestamp"), column("company_id"),
+      column("mrp", "decimal"), column("sku"), column("barcode"), column("hsn"),
+      column("category"), column("unit"), column("gst", "decimal"),
+      column("purchase_price", "decimal"), column("opening_stock", "decimal"),
+      column("reorder_level", "decimal"), column("status"), column("batch_no"),
+      column("manufactured_date", "date"), column("expiry_date", "date"),
+    ]),
+    inventory_transactions: Object.freeze([
+      column("id"), column("company_id"), column("branch_id"), column("product_id"),
+      column("transaction_type"), column("reference_type"), column("reference_id"),
+      column("quantity_in", "decimal"), column("quantity_out", "decimal"),
+      column("transaction_date", "date"), column("created_by"),
+      column("created_at", "timestamp"),
+    ]),
+    bill_items: null,
+    bills: null,
+    goods_receipts: Object.freeze([
+      column("id"), column("company_id"), column("branch_id"), column("grn_number"),
+      column("purchase_order_id"), column("vendor_id"), column("grn_date", "date"),
+      column("challan_number"), column("challan_date", "date"), column("status"),
+      column("stock_posted", "boolean"), column("notes"), column("created_by"),
+      column("posted_by"), column("posted_at", "timestamp"),
+      column("created_at", "timestamp"), column("updated_at", "timestamp"),
+    ]),
+    goods_receipt_items: Object.freeze([
+      column("id"), column("company_id"), column("goods_receipt_id"),
+      column("purchase_order_item_id"), column("product_id"),
+      column("received_qty", "decimal"), column("rejected_qty", "decimal"),
+      column("accepted_qty", "decimal"), column("notes"),
+      column("created_at", "timestamp"),
+    ]),
+  },
+});
+TABLE_CONTRACTS.stock.bill_items = TABLE_CONTRACTS.accounting.bill_items;
+TABLE_CONTRACTS.stock.bills = TABLE_CONTRACTS.accounting.bills;
+Object.freeze(TABLE_CONTRACTS.stock);
+const scopeFromManifest = (manifest) => {
+  if (!manifest || !Array.isArray(manifest.groups))
+    throw Error("FY6_FINGERPRINT_SCOPE_INVALID");
+  const bills = [], payments = [];
+  for (const group of manifest.groups) {
+    if (!group || !Array.isArray(group.records))
+      throw Error("FY6_FINGERPRINT_SCOPE_INVALID");
+    for (const record of group.records) {
+      if (!record || !Number.isInteger(record.record_id) || record.record_id <= 0)
+        throw Error("FY6_FINGERPRINT_SCOPE_INVALID");
+      if (record.record_type === "BILL") bills.push(record.record_id);
+      else if (record.record_type === "VENDOR_PAYMENT") payments.push(record.record_id);
+      else throw Error("FY6_FINGERPRINT_SCOPE_INVALID");
+    }
+  }
+  const unique = (values) => [...new Set(values)].sort((a, b) => a - b);
+  return { billIds: unique(bills), paymentIds: unique(payments) };
+};
+const APPROVED_SCOPE = Object.freeze(scopeFromManifest(bundledManifest));
+Object.freeze(APPROVED_SCOPE.billIds);
+Object.freeze(APPROVED_SCOPE.paymentIds);
+const sameIds = (a, b) =>
+  a.length === b.length && a.every((value, index) => value === b[index]);
 class Fy6MysqlReadAdapter {
   constructor(pool) {
     if (!pool || typeof pool.getConnection !== "function")
@@ -19,6 +141,7 @@ class Fy6MysqlReadAdapter {
     this.released = false;
     this.transaction = null;
     this.ledger = [];
+    this.fingerprintScope = null;
     this.ready = this.#acquire();
   }
   async #acquire() {
@@ -120,6 +243,12 @@ class Fy6MysqlReadAdapter {
     return this.#getMismatchCounts(manifest);
   }
   async getPopulationEvidence(manifest) {
+    const proposedScope = scopeFromManifest(manifest);
+    if (
+      !sameIds(proposedScope.billIds, APPROVED_SCOPE.billIds) ||
+      !sameIds(proposedScope.paymentIds, APPROVED_SCOPE.paymentIds)
+    )
+      throw Error("FY6_FINGERPRINT_SCOPE_INVALID");
     const bills = [];
     for (const id of manifest.groups
       .flatMap((g) => g.records)
@@ -192,6 +321,10 @@ class Fy6MysqlReadAdapter {
       fingerprint: null,
     };
     evidence.fingerprint = fingerprint(evidence);
+    this.fingerprintScope = Object.freeze({
+      billIds: Object.freeze([...proposedScope.billIds]),
+      paymentIds: Object.freeze([...proposedScope.paymentIds]),
+    });
     return evidence;
   }
   async getGlobalPostState(manifest) {
@@ -239,19 +372,58 @@ class Fy6MysqlReadAdapter {
       protectedFields: x,
     };
   }
+  #requireFingerprintScope() {
+    if (!this.fingerprintScope) throw Error("FY6_FINGERPRINT_SCOPE_REQUIRED");
+    return this.fingerprintScope;
+  }
+  #projection(columns, controlledIds) {
+    const args = [];
+    const sql = columns.map(({ name, type }) => {
+      const q = `\`${name}\``;
+      if (type === "decimal") return `CAST(${q} AS CHAR) AS ${q}`;
+      if (type === "date") return `DATE_FORMAT(${q},'%Y-%m-%d') AS ${q}`;
+      if (type === "timestamp")
+        return `DATE_FORMAT(${q},'%Y-%m-%dT%H:%i:%s.%f') AS ${q}`;
+      if (type === "boolean") return `CAST(${q} AS SIGNED) AS ${q}`;
+      if (type === "controlledVendor") {
+        const placeholders = controlledIds.map(() => "?").join(",");
+        args.push(...controlledIds);
+        return `CASE WHEN \`id\` IN (${placeholders}) THEN NULL ELSE ${q} END AS ${q}`;
+      }
+      return q;
+    });
+    return { sql: sql.join(","), args };
+  }
+  async #contractFingerprint(kind) {
+    const scope = this.#requireFingerprintScope();
+    const tables = {};
+    try {
+      for (const [table, columns] of Object.entries(TABLE_CONTRACTS[kind])) {
+        const controlledIds =
+          table === "bills"
+            ? scope.billIds
+            : table === "vendor_payments"
+              ? scope.paymentIds
+              : [];
+        const projection = this.#projection(columns, controlledIds);
+        const [rows] = await this.#query(
+          `SELECT ${projection.sql} FROM \`${table}\` ORDER BY \`id\` ASC`,
+          projection.args,
+        );
+        tables[table] = rows;
+      }
+    } catch (cause) {
+      throw Object.assign(new Error("FY6_FINGERPRINT_SCHEMA_CONTRACT", { cause }), {
+        code: "FY6_FINGERPRINT_SCHEMA_CONTRACT",
+      });
+    }
+    return fingerprint({ contractVersion: CONTRACT_VERSION, tables });
+  }
   async getAccountingFingerprint() {
-    const [r] = await this.#query(
-      "SELECT id,company_id,debit,credit FROM accounting_entries ORDER BY id",
-      [],
-    );
-    return fingerprint(r);
+    return this.#contractFingerprint("accounting");
   }
   async getStockFingerprint() {
-    const [r] = await this.#query(
-      "SELECT id,company_id,product_id,quantity FROM stock_movements ORDER BY id",
-      [],
-    );
-    return fingerprint(r);
+    return this.#contractFingerprint("stock");
   }
   async getSchemaFingerprint() {
     const [r] = await this.#query(
