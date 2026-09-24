@@ -3,6 +3,9 @@ const test = require("node:test"),
   assert = require("node:assert/strict");
 const {
   Fy6MysqlReadAdapter,
+  VENDOR_COPY_COLUMNS,
+  vendorCopyFields,
+  fingerprint,
 } = require("../scripts/fy6c-legacy-vendor-repair-mysql-adapter");
 function pool(fail, insertId = 9) {
   const calls = [];
@@ -40,6 +43,36 @@ test("typed mutations and ledger commit on leased connection", async () => {
   );
   await a.release();
   assert.equal(f.c.released, 1);
+});
+test("vendor insert copies the exact protected allowlist and excludes local metadata", async () => {
+  const f = pool(), a = new Fy6MysqlReadAdapter(f.p);
+  const source = Object.fromEntries(VENDOR_COPY_COLUMNS.map((name) => [name, `${name}-value`]));
+  Object.assign(source, { id: 1, company_id: 1, created_at: "source-time" });
+  await a.beginTransaction("G1");
+  const result = await a.insertVendorCopy(source, 6);
+  const [sql, args] = f.calls.find(([statement]) => statement.startsWith("INSERT"));
+  assert.match(sql, /^INSERT INTO vendors \(company_id,/);
+  for (const name of VENDOR_COPY_COLUMNS) {
+    assert.match(sql, new RegExp(`\\b${name}\\b`));
+  }
+  assert.doesNotMatch(sql, /created_at/);
+  assert.deepEqual(args, [6, 1, 1]);
+  assert.equal(result.copiedFingerprint, fingerprint(vendorCopyFields(source)));
+  await a.rollback();
+  await a.release();
+});
+test("completion update is exact parameterized vendor-only DML", async () => {
+  const f = pool(), a = new Fy6MysqlReadAdapter(f.p);
+  await a.beginCompletionTransaction();
+  const result = await a.completeVendorCopy(1, 1, 11, 6);
+  const [sql, args] = f.calls.find(([statement]) => statement.startsWith("UPDATE vendors t"));
+  assert.deepEqual(args, [1, 1, 11, 6]);
+  assert.match(sql, /^UPDATE vendors t JOIN vendors s/);
+  assert.doesNotMatch(sql, /created_at|DELETE|INSERT|ALTER|CREATE|DROP|TRUNCATE/i);
+  for (const name of VENDOR_COPY_COLUMNS) assert.match(sql, new RegExp(`t\\.${name}=s\\.${name}`));
+  assert.deepEqual(result, { sequence: 1, groupId: "COMPLETION", operationType: "VENDOR_COPY_COMPLETION", table: "vendors", recordId: 11, companyId: 6, sourceVendorId: 1, affectedRows: 1, state: "ATTEMPTED" });
+  await a.rollback();
+  await a.release();
 });
 test("active G1 ledger entries are visible and commit exactly once", async () => {
   const f = pool(),

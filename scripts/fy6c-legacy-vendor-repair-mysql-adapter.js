@@ -12,6 +12,41 @@ const fingerprint = (v) =>
   crypto.createHash("sha256").update(canonical(v)).digest("hex");
 const bundledManifest = require("./fy6c-legacy-vendor-repair-manifest.json");
 const CONTRACT_VERSION = 1;
+const VENDOR_COPY_COLUMNS = Object.freeze([
+  "name",
+  "phone",
+  "email",
+  "gst_number",
+  "address",
+  "status",
+  "pan_number",
+  "opening_balance",
+  "opening_balance_type",
+  "party_category",
+  "billing_address",
+  "shipping_address",
+  "credit_period_days",
+  "credit_limit",
+  "contact_person_name",
+  "contact_person_dob",
+]);
+const normalizeVendorCopyValue = (name, value) => {
+  if (value === null || value === undefined) return value;
+  if (name === "contact_person_dob")
+    return value instanceof Date
+      ? value.toISOString().slice(0, 10)
+      : String(value).slice(0, 10);
+  if (name === "opening_balance" || name === "credit_limit")
+    return String(value);
+  return value;
+};
+const vendorCopyFields = (row) =>
+  Object.fromEntries(
+    VENDOR_COPY_COLUMNS.map((name) => [
+      name,
+      normalizeVendorCopyValue(name, row[name]),
+    ]),
+  );
 const column = (name, type = "value") => Object.freeze({ name, type });
 const TABLE_CONTRACTS = Object.freeze({
   accounting: Object.freeze({
@@ -161,6 +196,11 @@ class Fy6MysqlReadAdapter {
     await this.#query("START TRANSACTION", []);
     this.transaction = { groupId, ops: [] };
   }
+  async beginCompletionTransaction() {
+    if (this.transaction) throw Error("FY6_TX_ACTIVE");
+    await this.#query("START TRANSACTION", []);
+    this.transaction = { groupId: "COMPLETION", ops: [] };
+  }
   async getProductionIdentityEvidence() {
     const [rows] = await this.#query(
       "SELECT @@hostname AS host,@@port AS port,@@version AS version,DATABASE() AS db",
@@ -308,17 +348,13 @@ class Fy6MysqlReadAdapter {
       const source = await this.getVendorById(g.source_vendor_id);
       if (!source) continue;
       const [rows] = await this.#query(
-        "SELECT * FROM vendors WHERE company_id=? AND name=? ORDER BY id",
+        `SELECT id,company_id,${VENDOR_COPY_COLUMNS.join(",")} FROM vendors WHERE company_id=? AND name=? ORDER BY id`,
         [g.target_company_id, source.name],
       );
       for (const v of rows) {
-        const sp = { ...source };
-        delete sp.id;
-        delete sp.company_id;
+        const sp = vendorCopyFields(source);
         const sourceCopiedFingerprint = fingerprint(sp);
-        const ep = { ...v };
-        delete ep.id;
-        delete ep.company_id;
+        const ep = vendorCopyFields(v);
         const candidateCopiedFingerprint = fingerprint(ep);
         if (candidateCopiedFingerprint !== sourceCopiedFingerprint) continue;
         equivalentTargetVendors.push({
@@ -358,9 +394,7 @@ class Fy6MysqlReadAdapter {
   async getSourceVendorEvidence(id, c) {
     const v = await this.getVendorById(id);
     if (!v || v.company_id !== c) return null;
-    const p = { ...v };
-    delete p.id;
-    delete p.company_id;
+    const p = vendorCopyFields(v);
     return {
       vendorId: id,
       companyId: c,
@@ -488,7 +522,7 @@ class Fy6MysqlReadAdapter {
   async insertVendorCopy(source, target) {
     const t = this._requireTx(),
       [r] = await this.#query(
-        "INSERT INTO vendors (company_id,name) SELECT ?,name FROM vendors WHERE id=? AND company_id=?",
+        `INSERT INTO vendors (company_id,${VENDOR_COPY_COLUMNS.join(",")}) SELECT ?,${VENDOR_COPY_COLUMNS.join(",")} FROM vendors WHERE id=? AND company_id=?`,
         [target, source.id, source.company_id],
       );
     if (
@@ -506,7 +540,56 @@ class Fy6MysqlReadAdapter {
       companyId: target,
       sourceVendorId: source.id,
     });
-    return { ...e, copiedFingerprint: fingerprint(source) };
+    return { ...e, copiedFingerprint: fingerprint(vendorCopyFields(source)) };
+  }
+  async getVendorCopyEvidence(id, companyId, { lock = false } = {}) {
+    const [rows] = await this.#query(
+      `SELECT id,company_id,${VENDOR_COPY_COLUMNS.join(",")} FROM vendors WHERE id=? AND company_id=? LIMIT 1${lock ? " FOR UPDATE" : ""}`,
+      [id, companyId],
+    );
+    const row = rows[0] || null;
+    if (!row) return null;
+    const fields = vendorCopyFields(row);
+    return {
+      vendorId: row.id,
+      companyId: row.company_id,
+      protectedFields: fields,
+      fingerprint: fingerprint(fields),
+    };
+  }
+  async lockControlledRepairRows(manifest) {
+    const scope = scopeFromManifest(manifest);
+    const billPlaceholders = scope.billIds.map(() => "?").join(",");
+    const paymentPlaceholders = scope.paymentIds.map(() => "?").join(",");
+    const [bills] = await this.#query(
+      `SELECT id,company_id,vendor_id FROM bills WHERE id IN (${billPlaceholders}) ORDER BY id FOR UPDATE`,
+      scope.billIds,
+    );
+    const [payments] = await this.#query(
+      `SELECT id,company_id,vendor_id,bill_id FROM vendor_payments WHERE id IN (${paymentPlaceholders}) ORDER BY id FOR UPDATE`,
+      scope.paymentIds,
+    );
+    return { bills, payments };
+  }
+  async completeVendorCopy(sourceId, sourceCompanyId, targetId, targetCompanyId) {
+    this._requireTx();
+    const assignments = VENDOR_COPY_COLUMNS.map(
+      (name) => `t.${name}=s.${name}`,
+    ).join(",");
+    const [result] = await this.#query(
+      `UPDATE vendors t JOIN vendors s ON s.id=? AND s.company_id=? SET ${assignments} WHERE t.id=? AND t.company_id=?`,
+      [sourceId, sourceCompanyId, targetId, targetCompanyId],
+    );
+    if (!result || result.affectedRows !== 1) throw Error("VENDOR_COMPLETION_ROW_COUNT");
+    return this._op({
+      groupId: "COMPLETION",
+      operationType: "VENDOR_COPY_COMPLETION",
+      table: "vendors",
+      recordId: targetId,
+      companyId: targetCompanyId,
+      sourceVendorId: sourceId,
+      affectedRows: 1,
+    });
   }
   async updateBillVendor(id, company, oldV, newV) {
     const t = this._requireTx(),
@@ -560,4 +643,10 @@ class Fy6MysqlReadAdapter {
     return true;
   }
 }
-module.exports = { Fy6MysqlReadAdapter, canonical, fingerprint };
+module.exports = {
+  Fy6MysqlReadAdapter,
+  VENDOR_COPY_COLUMNS,
+  vendorCopyFields,
+  canonical,
+  fingerprint,
+};

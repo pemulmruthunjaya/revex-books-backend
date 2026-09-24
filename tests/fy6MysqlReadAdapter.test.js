@@ -134,8 +134,8 @@ test("FY6 population evidence pristine control is deterministic", async () => {
   assert.match(x.fingerprint, /^[0-9a-f]{64}$/);
   await a.release();
 });
-test("equivalent candidates require full copied-field fingerprint", async () => {
-  const calls=[]; const src={id:1,company_id:7,name:"V",status:"ACTIVE"}; const exact={id:10,company_id:6,name:"V",status:"ACTIVE"}; const wrong={id:11,company_id:6,name:"V",status:"INACTIVE"}; const dup={id:12,company_id:6,name:"V",status:"ACTIVE"};
+test("equivalent candidates require the exact copy allowlist and ignore created_at", async () => {
+  const calls=[]; const src={id:1,company_id:7,name:"V",status:"ACTIVE",created_at:"source"}; const exact={id:10,company_id:6,name:"V",status:"ACTIVE",created_at:"target-a"}; const wrong={id:11,company_id:6,name:"V",status:"INACTIVE",created_at:"source"}; const dup={id:12,company_id:6,name:"V",status:"ACTIVE",created_at:"target-b"};
   const c={query:async(s,a)=>{calls.push([s,a]);if(s.includes("COUNT(*) AS mismatchCount"))return [[{mismatchCount:s.includes("FROM bills b")?6:2}]];if(s.includes("FROM bills WHERE"))return [[]];if(s.includes("FROM vendor_payments WHERE"))return [[]];if(s.includes("FROM vendors WHERE id"))return [[{...src,id:a[0],company_id:1}]];if(s.includes("WHERE company_id=?"))return [a[0]===6?[exact,wrong,dup]:[]];return [[]]},release(){}}; const a=new Fy6MysqlReadAdapter({getConnection:async()=>c}); const m=require("../scripts/fy6c-legacy-vendor-repair-manifest.json"); const e=await a.getPopulationEvidence(m); assert.deepEqual(e.equivalentTargetVendors.filter(x=>x.groupId==="G1").map(x=>x.equivalentVendorId),[10,12]); assert.ok(calls.every(([s])=>s.startsWith("SELECT"))); await a.release();
 });
 test("dynamic mismatch counts are consistent for pristine repaired and missing-vendor state", async () => {
