@@ -46,10 +46,7 @@ const allowed = [
   ["DRAFT", "OPEN", null, null, "OPEN"],
   ["OPEN", "RECONCILIATION", null, null, "BEGIN_RECONCILIATION"],
   ["RECONCILIATION", "OPEN", "correction", null, "REOPEN"],
-  ["RECONCILIATION", "CLOSING", null, null, "BEGIN_CLOSE"],
   ["CLOSING", "RECONCILIATION", "more work", null, "REOPEN"],
-  ["CLOSING", "CLOSED", null, null, "CLOSE"],
-  ["CLOSED", "LOCKED", "final lock", "LOCK", "LOCK"],
 ];
 
 for (const [from, to, reason, confirmation, event] of allowed) {
@@ -69,11 +66,22 @@ for (const [from, to, reason, confirmation, event] of allowed) {
 test("all unspecified transitions are denied", async () => {
   for (const from of TRANSITION_MATRIX ? ["DRAFT","OPEN","RECONCILIATION","CLOSING","CLOSED","LOCKED"] : []) {
     for (const to of ["DRAFT","OPEN","RECONCILIATION","CLOSING","CLOSED","LOCKED"]) {
-      if (from === to || TRANSITION_MATRIX[from].has(to)) continue;
+      if (from === to || TRANSITION_MATRIX[from].has(to) || ["CLOSING", "CLOSED", "LOCKED"].includes(to)) continue;
       const fixture = executorFor(from, to);
       await assert.rejects(transitionFinancialYear({ companyId: 4, financialYearId: 21, targetStatus: to, actorUserId: 13 }, fixture.executor), { code: "FINANCIAL_YEAR_TRANSITION_NOT_ALLOWED", status: 409 });
       assert.ok(fixture.calls.includes("ROLLBACK"));
     }
+  }
+});
+
+test("controlled trial blocks every transition into CLOSING, CLOSED, or LOCKED before database work", async () => {
+  for (const [from, to] of [["RECONCILIATION", "CLOSING"], ["CLOSING", "CLOSED"], ["CLOSED", "LOCKED"], ["LOCKED", "LOCKED"]]) {
+    const fixture = executorFor(from, to);
+    await assert.rejects(
+      transitionFinancialYear({ companyId: 4, financialYearId: 21, targetStatus: to, actorUserId: 13, reason: "attempt", confirmation: "LOCK" }, fixture.executor),
+      { code: "FINANCIAL_YEAR_CLOSE_NOT_AVAILABLE", status: 409 }
+    );
+    assert.deepEqual(fixture.calls, []);
   }
 });
 
@@ -112,11 +120,10 @@ test("transition requires an explicit target status", async () => {
   });
 });
 
-test("controlled transitions require reason and exact lock confirmation", async () => {
-  for (const [from, to] of [["RECONCILIATION","OPEN"],["CLOSING","RECONCILIATION"],["CLOSED","LOCKED"]]) {
+test("supported reversals require a reason", async () => {
+  for (const [from, to] of [["RECONCILIATION","OPEN"],["CLOSING","RECONCILIATION"]]) {
     await assert.rejects(transitionFinancialYear({ companyId:4,financialYearId:21,targetStatus:to,actorUserId:13,confirmation:"LOCK" }, executorFor(from,to).executor), { code:"FINANCIAL_YEAR_TRANSITION_REASON_REQUIRED" });
   }
-  await assert.rejects(transitionFinancialYear({ companyId:4,financialYearId:21,targetStatus:"LOCKED",actorUserId:13,reason:"done",confirmation:"wrong" }, executorFor("CLOSED","LOCKED").executor), { code:"FINANCIAL_YEAR_LOCK_CONFIRMATION_REQUIRED" });
 });
 
 test("event failure and transition conflict roll back", async () => {

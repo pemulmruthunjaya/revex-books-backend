@@ -8,7 +8,7 @@ const run = async () => {
     async query(sql, params = []) {
       const text = String(sql);
       calls.push({ sql: text, params });
-      if (text.includes("CREATE TABLE")) return [[], []];
+      if (/^SELECT .* LIMIT 0$/.test(text)) return [[], []];
       if (text.includes("FROM invoices i")) {
         return [[{
           sales: "1200.00",
@@ -51,6 +51,8 @@ const run = async () => {
   assert.equal(summary.receivables, summary.sales + summary.gstOutput);
   assert.equal(summary.openingBalances.reduce((sum, row) => sum + row.debit - row.credit, 0), 0);
   assert.deepEqual(invoiceQuery.params, [4], "summary must remain company scoped");
+  assert.equal(calls.some(({ sql }) => /\b(?:CREATE|ALTER|DROP|TRUNCATE)\b/i.test(sql)), false,
+    "accounting report reads must never execute DDL");
 
   const controlCalls = [];
   const establishedReceivable = {

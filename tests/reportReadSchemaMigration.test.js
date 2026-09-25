@@ -26,6 +26,10 @@ const runtimeSource = [
   .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
   .join("\n")
   .replace(/\s+/g, " ");
+const reportSchemaSource = fs.readFileSync(
+  path.join(__dirname, "..", "controllers", "reportController.js"),
+  "utf8"
+);
 
 const requireFragment = (fragment, label = fragment) => {
   assert.ok(compact.includes(fragment.replace(/\s+/g, " ").trim()), `missing ${label}`);
@@ -167,10 +171,9 @@ const productColumns = new Map([
 ]);
 
 for (const [column, definition] of productColumns) {
-  const runtimeDefinition = definition.replace(/''/g, "'");
   assert.ok(
-    runtimeSource.includes(`{ name: "${column}", definition: "${runtimeDefinition}" }`),
-    `products.${column} must match a current runtime definition`
+    reportSchemaSource.includes(`"${column}"`),
+    `products.${column} must be covered by read-only report schema validation`
   );
   requireFragment(
     `TABLE_NAME = 'products' AND COLUMN_NAME = '${column}'`,
@@ -181,6 +184,12 @@ for (const [column, definition] of productColumns) {
     `products.${column} runtime-compatible definition`
   );
 }
+
+assert.doesNotMatch(
+  reportSchemaSource,
+  /\b(?:CREATE|ALTER|DROP|TRUNCATE)\s+(?:TABLE|INDEX)\b/i,
+  "report GET handlers must not retain request-time DDL"
+);
 
 const payrollEvolution = new Map([
   ["payroll_employees.employee_code", "VARCHAR(80) NULL AFTER name"],

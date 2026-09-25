@@ -1,4 +1,20 @@
 const db = require("../db/connection");
+const { assertReportSchemaReady } = require("../services/reportSchemaService");
+
+const RETURN_SCHEMA = Object.freeze([
+  { table: "product_returns", columns: ["id", "company_id", "type", "return_date", "subtotal", "tax_amount", "total_amount"] },
+  { table: "return_items", columns: ["return_id", "company_id", "product_id", "quantity", "unit_price", "gst_rate", "total_price"] },
+]);
+const DELIVERY_SCHEMA = Object.freeze([
+  { table: "delivery_challans", columns: ["id", "company_id", "type", "challan_date", "status"] },
+  { table: "delivery_challan_items", columns: ["challan_id", "company_id", "product_id", "quantity"] },
+]);
+const PRODUCT_REPORT_SCHEMA = Object.freeze([
+  { table: "products", columns: ["id", "company_id", "mrp", "sku", "hsn", "category", "batch_no", "manufactured_date", "expiry_date", "unit", "gst", "purchase_price", "opening_stock", "reorder_level", "status"] },
+]);
+const PAYROLL_REPORT_SCHEMA = Object.freeze([
+  { table: "payroll_entries", columns: ["id", "company_id", "payroll_date", "net_amount", "status", "payment_date"] },
+]);
 
 const toNumber = (value) => Number(value || 0);
 const money = (value) => Math.round(toNumber(value) * 100) / 100;
@@ -17,140 +33,6 @@ const addDateFilter = (column, query, params) => {
   }
 
   return clauses.length ? ` AND ${clauses.join(" AND ")}` : "";
-};
-
-let returnTablesReady = false;
-
-const ensureReturnTables = async () => {
-  if (returnTablesReady) {
-    return;
-  }
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS product_returns (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      company_id INT NOT NULL,
-      type VARCHAR(20) NOT NULL,
-      return_number VARCHAR(50) NOT NULL,
-      return_date DATE NOT NULL,
-      party_type VARCHAR(20) NOT NULL,
-      party_id INT NULL,
-      party_name VARCHAR(255) NOT NULL,
-      reference_number VARCHAR(100) NULL,
-      subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
-      tax_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-      total_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-      notes TEXT NULL,
-      created_by INT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_product_returns_company_number (company_id, return_number)
-    )
-  `);
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS return_items (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      return_id INT NOT NULL,
-      company_id INT NOT NULL,
-      product_id INT NOT NULL,
-      product_name VARCHAR(255) NOT NULL,
-      batch_no VARCHAR(100) NULL,
-      quantity DECIMAL(10,2) NOT NULL DEFAULT 0,
-      unit_price DECIMAL(12,2) NOT NULL DEFAULT 0,
-      mrp DECIMAL(12,2) NOT NULL DEFAULT 0,
-      gst_rate DECIMAL(5,2) NOT NULL DEFAULT 0,
-      total_price DECIMAL(12,2) NOT NULL DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_return_items_return (return_id),
-      INDEX idx_return_items_company_product (company_id, product_id)
-    )
-  `);
-
-  returnTablesReady = true;
-};
-
-let deliveryChallanTablesReady = false;
-
-const ensureDeliveryChallanTables = async () => {
-  if (deliveryChallanTablesReady) {
-    return;
-  }
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS delivery_challans (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      company_id INT NOT NULL,
-      type VARCHAR(10) NOT NULL,
-      challan_number VARCHAR(50) NOT NULL,
-      challan_date DATE NOT NULL,
-      party_type VARCHAR(20) NOT NULL,
-      party_id INT NULL,
-      party_name VARCHAR(255) NOT NULL,
-      address TEXT NULL,
-      transport VARCHAR(255) NULL,
-      vehicle_number VARCHAR(100) NULL,
-      notes TEXT NULL,
-      status VARCHAR(30) NOT NULL DEFAULT 'Created',
-      created_by INT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_delivery_challan_company_number (company_id, challan_number)
-    )
-  `);
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS delivery_challan_items (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      challan_id INT NOT NULL,
-      company_id INT NOT NULL,
-      product_id INT NOT NULL,
-      product_name VARCHAR(255) NOT NULL,
-      batch_no VARCHAR(100) NULL,
-      quantity DECIMAL(10,2) NOT NULL DEFAULT 0,
-      unit VARCHAR(30) NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_delivery_challan_items_challan (challan_id),
-      INDEX idx_delivery_challan_items_company_product (company_id, product_id)
-    )
-  `);
-
-  deliveryChallanTablesReady = true;
-};
-
-let productInventoryColumnsReady = false;
-
-const ensureProductInventoryColumns = async () => {
-  if (productInventoryColumnsReady) {
-    return;
-  }
-
-  const requiredColumns = [
-    { name: "mrp", definition: "DECIMAL(10,2) NOT NULL DEFAULT 0" },
-    { name: "sku", definition: "VARCHAR(100) NULL" },
-    { name: "hsn", definition: "VARCHAR(30) NULL" },
-    { name: "category", definition: "VARCHAR(100) NULL" },
-    { name: "batch_no", definition: "VARCHAR(100) NULL" },
-    { name: "manufactured_date", definition: "DATE NULL" },
-    { name: "expiry_date", definition: "DATE NULL" },
-    { name: "unit", definition: "VARCHAR(30) NOT NULL DEFAULT 'PCS'" },
-    { name: "gst", definition: "DECIMAL(5,2) NOT NULL DEFAULT 18" },
-    { name: "purchase_price", definition: "DECIMAL(10,2) NOT NULL DEFAULT 0" },
-    { name: "opening_stock", definition: "DECIMAL(10,2) NOT NULL DEFAULT 0" },
-    { name: "reorder_level", definition: "DECIMAL(10,2) NOT NULL DEFAULT 0" },
-    { name: "status", definition: "VARCHAR(20) NOT NULL DEFAULT 'Active'" },
-  ];
-
-  const [columns] = await db.query("SHOW COLUMNS FROM products");
-  const existingColumns = new Set(columns.map((column) => column.Field));
-
-  for (const column of requiredColumns) {
-    if (!existingColumns.has(column.name)) {
-      await db.query(
-        `ALTER TABLE products ADD COLUMN \`${column.name}\` ${column.definition}`
-      );
-    }
-  }
-
-  productInventoryColumnsReady = true;
 };
 
 const buildTaxSummary = (rows, extra = {}) => {
@@ -356,6 +238,7 @@ exports.getProfit = async (req, res) => {
  */
 exports.getSales = async (req, res) => {
   try {
+    await assertReportSchemaReady(db, RETURN_SCHEMA);
     const company_id = req.user.company_id;
     const params = [company_id];
     const dateFilter = addDateFilter("i.invoice_date", req.query, params);
@@ -474,6 +357,7 @@ exports.getSales = async (req, res) => {
  */
 exports.getPurchase = async (req, res) => {
   try {
+    await assertReportSchemaReady(db, RETURN_SCHEMA);
     const company_id = req.user.company_id;
     const params = [company_id];
     const dateFilter = addDateFilter("b.bill_date", req.query, params);
@@ -600,6 +484,7 @@ exports.getPurchase = async (req, res) => {
  */
 exports.getPayrollReport = async (req, res) => {
   try {
+    await assertReportSchemaReady(db, PAYROLL_REPORT_SCHEMA);
     const company_id = req.user.company_id;
     const params = [company_id];
     const dateFilter = addDateFilter("pe.payroll_date", req.query, params);
@@ -728,6 +613,7 @@ exports.getPayrollReport = async (req, res) => {
  */
 exports.getStock = async (req, res) => {
   try {
+    await assertReportSchemaReady(db, PRODUCT_REPORT_SCHEMA);
     const company_id = req.user.company_id;
     const [rows] = await db.query(
       `
@@ -815,6 +701,7 @@ exports.getStock = async (req, res) => {
  */
 exports.getStockMovementReport = async (req, res) => {
   try {
+    await assertReportSchemaReady(db, [...PRODUCT_REPORT_SCHEMA, ...DELIVERY_SCHEMA, ...RETURN_SCHEMA]);
     const company_id = req.user.company_id;
     const productId = req.query.product_id ? Number(req.query.product_id) : null;
 
@@ -1039,6 +926,7 @@ exports.getStockMovementReport = async (req, res) => {
  */
 exports.getLowStock = async (req, res) => {
   try {
+    await assertReportSchemaReady(db, PRODUCT_REPORT_SCHEMA);
     const company_id = req.user.company_id;
 
     const [rows] = await db.query(
@@ -1063,6 +951,7 @@ exports.getLowStock = async (req, res) => {
  */
 exports.getDeliveryChallanReport = async (req, res) => {
   try {
+    await assertReportSchemaReady(db, [...DELIVERY_SCHEMA, ...PRODUCT_REPORT_SCHEMA]);
     const company_id = req.user.company_id;
     const type = String(req.query.type || "out").toLowerCase() === "in" ? "in" : "out";
     const params = [company_id, type];
@@ -1127,6 +1016,7 @@ exports.getDeliveryChallanReport = async (req, res) => {
  */
 exports.getReturnReport = async (req, res) => {
   try {
+    await assertReportSchemaReady(db, [...RETURN_SCHEMA, ...PRODUCT_REPORT_SCHEMA]);
     const company_id = req.user.company_id;
     const type = String(req.query.type || "sales").toLowerCase() === "purchase" ? "purchase" : "sales";
     const params = [company_id, type];

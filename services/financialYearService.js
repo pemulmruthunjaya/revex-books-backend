@@ -9,6 +9,9 @@ const FY_STATUSES = new Set([
   "LOCKED",
 ]);
 
+const UNAVAILABLE_CLOSE_STATUSES = new Set(["CLOSING", "CLOSED", "LOCKED"]);
+const FINANCIAL_YEAR_CLOSE_NOT_AVAILABLE = "FINANCIAL_YEAR_CLOSE_NOT_AVAILABLE";
+
 const TRANSITION_MATRIX = Object.freeze({
   DRAFT: new Set(["OPEN"]),
   OPEN: new Set(["RECONCILIATION"]),
@@ -427,6 +430,13 @@ const transitionFinancialYear = async (input, executor = db, hooks = {}) => {
     reason: normalizeText(input?.reason, "reason", 500),
     confirmation: normalizeText(input?.confirmation, "confirmation", 80),
   };
+  if (UNAVAILABLE_CLOSE_STATUSES.has(values.targetStatus)) {
+    fail(
+      FINANCIAL_YEAR_CLOSE_NOT_AVAILABLE,
+      "Financial year closing, locking, and carry-forward are not available during the controlled trial",
+      409
+    );
+  }
   try {
     return await withTransaction(executor, async (connection) => {
       await lockCompany(connection, values.companyId);
@@ -523,6 +533,7 @@ const setDefaultFinancialYear = async ({ companyId, financialYearId, actorUserId
 
 module.exports = {
   FinancialYearServiceError,
+  FINANCIAL_YEAR_CLOSE_NOT_AVAILABLE,
   FY_STATUSES,
   TRANSITION_MATRIX,
   accountingDate,

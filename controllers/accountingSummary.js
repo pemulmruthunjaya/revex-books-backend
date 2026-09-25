@@ -1,3 +1,11 @@
+const { assertReportSchemaReady } = require("../services/reportSchemaService");
+
+const ACCOUNTING_REPORT_SCHEMA = Object.freeze([
+  { table: "product_returns", columns: ["company_id", "type", "return_date", "subtotal", "tax_amount", "total_amount"] },
+  { table: "payroll_entries", columns: ["company_id", "payroll_date", "net_amount", "status"] },
+  { table: "opening_balance_events", columns: ["company_id", "financial_year_id", "account_id", "opening_date", "debit", "credit"] },
+]);
+
 const toNumber = (value) => Number(value || 0);
 
 const buildDateClause = (column, fromDate, toDate, params) => {
@@ -18,98 +26,8 @@ const buildDateClause = (column, fromDate, toDate, params) => {
 
 const money = (value) => Math.round(toNumber(value) * 100) / 100;
 
-let returnTablesReady = false;
-let payrollTablesReady = false;
-
-const ensureReturnTables = async (db) => {
-  if (returnTablesReady) {
-    return;
-  }
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS product_returns (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      company_id INT NOT NULL,
-      type VARCHAR(20) NOT NULL,
-      return_number VARCHAR(50) NOT NULL,
-      return_date DATE NOT NULL,
-      party_type VARCHAR(20) NOT NULL,
-      party_id INT NULL,
-      party_name VARCHAR(255) NOT NULL,
-      reference_number VARCHAR(100) NULL,
-      subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
-      tax_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-      total_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-      notes TEXT NULL,
-      created_by INT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_product_returns_company_number (company_id, return_number)
-    )
-  `);
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS return_items (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      return_id INT NOT NULL,
-      company_id INT NOT NULL,
-      product_id INT NOT NULL,
-      product_name VARCHAR(255) NOT NULL,
-      batch_no VARCHAR(100) NULL,
-      quantity DECIMAL(10,2) NOT NULL DEFAULT 0,
-      unit_price DECIMAL(12,2) NOT NULL DEFAULT 0,
-      mrp DECIMAL(12,2) NOT NULL DEFAULT 0,
-      gst_rate DECIMAL(5,2) NOT NULL DEFAULT 0,
-      total_price DECIMAL(12,2) NOT NULL DEFAULT 0,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_return_items_return (return_id),
-      INDEX idx_return_items_company_product (company_id, product_id)
-    )
-  `);
-
-  returnTablesReady = true;
-};
-
-const ensurePayrollTables = async (db) => {
-  if (payrollTablesReady) {
-    return;
-  }
-
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS payroll_entries (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      company_id INT NOT NULL,
-      employee_id INT NOT NULL,
-      employee_name VARCHAR(255) NOT NULL,
-      payroll_month VARCHAR(7) NOT NULL,
-      payroll_date DATE NOT NULL,
-      salary_mode VARCHAR(40) NOT NULL DEFAULT 'Manual',
-      working_days DECIMAL(8,2) NOT NULL DEFAULT 0,
-      present_days DECIMAL(8,2) NOT NULL DEFAULT 0,
-      absent_days DECIMAL(8,2) NOT NULL DEFAULT 0,
-      total_hours DECIMAL(10,2) NOT NULL DEFAULT 0,
-      overtime_hours DECIMAL(10,2) NOT NULL DEFAULT 0,
-      standard_hours DECIMAL(10,2) NOT NULL DEFAULT 0,
-      basic_salary DECIMAL(12,2) NOT NULL DEFAULT 0,
-      allowances DECIMAL(12,2) NOT NULL DEFAULT 0,
-      deductions DECIMAL(12,2) NOT NULL DEFAULT 0,
-      net_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
-      status VARCHAR(30) NOT NULL DEFAULT 'Unpaid',
-      payment_date DATE NULL,
-      notes TEXT NULL,
-      attendance_import_id INT NULL,
-      created_by INT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_payroll_employee_month (company_id, employee_id, payroll_month),
-      INDEX idx_payroll_entries_company_month (company_id, payroll_month),
-      INDEX idx_payroll_entries_status (company_id, status)
-    )
-  `);
-
-  payrollTablesReady = true;
-};
-
 exports.getAccountingSummary = async (db, companyId, filters = {}) => {
+  await assertReportSchemaReady(db, ACCOUNTING_REPORT_SCHEMA);
   const { from_date, to_date } = filters;
 
   const invoiceParams = [companyId];
