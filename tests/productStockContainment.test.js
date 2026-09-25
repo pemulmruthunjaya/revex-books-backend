@@ -95,8 +95,8 @@ test("new products with zero or omitted quantity persist zero without fabricatin
   db.query = async (sql, params = []) => {
     const text = String(sql);
     calls.push({ text, params });
-    if (text.includes("SHOW COLUMNS FROM products")) {
-      return [["mrp", "sku", "barcode", "hsn", "category", "batch_no", "manufactured_date", "expiry_date", "unit", "gst", "purchase_price", "opening_stock", "reorder_level", "status"].map((Field) => ({ Field }))];
+    if (text.includes("information_schema.COLUMNS")) {
+      return [["mrp", "sku", "barcode", "hsn", "category", "batch_no", "manufactured_date", "expiry_date", "unit", "gst", "purchase_price", "opening_stock", "reorder_level", "status"].map((COLUMN_NAME) => ({ COLUMN_NAME }))];
     }
     if (text.includes("INSERT INTO products")) return [{ insertId: calls.length }];
     throw new Error(`Unexpected SQL: ${text}`);
@@ -141,8 +141,8 @@ test("safe product edit succeeds while a quantity change leaves every field unto
   db.query = async (sql, params = []) => {
     const text = String(sql);
     calls.push({ text, params });
-    if (text.includes("SHOW COLUMNS FROM products")) {
-      return [["mrp", "sku", "barcode", "hsn", "category", "batch_no", "manufactured_date", "expiry_date", "unit", "gst", "purchase_price", "opening_stock", "reorder_level", "status"].map((Field) => ({ Field }))];
+    if (text.includes("information_schema.COLUMNS")) {
+      return [["mrp", "sku", "barcode", "hsn", "category", "batch_no", "manufactured_date", "expiry_date", "unit", "gst", "purchase_price", "opening_stock", "reorder_level", "status"].map((COLUMN_NAME) => ({ COLUMN_NAME }))];
     }
     if (text.includes("SELECT id,stock,opening_stock")) return [[{ id: 8, stock: "12.50", opening_stock: "5.00" }]];
     if (text.includes("UPDATE products")) return [{ affectedRows: 1 }];

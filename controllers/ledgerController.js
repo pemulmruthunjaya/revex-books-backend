@@ -444,8 +444,9 @@ exports.getAccountLedger = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: error.message ||
-        "Failed to fetch account ledger"
+      message: "Failed to fetch account ledger",
+      code: "INTERNAL_SERVER_ERROR",
+      request_id: req.requestId || null
     });
 
   }

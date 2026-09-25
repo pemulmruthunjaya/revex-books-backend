@@ -11,6 +11,14 @@ const {
   ensureUserAccessColumns,
   getDefaultPermissions,
 } = require("../services/userAccessService");
+const { SchemaReadinessError } = require("../services/schemaReadinessService");
+
+const sendAuthFailure = (req, res, error, fallback) => {
+  if (error instanceof SchemaReadinessError) {
+    return res.status(error.status).json({ message: error.message, code: error.code });
+  }
+  return res.status(500).json({ message: fallback, code: "INTERNAL_SERVER_ERROR", request_id: req.requestId || null });
+};
 const { sendPasswordReset } = require("../services/emailService");
 const {
   provisionCompanyTrial,
@@ -157,7 +165,7 @@ exports.register = async (req, res) => {
   } catch (error) {
     if (connection && transactionStarted) await connection.rollback();
     console.error("Register error:", error);
-    res.status(500).json({ message: "Registration failed" });
+    return sendAuthFailure(req, res, error, "Registration failed");
   } finally {
     if (connection) connection.release();
   }
@@ -202,7 +210,7 @@ exports.login = async (req, res) => {
 
   } catch (error) {
     console.error("Login error:", error);
-    res.status(500).json({ message: "Login failed" });
+    return sendAuthFailure(req, res, error, "Login failed");
   }
 };
 
@@ -258,9 +266,7 @@ exports.staffLogin = async (req, res) => {
 
   } catch (error) {
     console.error("Staff login error:", error);
-    res.status(error.status || 500).json({
-      message: "Staff login failed"
-    });
+    return sendAuthFailure(req, res, error, "Staff login failed");
   }
 };
 
@@ -316,6 +322,9 @@ exports.forgotPassword = async (req, res) => {
     return res.json(genericResponse);
   } catch (error) {
     console.error("Forgot password error:", error);
+    if (error instanceof SchemaReadinessError) {
+      return res.status(error.status).json({ ...genericResponse, code: error.code });
+    }
     return res.json(genericResponse);
   }
 };
@@ -359,7 +368,7 @@ exports.resetPassword = async (req, res) => {
     return res.json({ message: "Password reset successfully. You can now sign in." });
   } catch (error) {
     console.error("Reset password error:", error);
-    return res.status(500).json({ message: "Password reset failed" });
+    return sendAuthFailure(req, res, error, "Password reset failed");
   }
 };
 

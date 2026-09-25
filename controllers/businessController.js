@@ -231,7 +231,7 @@ exports.switchCompany = async (req, res) => {
     const token = issueContextToken(user, companyId, defaultBranch?.id || null);
     return res.json({ token, company_id: companyId, branch_id: defaultBranch?.id || null });
   } catch (error) {
-    return res.status(error.status || 500).json({ message: error.message || "Switch failed" });
+    return res.status(error.status || 500).json({ message: error.status ? error.message : "Switch failed", ...(error.status && error.code ? { code: error.code } : {}), request_id: req.requestId || null });
   }
 };
 
@@ -251,7 +251,7 @@ exports.switchBranch = async (req, res) => {
     const token = issueContextToken(user, req.user.company_id, branchId);
     return res.json({ token, company_id: req.user.company_id, branch_id: branchId });
   } catch (error) {
-    return res.status(error.status || 500).json({ message: error.message || "Switch failed" });
+    return res.status(error.status || 500).json({ message: error.status ? error.message : "Switch failed", ...(error.status && error.code ? { code: error.code } : {}), request_id: req.requestId || null });
   }
 };
 

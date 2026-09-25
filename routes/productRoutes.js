@@ -6,6 +6,8 @@ const {
   assertUnchangedProductStock,
   assertZeroInitialStock,
 } = require("../services/productStockSafety");
+const { assertTableColumns } = require("../services/schemaReadinessService");
+const { sendUnexpectedError } = require("../utils/errorResponse");
 
 let productColumnsReady = false;
 
@@ -31,16 +33,12 @@ const ensureProductColumns = async () => {
     return;
   }
 
-  const [columns] = await db.query("SHOW COLUMNS FROM products");
-  const existingColumns = new Set(columns.map((column) => column.Field));
-
-  for (const column of inventoryColumns) {
-    if (!existingColumns.has(column.name)) {
-      await db.query(
-        `ALTER TABLE products ADD COLUMN \`${column.name}\` ${column.definition}`
-      );
-    }
-  }
+  await assertTableColumns({
+    executor: db,
+    table: "products",
+    columns: inventoryColumns.map((column) => column.name),
+    code: "PRODUCT_SCHEMA_NOT_READY",
+  });
 
   productColumnsReady = true;
 };
@@ -92,12 +90,10 @@ router.get("/", authMiddleware, async (req, res) => {
 
     res.status(200).json(rows);
   } catch (err) {
-    console.error("❌ ERROR FETCHING PRODUCTS:", err);
-
-    res.status(500).json({
-      error: "Failed to fetch products",
-      details: err.message,
-    });
+    if (err.status && err.code) {
+      return res.status(err.status).json({ error: err.message, code: err.code });
+    }
+    return sendUnexpectedError(req, res, err, "Product list");
   }
 });
 
@@ -146,12 +142,10 @@ router.post("/", authMiddleware, async (req, res) => {
       productId: result.insertId,
     });
   } catch (err) {
-    console.error("❌ ADD PRODUCT ERROR:", err);
-
-    res.status(err.status || 500).json({
-      error: err.status ? err.message : "Failed to create product",
-      ...(err.code ? { code: err.code } : {}),
-    });
+    if (err.status && err.code) {
+      return res.status(err.status).json({ error: err.message, code: err.code });
+    }
+    return sendUnexpectedError(req, res, err, "Product creation");
   }
 });
 
@@ -225,12 +219,10 @@ router.put("/:id", authMiddleware, async (req, res) => {
 
     res.json({ message: "Product updated successfully" });
   } catch (err) {
-    console.error("❌ UPDATE ERROR:", err);
-
-    res.status(err.status || 500).json({
-      error: err.status ? err.message : "Failed to update product",
-      ...(err.code ? { code: err.code } : {}),
-    });
+    if (err.status && err.code) {
+      return res.status(err.status).json({ error: err.message, code: err.code });
+    }
+    return sendUnexpectedError(req, res, err, "Product update");
   }
 });
 
@@ -287,12 +279,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
 
     res.json({ message: "Product deleted successfully" });
   } catch (err) {
-    console.error("❌ DELETE ERROR:", err);
-
-    res.status(500).json({
-      error: "Failed to delete product",
-      details: err.message,
-    });
+    return sendUnexpectedError(req, res, err, "Product deletion");
   }
 });
 

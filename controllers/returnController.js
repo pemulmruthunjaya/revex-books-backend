@@ -317,7 +317,7 @@ exports.createReturn = async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error("Create return error:", error);
-    res.status(500).json({ message: "Failed to save return", error: error.message });
+    res.status(500).json({ message: "Failed to save return", code: "INTERNAL_SERVER_ERROR", request_id: req.requestId || null });
   } finally {
     connection.release();
   }

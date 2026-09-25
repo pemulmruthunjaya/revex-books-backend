@@ -16,11 +16,14 @@ const {
   ownerOnly,
 } = require("./middleware/permissionMiddleware");
 const auditLogMiddleware = require("./middleware/auditLogMiddleware");
+const requestIdMiddleware = require("./middleware/requestIdMiddleware");
+const { assertLaunchConfiguration } = require("./services/launchReadinessService");
 const {
   isSubscriptionEnforcementEnabled,
 } = require("./utils/subscriptionEnforcementConfig");
 
 const app = express();
+assertLaunchConfiguration();
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
@@ -154,6 +157,7 @@ const corsOptions = {
 
 };
 
+app.use(requestIdMiddleware);
 app.use(cors(corsOptions));
 app.use(securityHeaders);
 
@@ -662,10 +666,21 @@ app.use((err, req, res, next) => {
     return next(err);
   }
 
-  console.error("API error:", err.message);
+  console.error("API error", {
+    requestId: req.requestId || null,
+    name: err.name,
+    code: err.code,
+    message: err.message,
+    stack: err.stack,
+  });
+  const expected = Number(err.status) >= 400 && Number(err.status) < 500;
   return res.status(err.status || 500).json({
     success: false,
-    message: err.message === "Not allowed by CORS" ? "Origin not allowed" : "Server error",
+    message: err.message === "Not allowed by CORS"
+      ? "Origin not allowed"
+      : expected ? err.message : "An unexpected error occurred",
+    code: expected && err.code ? err.code : "INTERNAL_SERVER_ERROR",
+    request_id: req.requestId || null,
   });
 });
 

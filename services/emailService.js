@@ -1,4 +1,5 @@
 const nodemailer = require("nodemailer");
+const { isLaunchMode, validatePublicAppUrl } = require("./launchReadinessService");
 
 const smtpConfigured = () =>
   Boolean(
@@ -40,8 +41,16 @@ const sendMail = async ({ to, subject, text, html }) => {
   }
 };
 
-const appUrl = () =>
-  String(process.env.APP_URL || "http://localhost:5173").replace(/\/+$/, "");
+const appUrl = (environment = process.env) => {
+  const configured = String(environment.APP_URL || "").trim().replace(/\/+$/, "");
+  if (isLaunchMode(environment) && !validatePublicAppUrl(configured)) {
+    const error = new Error("Public application URL is not configured");
+    error.code = "PUBLIC_APP_URL_REQUIRED";
+    error.status = 503;
+    throw error;
+  }
+  return configured || "http://localhost:5173";
+};
 
 const sendStaffInvitation = ({ name, email, temporaryPassword }) =>
   sendMail({
@@ -63,6 +72,7 @@ const sendPasswordReset = ({ name, email, token }) => {
 
 module.exports = {
   smtpConfigured,
+  appUrl,
   sendStaffInvitation,
   sendPasswordReset,
 };

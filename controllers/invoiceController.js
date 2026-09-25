@@ -1,4 +1,5 @@
 const db = require("../db/connection");
+const { sendUnexpectedError } = require("../utils/errorResponse");
 const crypto = require("node:crypto");
 const { ensureReceiptEntrySchema, normalizePaymentMethod, postReceipt } = require("../services/receiptEntryService");
 const { postSalesInvoiceJournal } = require("../services/salesInvoiceAccountingService");
@@ -854,7 +855,7 @@ exports.getInvoices = async (req, res) => {
     );
     res.json(rows);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return sendUnexpectedError(req, res, error, "Invoice list");
   }
 };
 
@@ -925,7 +926,7 @@ exports.getInvoiceById = async (req, res) => {
       items
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return sendUnexpectedError(req, res, error, "Invoice read");
   }
 };
 

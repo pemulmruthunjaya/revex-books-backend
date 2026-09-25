@@ -190,7 +190,9 @@ exports.createJournalEntry = async (req, res) => {
 
         res.status(error.status || 500).json({
             success: false,
-            message: error.message
+            message: error.status ? error.message : "An unexpected error occurred",
+            code: error.status && error.code ? error.code : "INTERNAL_SERVER_ERROR",
+            request_id: req.requestId || null
         });
 
     } finally {
@@ -270,7 +272,9 @@ exports.getAllJournalEntries = async (req, res) => {
 
         res.status(500).json({
             success: false,
-            message: error.message
+            message: "An unexpected error occurred",
+            code: "INTERNAL_SERVER_ERROR",
+            request_id: req.requestId || null
         });
 
     }
@@ -355,7 +359,9 @@ exports.getSingleJournalEntry = async (req, res) => {
 
         res.status(500).json({
             success: false,
-            message: error.message
+            message: "An unexpected error occurred",
+            code: "INTERNAL_SERVER_ERROR",
+            request_id: req.requestId || null
         });
 
     }

@@ -32,15 +32,15 @@ test("exactly the four incomplete operational accounting imports fail closed bef
   }
 });
 
-test("invalid transaction types remain validation errors and unrelated backup/master routes stay mounted", async () => {
+test("invalid internal transaction types remain validation errors while customer backup routes fail closed", async () => {
   const res = response();
   await importTransactions({ params: { type: "customers" }, body: {}, user: {} }, res);
   assert.equal(res.statusCode, 400);
   assert.equal(res.body.message, "Invalid transaction import type");
 
   const routes = fs.readFileSync(path.join(__dirname, "..", "routes", "backupRoutes.js"), "utf8");
-  assert.match(routes, /router\.post\("\/import\/:type", importMasterData\)/);
-  assert.match(routes, /router\.get\("\/export", exportCompanyBackup\)/);
+  assert.match(routes, /router\.post\("\/import\/:type", trialBackupUnavailable\)/);
+  assert.match(routes, /router\.get\("\/export", trialBackupUnavailable\)/);
   assert.match(routes, /router\.post\("\/restore\/preview", previewRestoreBackup\)/);
 });
 

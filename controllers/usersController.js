@@ -16,7 +16,7 @@ exports.getUsers = async (req, res) => {
 
     res.json(users);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "An unexpected error occurred", code: "INTERNAL_SERVER_ERROR", request_id: req.requestId || null });
   }
 };
 
@@ -31,7 +31,7 @@ exports.createUser = (req, res) => {
   const sql = 'INSERT INTO users (name, email) VALUES (?, ?)';
   db.query(sql, [name, email], (err, result) => {
     if (err) {
-      return res.status(500).json({ error: err.message });
+      return res.status(500).json({ error: "An unexpected error occurred", code: "INTERNAL_SERVER_ERROR", request_id: req.requestId || null });
     }
 
     res.status(201).json({
@@ -49,7 +49,7 @@ exports.updateUser = (req, res) => {
   const sql = 'UPDATE users SET name = ?, email = ? WHERE id = ?';
   db.query(sql, [name, email, id], (err, result) => {
     if (err) {
-      return res.status(500).json({ error: err.message });
+      return res.status(500).json({ error: "An unexpected error occurred", code: "INTERNAL_SERVER_ERROR", request_id: req.requestId || null });
     }
 
     if (result.affectedRows === 0) {
@@ -67,7 +67,7 @@ exports.deleteUser = (req, res) => {
   const sql = 'DELETE FROM users WHERE id = ?';
   db.query(sql, [id], (err, result) => {
     if (err) {
-      return res.status(500).json({ error: err.message });
+      return res.status(500).json({ error: "An unexpected error occurred", code: "INTERNAL_SERVER_ERROR", request_id: req.requestId || null });
     }
 
     if (result.affectedRows === 0) {

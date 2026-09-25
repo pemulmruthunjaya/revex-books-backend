@@ -4,6 +4,12 @@ const { ensurePayrollTables } = require("../services/payrollService");
 const { ensureUserAccessColumns } = require("../services/userAccessService");
 const { assertSafeProductImportRows } = require("../services/productStockSafety");
 
+exports.trialBackupUnavailable = (req, res) => res.status(503).json({
+  success: false,
+  code: "TRIAL_BACKUP_NOT_AVAILABLE",
+  message: "Customer backup, import, and restore operations are unavailable during the controlled trial. Recovery is managed by RevEx Books infrastructure.",
+});
+
 const productInventoryColumns = [
   { name: "mrp", definition: "DECIMAL(10,2) NOT NULL DEFAULT 0" },
   { name: "sku", definition: "VARCHAR(100) NULL" },

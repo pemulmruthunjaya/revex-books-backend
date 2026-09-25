@@ -5,6 +5,7 @@ const {
   recordOpeningBalanceEvent,
   signedAccountOpening,
 } = require("../services/openingBalanceService");
+const { sendUnexpectedError } = require("../utils/errorResponse");
 
 const accountError = (message, status = 400) => Object.assign(new Error(message), { status });
 const accountValues = (body) => {
@@ -32,15 +33,14 @@ const validateParent = async (connection, parentId, companyId, ownId = null) => 
   if (!rows.length) throw accountError("Parent account not found for this company");
 };
 
-const sendAccountError = (res, error) => {
+const sendAccountError = (req, res, error) => {
   if (error.code === "ER_DUP_ENTRY") {
     return res.status(400).json({ success: false, message: "Account code or opening event already exists" });
   }
-  return res.status(error.status || 500).json({
-    success: false,
-    message: error.status ? error.message : "Server error",
-    ...(error.code ? { code: error.code } : {}),
-  });
+  if (error.status && error.status < 500) {
+    return res.status(error.status).json({ success: false, message: error.message, ...(error.code ? { code: error.code } : {}) });
+  }
+  return sendUnexpectedError(req, res, error, "Account request");
 };
 
 exports.createAccount = async (req, res) => {
@@ -72,7 +72,7 @@ exports.createAccount = async (req, res) => {
   } catch (error) {
     if (connection) await connection.rollback();
     console.error("CREATE ACCOUNT ERROR:", error);
-    return sendAccountError(res, error);
+    return sendAccountError(req, res, error);
   } finally {
     if (connection) connection.release();
   }
@@ -88,7 +88,7 @@ exports.getAllAccounts = async (req, res) => {
     );
     return res.status(200).json({ success: true, count: results.length, data: results });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message || "Server error" });
+    return sendUnexpectedError(req, res, error, "Account list");
   }
 };
 
@@ -103,7 +103,7 @@ exports.getSingleAccount = async (req, res) => {
     if (!results.length) return res.status(404).json({ success: false, message: "Account not found" });
     return res.status(200).json({ success: true, data: results[0] });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message || "Server error" });
+    return sendUnexpectedError(req, res, error, "Account read");
   }
 };
 
@@ -149,7 +149,7 @@ exports.updateAccount = async (req, res) => {
   } catch (error) {
     if (connection) await connection.rollback();
     console.error("UPDATE ACCOUNT ERROR:", error);
-    return sendAccountError(res, error);
+    return sendAccountError(req, res, error);
   } finally {
     if (connection) connection.release();
   }
@@ -164,6 +164,6 @@ exports.deleteAccount = async (req, res) => {
     if (!result.affectedRows) return res.status(404).json({ success: false, message: "Account not found" });
     return res.status(200).json({ success: true, message: "Account deleted successfully" });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message || "Server error" });
+    return sendUnexpectedError(req, res, error, "Account deletion");
   }
 };

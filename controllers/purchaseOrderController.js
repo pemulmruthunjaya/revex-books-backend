@@ -452,7 +452,7 @@ exports.updatePurchaseOrder = async (req, res) => {
       return res.status(409).json({ message: "Purchase order number already exists" });
     }
 
-    res.status(500).json({ message: error.message || "Server error" });
+    res.status(500).json({ message: "An unexpected error occurred", code: "INTERNAL_SERVER_ERROR", request_id: req.requestId || null });
   } finally {
     connection.release();
   }

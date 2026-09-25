@@ -126,55 +126,30 @@ const normalizePermissions = (permissions, role = "sales") => {
   }, {});
 };
 
+const { assertTableColumns } = require("./schemaReadinessService");
+
+const USER_ACCESS_COLUMNS = Object.freeze([
+  "access_role",
+  "permissions",
+  "is_active",
+  "last_login_at",
+  "must_change_password",
+  "password_reset_token_hash",
+  "password_reset_expires_at",
+  "password_changed_at",
+]);
+
 const ensureUserAccessColumns = async () => {
   if (usersAccessReady) {
     return;
   }
 
-  const [columns] = await db.query("SHOW COLUMNS FROM users");
-  const existingColumns = new Set(columns.map((column) => column.Field));
-
-  if (!existingColumns.has("access_role")) {
-    await db.query(
-      "ALTER TABLE users ADD COLUMN access_role VARCHAR(30) NOT NULL DEFAULT 'sales'"
-    );
-  }
-
-  if (!existingColumns.has("permissions")) {
-    await db.query("ALTER TABLE users ADD COLUMN permissions LONGTEXT NULL");
-  }
-
-  if (!existingColumns.has("is_active")) {
-    await db.query(
-      "ALTER TABLE users ADD COLUMN is_active TINYINT(1) NOT NULL DEFAULT 1"
-    );
-  }
-
-  if (!existingColumns.has("last_login_at")) {
-    await db.query("ALTER TABLE users ADD COLUMN last_login_at DATETIME NULL");
-  }
-
-  if (!existingColumns.has("must_change_password")) {
-    await db.query(
-      "ALTER TABLE users ADD COLUMN must_change_password TINYINT(1) NOT NULL DEFAULT 0"
-    );
-  }
-
-  if (!existingColumns.has("password_reset_token_hash")) {
-    await db.query(
-      "ALTER TABLE users ADD COLUMN password_reset_token_hash CHAR(64) NULL"
-    );
-  }
-
-  if (!existingColumns.has("password_reset_expires_at")) {
-    await db.query(
-      "ALTER TABLE users ADD COLUMN password_reset_expires_at DATETIME NULL"
-    );
-  }
-
-  if (!existingColumns.has("password_changed_at")) {
-    await db.query("ALTER TABLE users ADD COLUMN password_changed_at DATETIME NULL");
-  }
+  await assertTableColumns({
+    executor: db,
+    table: "users",
+    columns: USER_ACCESS_COLUMNS,
+    code: "USER_ACCESS_SCHEMA_NOT_READY",
+  });
 
   usersAccessReady = true;
 };
