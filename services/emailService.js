@@ -1,49 +1,32 @@
-const nodemailer = require("nodemailer");
-const { isLaunchMode, validatePublicAppUrl } = require("./launchReadinessService");
+const {
+  CANONICAL_APP_URL,
+  isLaunchMode,
+  validatePublicAppUrl,
+} = require("./launchReadinessService");
+const {
+  createMicrosoftGraphProvider,
+  graphConfigurationIssues,
+} = require("./microsoftGraphEmailProvider");
 
-const smtpConfigured = () =>
-  Boolean(
-    process.env.SMTP_HOST &&
-      process.env.SMTP_PORT &&
-      process.env.SMTP_USER &&
-      process.env.SMTP_PASSWORD &&
-      process.env.SMTP_FROM
-  );
+let graphProvider;
 
-const getTransport = () =>
-  nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT),
-    secure: String(process.env.SMTP_SECURE || "").toLowerCase() === "true",
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASSWORD,
-    },
-  });
-
-const sendMail = async ({ to, subject, text, html }) => {
-  if (!smtpConfigured()) {
+const sendMail = async (message, options = {}) => {
+  const environment = options.environment || process.env;
+  if (graphConfigurationIssues(environment).length) {
     return { sent: false, reason: "not_configured" };
   }
-
-  try {
-    await getTransport().sendMail({
-      from: process.env.SMTP_FROM,
-      to,
-      subject,
-      text,
-      html,
-    });
-    return { sent: true };
-  } catch (error) {
-    console.error("Email delivery failed:", error.message);
-    return { sent: false, reason: "delivery_failed" };
+  if (options.provider) return options.provider.sendMail(message);
+  if (!graphProvider) {
+    graphProvider = createMicrosoftGraphProvider({ environment });
   }
+  return graphProvider.sendMail(message);
 };
 
 const appUrl = (environment = process.env) => {
   const configured = String(environment.APP_URL || "").trim().replace(/\/+$/, "");
-  if (isLaunchMode(environment) && !validatePublicAppUrl(configured)) {
+  if (isLaunchMode(environment) && (
+    !validatePublicAppUrl(configured) || configured !== CANONICAL_APP_URL
+  )) {
     const error = new Error("Public application URL is not configured");
     error.code = "PUBLIC_APP_URL_REQUIRED";
     error.status = 503;
@@ -71,8 +54,8 @@ const sendPasswordReset = ({ name, email, token }) => {
 };
 
 module.exports = {
-  smtpConfigured,
   appUrl,
+  sendMail,
   sendStaffInvitation,
   sendPasswordReset,
 };

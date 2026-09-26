@@ -17,12 +17,12 @@ const source = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const launchEnvironment = (overrides = {}) => ({
   NODE_ENV: "production",
   SUBSCRIPTION_ENFORCEMENT_ENABLED: "true",
-  SMTP_HOST: "smtp.example.test",
-  SMTP_PORT: "587",
-  SMTP_USER: "mailer",
-  SMTP_PASSWORD: "not-a-real-secret",
-  SMTP_FROM: "support@example.test",
-  APP_URL: "https://books.example.test",
+  EMAIL_PROVIDER: "microsoft_graph",
+  MS_GRAPH_TENANT_ID: "11111111-1111-4111-8111-111111111111",
+  MS_GRAPH_CLIENT_ID: "22222222-2222-4222-8222-222222222222",
+  MS_GRAPH_CLIENT_SECRET: "synthetic-test-value",
+  MS_GRAPH_SENDER: "support@revexbooks.com",
+  APP_URL: "https://revex-books-frontend.vercel.app",
   ...overrides,
 });
 
@@ -40,15 +40,15 @@ test("production and explicit trial launch modes require exact subscription enfo
   );
 });
 
-test("launch email readiness requires SMTP fields and a public HTTPS APP_URL without sending mail", () => {
-  for (const variable of ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "APP_URL"]) {
+test("launch email readiness requires Microsoft Graph fields and the canonical APP_URL without sending mail", () => {
+  for (const variable of ["EMAIL_PROVIDER", "MS_GRAPH_TENANT_ID", "MS_GRAPH_CLIENT_ID", "MS_GRAPH_CLIENT_SECRET", "MS_GRAPH_SENDER", "APP_URL"]) {
     const environment = launchEnvironment({ [variable]: "" });
     assert.ok(getLaunchConfigurationIssues(environment).some((issue) => issue.variable === variable));
   }
-  for (const value of ["http://localhost:5173", "http://books.example.test", "not-a-url"]) {
+  for (const value of ["http://localhost:5173", "https://books.example.test", "not-a-url"]) {
     assert.throws(() => appUrl(launchEnvironment({ APP_URL: value })), (error) => error.code === "PUBLIC_APP_URL_REQUIRED");
   }
-  assert.equal(appUrl(launchEnvironment()), "https://books.example.test");
+  assert.equal(appUrl(launchEnvironment()), "https://revex-books-frontend.vercel.app");
   assert.equal(appUrl({ NODE_ENV: "development" }), "http://localhost:5173");
 });
 

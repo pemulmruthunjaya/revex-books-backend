@@ -104,7 +104,7 @@ const buildProductionReadinessReport = async () => {
       required: true,
       message: launchIssues.length
         ? `Missing or invalid launch variables: ${launchIssues.map((issue) => issue.variable).join(", ")}`
-        : "Subscription enforcement, SMTP, and public application URL are configured",
+        : "Subscription enforcement, Microsoft Graph email, and public application URL are configured",
     },
     cors: checkCors(),
     jsonBodyLimit: {
