@@ -124,7 +124,12 @@ test("platform activation derives audit actor from middleware identity, never bo
 test("platform namespace is isolated and outside tenant enforcement", () => {
   const routes = fs.readFileSync(path.join(root, "routes", "platformRoutes.js"), "utf8");
   const index = fs.readFileSync(path.join(root, "index.js"), "utf8");
-  assert.match(routes, /router\.post\("\/auth\/login", authRateLimiter, platformLogin\)/);
+  const auth = fs.readFileSync(path.join(root, "routes", "platformAuthRoutes.js"), "utf8");
+  const assembly = fs.readFileSync(path.join(root, "middleware", "applicationAssembly.js"), "utf8");
+  assert.match(auth, /router\.post\("\/login", authRateLimiter/);
+  assert.match(assembly, /app\.use\("\/api\/platform\/auth", platformAuthRoutes\)/);
+  assert.match(index, /login: platformLogin, authenticate: platformAuthMiddleware/);
+  assert.doesNotMatch(routes, /\/auth\/login/);
   assert.match(routes, /router\.post\("\/subscriptions\/activate", platformAuthMiddleware, activatePlatformSubscription\)/);
   assert.match(index, /app\.use\("\/api\/platform", platformRoutes\)/);
   const prefixes = index.slice(index.indexOf("const tenantErpRoutePrefixes"), index.indexOf("if (isSubscriptionEnforcementEnabled())"));

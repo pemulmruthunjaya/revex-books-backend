@@ -12,7 +12,12 @@ class PlatformAdminError extends Error {
   }
 }
 
-const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+const normalizeEmail = (value) => typeof value === "string" ? value.trim().toLowerCase() : "";
+// Bound presented passwords without breaking existing bcrypt credentials longer
+// than 72 bytes. New password creation is a separate contract.
+const validPlatformCredentials = (email, password) => typeof email === "string"
+  && Buffer.byteLength(email, "utf8") <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+  && typeof password === "string" && password.length > 0 && Buffer.byteLength(password, "utf8") <= 1024;
 
 const createPlatformAdmin = async ({ name, email, password }, options = {}) => {
   const executor = options.executor || defaultExecutor();
@@ -49,17 +54,17 @@ const createPlatformAdmin = async ({ name, email, password }, options = {}) => {
 };
 
 const authenticatePlatformAdmin = async ({ email, password }, options = {}) => {
-  const executor = options.executor || defaultExecutor();
-  const normalizedEmail = normalizeEmail(email);
-  if (!normalizedEmail || !password) {
+  if (!validPlatformCredentials(email, password)) {
     throw new PlatformAdminError("INVALID_CREDENTIALS", "Invalid credentials", 401);
   }
+  const executor = options.executor || defaultExecutor();
+  const normalizedEmail = normalizeEmail(email);
   const [rows] = await executor.query(
     `SELECT id, name, email, password_hash, status
        FROM platform_admins WHERE email = ? LIMIT 1`,
     [normalizedEmail]
   );
-  if (!rows.length || !(await bcrypt.compare(String(password), rows[0].password_hash))) {
+  if (!rows.length || !(await bcrypt.compare(password, rows[0].password_hash))) {
     throw new PlatformAdminError("INVALID_CREDENTIALS", "Invalid credentials", 401);
   }
   if (rows[0].status !== "active") {
@@ -79,4 +84,5 @@ module.exports = {
   PlatformAdminError,
   authenticatePlatformAdmin,
   createPlatformAdmin,
+  validPlatformCredentials,
 };

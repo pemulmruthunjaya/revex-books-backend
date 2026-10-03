@@ -1,13 +1,16 @@
 const express = require("express");
-const { authRateLimiter } = require("../middleware/securityMiddleware");
 const platformAuthMiddleware = require("../middleware/platformAuthMiddleware");
-const { platformLogin } = require("../controllers/platformAuthController");
 const { activatePlatformSubscription, lifecycleActions } = require("../controllers/platformSubscriptionController");
 const platformPortal = require("../controllers/platformPortalController");
+const { createTrialInvitationController } = require("../controllers/trialInvitationController");
+const trialInvitations = createTrialInvitationController();
 
 const router = express.Router();
 
-router.post("/auth/login", authRateLimiter, platformLogin);
+router.get("/trial-requests", platformAuthMiddleware, trialInvitations.list);
+router.get("/trial-requests/:requestId", platformAuthMiddleware, trialInvitations.get);
+router.post("/trial-requests/:requestId/approve", platformAuthMiddleware, trialInvitations.approve);
+router.post("/trial-requests/:requestId/resend", platformAuthMiddleware, trialInvitations.resend);
 router.post("/subscriptions/activate", platformAuthMiddleware, activatePlatformSubscription);
 router.post("/subscriptions/:companyId/renew", platformAuthMiddleware, lifecycleActions.renew);
 router.post("/subscriptions/:companyId/change-plan", platformAuthMiddleware, lifecycleActions["change-plan"]);

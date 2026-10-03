@@ -33,6 +33,7 @@ app.set("trust proxy", 1);
  * =========================================================
  */
 const db = require("./db/connection");
+const publicTrialRequestRoutes = require("./routes/publicTrialRequestRoutes");
 
 /**
  * =========================================================
@@ -42,6 +43,10 @@ const db = require("./db/connection");
 
 /* ================= AUTH ================= */
 const authRoutes = require("./routes/authRoutes");
+const { assembleApplicationBoundary } = require("./middleware/applicationAssembly");
+const { createPlatformAuthRoutes } = require("./routes/platformAuthRoutes");
+const { platformLogin } = require("./controllers/platformAuthController");
+const platformAuthMiddleware = require("./middleware/platformAuthMiddleware");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const platformRoutes = require("./routes/platformRoutes");
 const usersRoutes = require("./routes/usersRoutes");
@@ -164,10 +169,13 @@ app.use(securityHeaders);
 /**
  * JSON PARSER
  */
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "25mb" }));
-app.use(express.urlencoded({ extended: true, limit: process.env.JSON_BODY_LIMIT || "25mb" }));
-app.use("/api", apiRateLimiter);
-app.use("/api", auditLogMiddleware);
+assembleApplicationBoundary(app, {
+  publicTrialRequestRoutes, authRoutes, apiRateLimiter, authRateLimiter, auditLogMiddleware,
+  platformAuthRoutes: createPlatformAuthRoutes({
+    login: platformLogin, authenticate: platformAuthMiddleware,
+    apiRateLimiter, authRateLimiter, auditLogMiddleware,
+  }),
+});
 
 /**
  * =========================================================
@@ -200,7 +208,6 @@ app.get("/", (req, res) => {
    AUTH & USER MANAGEMENT
 ========================================================= */
 
-app.use("/api/auth", authRateLimiter, authRoutes);
 app.use("/api/platform", platformRoutes);
 
 app.use("/api/subscription", subscriptionRoutes);

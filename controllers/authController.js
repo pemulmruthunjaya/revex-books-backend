@@ -17,6 +17,7 @@ const sendAuthFailure = (req, res, error, fallback) => {
   if (error instanceof SchemaReadinessError) {
     return res.status(error.status).json({ message: error.message, code: error.code });
   }
+  console.error("AUTH_FAILURE", { request_id: req.requestId || null });
   return res.status(500).json({ message: fallback, code: "INTERNAL_SERVER_ERROR", request_id: req.requestId || null });
 };
 const { sendPasswordReset } = require("../services/emailService");
@@ -25,6 +26,9 @@ const {
 } = require("../services/companyTrialProvisioningService");
 
 const RESET_TOKEN_MINUTES = 30;
+const RESET_TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const validNewPassword = (value) => typeof value === "string" && Array.from(value).length >= 8 && Buffer.byteLength(value, "utf8") <= 72;
+const validPresentedPassword = (value) => typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 72;
 const hashResetToken = (token) =>
   crypto.createHash("sha256").update(String(token)).digest("hex");
 
@@ -69,6 +73,9 @@ const resolveLoginContext = async (user) => {
  * OWNER REGISTER
  */
 exports.register = async (req, res) => {
+  if (process.env.NODE_ENV === "production") {
+    return res.status(404).json({ message: "Not found" });
+  }
   let connection;
   let transactionStarted = false;
   try {
@@ -76,7 +83,7 @@ exports.register = async (req, res) => {
     await ensureUserAccessColumns();
 
     const { company_name, name, email, password } = req.body;
-    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
     if (!company_name || !name || !normalizedEmail || !password) {
       return res.status(400).json({
@@ -84,7 +91,7 @@ exports.register = async (req, res) => {
       });
     }
 
-    if (String(password).length < 8) {
+    if (!validNewPassword(password)) {
       return res.status(400).json({
         message: "Password must be at least 8 characters"
       });
@@ -164,7 +171,6 @@ exports.register = async (req, res) => {
 
   } catch (error) {
     if (connection && transactionStarted) await connection.rollback();
-    console.error("Register error:", error);
     return sendAuthFailure(req, res, error, "Registration failed");
   } finally {
     if (connection) connection.release();
@@ -179,9 +185,9 @@ exports.login = async (req, res) => {
     await ensureUserAccessColumns();
 
     const { email, password } = req.body;
-    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
-    if (!normalizedEmail || !password) {
+    if (!normalizedEmail || !validPresentedPassword(password)) {
       return res.status(400).json({ message: "Email and password are required" });
     }
 
@@ -195,6 +201,9 @@ exports.login = async (req, res) => {
     }
 
     const user = users[0];
+    if (Number(user.is_active) !== 1 || Number(user.activation_required) === 1) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
@@ -209,7 +218,6 @@ exports.login = async (req, res) => {
     res.json(buildLoginResponse("Login successful", token, user, context));
 
   } catch (error) {
-    console.error("Login error:", error);
     return sendAuthFailure(req, res, error, "Login failed");
   }
 };
@@ -222,9 +230,9 @@ exports.staffLogin = async (req, res) => {
     await ensureUserAccessColumns();
 
     const { email, password } = req.body;
-    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
 
-    if (!normalizedEmail || !password) {
+    if (!normalizedEmail || !validPresentedPassword(password)) {
       return res.status(400).json({
         message: "Email and password are required"
       });
@@ -243,7 +251,7 @@ exports.staffLogin = async (req, res) => {
 
     const staff = users[0];
 
-    if (Number(staff.is_active) !== 1) {
+    if (Number(staff.is_active) !== 1 || Number(staff.activation_required) === 1) {
       return res.status(403).json({
         message: "This staff account is inactive"
       });
@@ -265,7 +273,6 @@ exports.staffLogin = async (req, res) => {
     res.json(buildLoginResponse("Staff login successful", token, staff, context));
 
   } catch (error) {
-    console.error("Staff login error:", error);
     return sendAuthFailure(req, res, error, "Staff login failed");
   }
 };
@@ -277,24 +284,24 @@ exports.forgotPassword = async (req, res) => {
 
   try {
     await ensureUserAccessColumns();
-    const normalizedEmail = String(req.body.email || "").trim().toLowerCase();
+    const normalizedEmail = typeof req.body.email === "string" ? req.body.email.trim().toLowerCase() : "";
 
     if (!normalizedEmail) {
       return res.status(400).json({ message: "Email is required" });
     }
 
     const [users] = await db.query(
-      `SELECT id, name, email, role, is_active
+      `SELECT id, name, email, role, is_active, activation_required
        FROM users WHERE email = ? LIMIT 1`,
       [normalizedEmail]
     );
 
-    if (!users.length || (users[0].role === "staff" && Number(users[0].is_active) !== 1)) {
+    if (!users.length || Number(users[0].is_active) !== 1 || Number(users[0].activation_required) === 1) {
       return res.json(genericResponse);
     }
 
     const user = users[0];
-    const token = crypto.randomBytes(32).toString("hex");
+    const token = crypto.randomBytes(32).toString("base64url");
     await db.query(
       `UPDATE users
        SET password_reset_token_hash = ?,
@@ -313,15 +320,13 @@ exports.forgotPassword = async (req, res) => {
       await db.query(
         `UPDATE users
          SET password_reset_token_hash = NULL, password_reset_expires_at = NULL
-         WHERE id = ?`,
-        [user.id]
+         WHERE id = ? AND password_reset_token_hash = ?`,
+        [user.id, hashResetToken(token)]
       );
-      console.error(`Password reset email unavailable for user ${user.id}: ${delivery.reason}`);
     }
 
     return res.json(genericResponse);
   } catch (error) {
-    console.error("Forgot password error:", error);
     if (error instanceof SchemaReadinessError) {
       return res.status(error.status).json({ ...genericResponse, code: error.code });
     }
@@ -330,54 +335,67 @@ exports.forgotPassword = async (req, res) => {
 };
 
 exports.resetPassword = async (req, res) => {
+  let connection;
   try {
     await ensureUserAccessColumns();
-    const token = String(req.body.token || "");
-    const password = String(req.body.password || "");
+    const { token, password } = req.body;
 
-    if (!token || password.length < 8) {
+    if (typeof token !== "string" || !RESET_TOKEN.test(token) || !validNewPassword(password)) {
       return res.status(400).json({
         message: "A valid reset token and password of at least 8 characters are required",
       });
     }
 
-    const [users] = await db.query(
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    const tokenHash = hashResetToken(token);
+    const [users] = await connection.query(
       `SELECT id FROM users
        WHERE password_reset_token_hash = ?
          AND password_reset_expires_at > NOW()
-       LIMIT 1`,
-      [hashResetToken(token)]
+         AND activation_required = 0
+         AND is_active = 1
+       LIMIT 1
+       FOR UPDATE`,
+      [tokenHash]
     );
 
     if (!users.length) {
+      await connection.rollback();
       return res.status(400).json({ message: "Reset link is invalid or has expired" });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    await db.query(
+    const [result] = await connection.query(
       `UPDATE users
        SET password = ?,
            must_change_password = 0,
            password_changed_at = NOW(),
            password_reset_token_hash = NULL,
            password_reset_expires_at = NULL
-       WHERE id = ? AND password_reset_token_hash = ?`,
-      [hashedPassword, users[0].id, hashResetToken(token)]
+       WHERE id = ? AND password_reset_token_hash = ? AND activation_required = 0`,
+      [hashedPassword, users[0].id, tokenHash]
     );
+    if (result.affectedRows !== 1) {
+      await connection.rollback();
+      return res.status(400).json({ message: "Reset link is invalid or has expired" });
+    }
+    await connection.commit();
 
     return res.json({ message: "Password reset successfully. You can now sign in." });
   } catch (error) {
-    console.error("Reset password error:", error);
+    if (connection) await connection.rollback().catch(() => {});
     return sendAuthFailure(req, res, error, "Password reset failed");
+  } finally {
+    if (connection) connection.release();
   }
 };
 
 exports.changePassword = async (req, res) => {
   try {
-    const currentPassword = String(req.body.current_password || "");
-    const newPassword = String(req.body.new_password || "");
+    const { current_password: currentPassword, new_password: newPassword } = req.body;
 
-    if (!currentPassword || newPassword.length < 8) {
+    if (!validPresentedPassword(currentPassword) || !validNewPassword(newPassword)) {
       return res.status(400).json({
         message: "Current password and a new password of at least 8 characters are required",
       });
@@ -407,7 +425,10 @@ exports.changePassword = async (req, res) => {
 
     return res.json({ message: "Password changed successfully" });
   } catch (error) {
-    console.error("Change password error:", error);
-    return res.status(500).json({ message: "Password change failed" });
+    return sendAuthFailure(req, res, error, "Password change failed");
   }
 };
+
+exports.RESET_TOKEN = RESET_TOKEN;
+exports.sendAuthFailure = sendAuthFailure;
+exports.validNewPassword = validNewPassword;

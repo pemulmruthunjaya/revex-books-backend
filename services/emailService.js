@@ -53,9 +53,26 @@ const sendPasswordReset = ({ name, email, token }) => {
   });
 };
 
+const sendTrialActivation = ({ name, email, token, trialExpiresAt }, options = {}) => {
+  const expiry = new Date(trialExpiresAt);
+  if (Number.isNaN(expiry.getTime())) {
+    const error = new Error("Trial invitation expiry is invalid");
+    error.code = "TRIAL_INVITATION_EXPIRY_INVALID";
+    throw error;
+  }
+  const activationUrl = `${appUrl(options.environment)}/activate-account#token=${token}`;
+  return sendMail({
+    to: email,
+    replyTo: "support@revexbooks.com",
+    subject: "Activate your RevEx Books Pro trial",
+    text: `Hello ${name},\n\nYour 14-day RevEx Books Pro trial is ready.\nUsername: ${email}\nTrial expires: ${expiry.toISOString()}\nSet your password: ${activationUrl}\n\nThis link can be used once and expires within 24 hours.`,
+  }, options);
+};
+
 module.exports = {
   appUrl,
   sendMail,
   sendStaffInvitation,
   sendPasswordReset,
+  sendTrialActivation,
 };

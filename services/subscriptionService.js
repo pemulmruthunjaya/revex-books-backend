@@ -339,6 +339,7 @@ const createTrialCompany = async ({
   trialDays,
   actor,
   idempotencyKey,
+  expectedPlanContract,
   connection: callerConnection,
 } = {}) => {
   const normalizedCompanyId = asPositiveInteger(companyId, "COMPANY_NOT_FOUND", "companyId");
@@ -352,6 +353,11 @@ const createTrialCompany = async ({
     const company = await lockCompany(connection, normalizedCompanyId);
     let subscription = await lockSubscription(connection, normalizedCompanyId);
     const plan = await lockPlan(connection, normalizedPlanId);
+    if (expectedPlanContract && (plan.code !== expectedPlanContract.code
+      || plan.name !== expectedPlanContract.name
+      || Number(plan.default_trial_days) !== Number(expectedPlanContract.defaultTrialDays))) {
+      throw serviceError("PLAN_CONTRACT_INVALID", "The requested plan contract is unavailable");
+    }
     const resolvedTrialDays = trialDays === null || trialDays === undefined || trialDays === ""
       ? Number(plan.default_trial_days)
       : Number(trialDays);

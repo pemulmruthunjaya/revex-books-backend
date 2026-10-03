@@ -5,6 +5,7 @@ const db = require("../db/connection");
 const { getJwtSecret } = require("../utils/jwtToken");
 const { getLaunchConfigurationIssues } = require("./launchReadinessService");
 const { assertTableColumns } = require("./schemaReadinessService");
+const { assertTrialInvitationReadiness } = require("./trialInvitationReadinessService");
 
 const backendRoot = path.resolve(__dirname, "..");
 
@@ -78,6 +79,15 @@ const checkTrialSchema = async () => {
   }
 };
 
+const checkTrialInvitationSchema = async () => {
+  try {
+    await assertTrialInvitationReadiness({ executor: db });
+    return { ok: true, required: true, message: "Trial request and activation schema is ready" };
+  } catch (error) {
+    return { ok: false, required: true, message: "Trial request and activation schema is not ready", code: error.code || "TR1B_SCHEMA_NOT_READY" };
+  }
+};
+
 const fileExists = (relativePath) =>
   fs.existsSync(path.join(backendRoot, relativePath));
 
@@ -98,6 +108,7 @@ const buildProductionReadinessReport = async () => {
     },
     database: await checkDatabase(),
     trialSchema: await checkTrialSchema(),
+    trialInvitationSchema: await checkTrialInvitationSchema(),
     jwtSecret: checkJwtSecret(),
     trialLaunchConfiguration: {
       ok: launchIssues.length === 0,

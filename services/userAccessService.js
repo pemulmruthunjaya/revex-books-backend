@@ -137,6 +137,8 @@ const USER_ACCESS_COLUMNS = Object.freeze([
   "password_reset_token_hash",
   "password_reset_expires_at",
   "password_changed_at",
+  "activation_required",
+  "activated_at",
 ]);
 
 const ensureUserAccessColumns = async () => {

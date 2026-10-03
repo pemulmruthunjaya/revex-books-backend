@@ -51,7 +51,7 @@ test("every mounted tenant ERP prefix is protected", () => {
   assert.deepEqual(protectedPrefixes, expectedTenantPrefixes);
   assert.equal(new Set(protectedPrefixes).size, protectedPrefixes.length);
 
-  const exemptMounts = new Set(["/api/auth", "/api/platform", "/api/subscription"]);
+  const exemptMounts = new Set(["/api/auth", "/api/platform", "/api/platform/trial-requests", "/api/public", "/api/subscription"]);
   const mountedTenantPrefixes = parseMountedApiPrefixes()
     .filter((prefix) => !exemptMounts.has(prefix));
   assert.deepEqual(
@@ -112,12 +112,15 @@ test("enabled branch mounts auth then subscription exactly once", () => {
   assert.deepEqual(mounts, [["authMiddleware", "requireValidSubscription"]]);
 });
 
-test("auth, health, and subscription status remain exempt", () => {
+test("auth, signed public intake, health, and subscription status remain exempt", () => {
   const protectedPrefixes = parseTenantPrefixes();
-  for (const prefix of ["/api/auth", "/health", "/api/health", "/api/subscription"]) {
+  for (const prefix of ["/api/auth", "/api/public", "/health", "/api/health", "/api/subscription"]) {
     assert.equal(protectedPrefixes.includes(prefix), false, `${prefix} must remain exempt`);
   }
-  assert.match(indexSource, /app\.use\("\/api\/auth", authRateLimiter, authRoutes\)/);
+  const assembly = fs.readFileSync(path.join(root, "middleware", "applicationAssembly.js"), "utf8");
+  assert.match(indexSource, /assembleApplicationBoundary\(app/);
+  assert.match(assembly, /app\.use\("\/api\/auth", boundedAuthJson, boundedAuthJsonError, apiRateLimiter, auditLogMiddleware, authRateLimiter, authRoutes\)/);
+  assert.match(assembly, /app\.use\("\/api\/public", publicTrialRequestRoutes\)/);
   assert.match(indexSource, /app\.get\("\/health", livenessCheckHandler\)/);
   assert.match(indexSource, /app\.get\("\/api\/health", readinessCheckHandler\)/);
   assert.match(

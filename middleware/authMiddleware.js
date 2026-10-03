@@ -29,7 +29,7 @@ module.exports = async (req, res, next) => {
 
     const [users] = await db.query(
       `SELECT id, name, email, role, access_role, permissions, is_active, company_id,
-              must_change_password, password_changed_at
+              must_change_password, password_changed_at, activation_required
        FROM users
        WHERE id = ?
        LIMIT 1`,
@@ -52,8 +52,8 @@ module.exports = async (req, res, next) => {
       });
     }
 
-    if (user.role === "staff" && Number(user.is_active) !== 1) {
-      return res.status(403).json({ message: "This staff account is inactive" });
+    if (Number(user.is_active) !== 1 || Number(user.activation_required) === 1) {
+      return res.status(403).json({ message: "This account is unavailable", code: "ACCOUNT_UNAVAILABLE" });
     }
 
     req.user = {
@@ -89,9 +89,7 @@ module.exports = async (req, res, next) => {
       return res.status(401).json({ message: "Session expired. Please login again." });
     }
 
-    if (error.name !== "JsonWebTokenError") {
-      console.error("AUTH ERROR:", error.message);
-    }
+    if (error.name !== "JsonWebTokenError") console.error("AUTH_MIDDLEWARE_FAILURE", { request_id: req.requestId || null });
 
     return res.status(401).json({ message: "Unauthorized" });
   }
