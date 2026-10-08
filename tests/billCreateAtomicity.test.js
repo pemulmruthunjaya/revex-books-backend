@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const db = require("../db/connection");
+const { operationalEvidence } = require("./helpers/inventoryValuationFixture");
 
 const request = (body = {}) => ({
   user: { company_id: 4, user_id: 13 },
@@ -21,7 +22,7 @@ const response = () => ({
   json(body) { this.body = body; return this; },
 });
 
-const connectionFor = (failure = null) => {
+const connectionFor = (failure = null, fixture = null) => {
   const events = [];
   const connection = {
     events,
@@ -45,6 +46,8 @@ const connectionFor = (failure = null) => {
         if (failure === "stock") throw new Error("forced stock failure");
         return [{ affectedRows: 1 }];
       }
+      if (sql.startsWith("SELECT bi.id,bi.product_id")) return [[{ id: 91, product_id: 9, quantity: "2.00", price: "100.00", total: "236.00", source_grn_item_id: null }]];
+      if (fixture) return fixture.query(sql, params);
       throw new Error(`Unexpected transaction query: ${sql}`);
     },
   };
@@ -67,10 +70,11 @@ test("normal Bill creation is FY-aware and atomic across header, item, and stock
   const { createBill } = require("../controllers/billController");
   try {
     for (const failure of ["fy", "item", "stock", null]) {
-      const connection = connectionFor(failure);
+      const setup = await operationalEvidence();
+      const connection = connectionFor(failure, setup.cx);
       db.getConnection = async () => connection;
       const res = response();
-      await createBill(request(), res);
+      await createBill(request({ valuation_lines: [setup.valuation] }), res);
       const sqlCalls = connection.events.filter((event) => typeof event === "object");
       const headers = sqlCalls.filter(({ sql }) => sql.includes("INSERT INTO bills"));
       const itemWrites = sqlCalls.filter(({ sql }) => sql.includes("INSERT INTO bill_items"));
@@ -80,13 +84,13 @@ test("normal Bill creation is FY-aware and atomic across header, item, and stock
         assert.equal(connection.events.includes("commit"), false);
         if (failure === "fy") assert.equal(headers.length, 0);
       } else {
-        assert.equal(res.statusCode, 201);
+        assert.equal(res.statusCode, 201, JSON.stringify(res.body));
         assert.equal(headers.length, 1);
         assert.equal(itemWrites.length, 1);
         assert.equal(stockWrites.length, 1);
         assert.equal(connection.events.filter((event) => event === "commit").length, 1);
         assert.equal(headers[0].params[7], 2026);
-        assert.equal(headers[0].params[4], 236);
+        assert.equal(headers[0].params[4], "236.00");
       }
       assert.equal(connection.events.at(-1), "release");
     }

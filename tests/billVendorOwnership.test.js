@@ -6,7 +6,9 @@ const test = require("node:test");
 const fs = require("node:fs");
 const path = require("node:path");
 const db = require("../db/connection");
+const { operationalEvidence } = require("./helpers/inventoryValuationFixture");
 test("valid GRN bill preserves inherited vendor, FY, item linkage and no duplicate stock posting", async () => {
+  const setup = await operationalEvidence({ type: "GRN", document: "31", line: "41", receiptQuantity: "3" });
   const old={query:db.query,get:db.getConnection};
   const calls=[];
   db.query=async sql=>{
@@ -28,17 +30,19 @@ test("valid GRN bill preserves inherited vendor, FY, item linkage and no duplica
       if(sql.includes("billed_quantity"))return [[]];
       if(sql.includes("INSERT INTO bills"))return [{insertId:81}];
       if(sql.includes("INSERT INTO bill_items"))return [{insertId:91}];
-      throw Error("Unexpected query: "+sql);
+      if(sql.startsWith("SELECT bi.id,bi.product_id"))return [[{id:91,product_id:9,quantity:"2.00",price:"100.00",total:"236.00",source_grn_item_id:41}]];
+      return setup.cx.query(sql,params);
     }
   });
   delete require.cache[require.resolve("../controllers/billController")];
   try {
     const request=req(7);request.body.source_grn_id=31;request.body.items[0].source_grn_item_id=41;
+    request.body.valuation_lines=[setup.valuation];
     const res=response();
     await require("../controllers/billController").createBillFromGrn(request,res);
     assert.equal(res.statusCode,201);
     const header=calls.find(x=>x.sql?.includes("INSERT INTO bills"));
-    assert.deepEqual(header.params,[7,"TEST","2026-08-12",null,236,4,2026,21,31]);
+    assert.deepEqual(header.params,[7,"TEST","2026-08-12",null,"236.00",4,2026,21,31]);
     assert.match(header.sql,/0\)$/);
     assert.ok(!calls.some(x=>/UPDATE products|INSERT INTO inventory|INSERT INTO journal|INSERT INTO ledger/.test(x.sql||"")));
     assert.ok(calls.some(x=>x.event==="commit"));
@@ -50,13 +54,14 @@ const req = vendor => ({ user:{company_id:4,user_id:13}, params:{id:81}, body:{
   items:[{product_id:9,name:"Item",qty:2,price:100,mrp:120,gst:18}]
 }});
 async function exercise(method, vendor, disappears=false, billDate="2026-08-12", allowVendor=false) {
+  const setup = await operationalEvidence({ correction: method === "updateBill" });
   const calls=[]; let lookups=0;
   const old={query:db.query,get:db.getConnection,error:console.error};
   db.query=async sql=>{
     calls.push({sql,pool:true});
     if(sql.includes("SHOW COLUMNS FROM products")) return [[{Field:"mrp"},{Field:"purchase_price"},{Field:"gst"}]];
     if(sql.includes("SHOW COLUMNS FROM bill_items")) return [[{Field:"mrp"}]];
-    if(sql.includes("ALTER TABLE bills MODIFY status")) return [{affectedRows:0}];
+    if(sql.includes("SHOW COLUMNS FROM bills")) return [[{Field:"status",Type:"varchar(30)",Null:"NO",Default:"Unpaid"}]];
     throw Error("Unexpected pool query: "+sql);
   };
   const c={
@@ -77,13 +82,17 @@ async function exercise(method, vendor, disappears=false, billDate="2026-08-12",
       if(sql.includes("SELECT bi.product_id"))return [[{product_id:9,quantity:1}]];
       if(sql.includes("SELECT id, name FROM products"))return [[{id:9,name:"Item"}]];
       if(sql.includes("AS paid_amount"))return [[{paid_amount:0}]];
+      if(sql.startsWith("SELECT bi.id,bi.product_id"))return [[{id:81,product_id:9,quantity:"2.00",price:"100.00",total:"236.00",source_grn_item_id:null}]];
+      if(sql.startsWith("SELECT bi.id"))return [[{id:90}]];
+      if(sql.includes("FROM invoice_items")||sql.includes("FROM return_items")||sql.includes("FROM delivery_challan_items")||sql.includes("FROM inventory_transactions"))return [[]];
+      if(sql.includes("iv_")||sql.includes("information_schema")||sql==="DO 0"||sql.includes("FROM companies")||sql.includes("FROM users")||sql.startsWith("SELECT id FROM products")||sql.startsWith("SELECT CAST(stock AS CHAR)")||sql.startsWith("UPDATE products SET stock=stock+?"))return setup.cx.query(sql,params);
       if(/^\s*(INSERT|UPDATE|DELETE)\b/.test(sql))return [{insertId:81,affectedRows:1}];
       throw Error("Unexpected transaction query: "+sql);
     }
   };
   db.getConnection=async()=>c; console.error=()=>{};
   delete require.cache[require.resolve("../controllers/billController")];
-  try {const res=response();const request=req(vendor);request.body.bill_date=billDate;await require("../controllers/billController")[method](request,res);return {calls,res};}
+  try {const res=response();const request=req(vendor);request.body.bill_date=billDate;request.body.valuation_lines=[setup.valuation];await require("../controllers/billController")[method](request,res);return {calls,res};}
   finally {db.query=old.query;db.getConnection=old.get;console.error=old.error;}
 }
 for(const method of ["createBill","updateBill"]) {
@@ -113,7 +122,7 @@ for(const method of ["createBill","updateBill"]) {
   }
   test(method+": same-company vendor preserves successful bill/item/stock transaction",async()=>{
     const {calls,res}=await exercise(method,7);
-    assert.equal(res.statusCode,method==="createBill"?201:200);
+    assert.equal(res.statusCode,method==="createBill"?201:200,JSON.stringify(res.body));
     assert.equal(res.body.message,method==="createBill"?"Bill created & stock increased ✅":"Bill updated");
     const checks=calls.filter(x=>x.sql?.includes("FROM vendors"));
     assert.equal(checks.length,2);assert.match(checks[1].sql,/FOR SHARE$/);
@@ -123,7 +132,7 @@ for(const method of ["createBill","updateBill"]) {
     assert.ok(calls.some(x=>x.sql?.includes("INSERT INTO bill_items")));
     assert.ok(calls.some(x=>x.sql?.includes("UPDATE products")));
     const header=calls.find(x=>method==="createBill"?x.sql?.includes("INSERT INTO bills"):x.sql?.includes("SET vendor_id"));
-    assert.equal(header.params[4],236);
+    assert.equal(header.params[4],"236.00");
     assert.ok(header.params.includes(2026));
     assert.ok(calls.some(x=>x.event==="commit"));
     assert.equal(calls.at(-1).event,"release");

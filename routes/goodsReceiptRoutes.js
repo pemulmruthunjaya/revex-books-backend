@@ -1,4 +1,5 @@
 const router = require("express").Router();
+router.use("/valuation", require("./inventoryValuationRoutes"));
 const controller = require("../controllers/goodsReceiptController");
 router.get("/next-number", controller.nextNumber);
 router.get("/billable", controller.listBillable);

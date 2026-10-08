@@ -3,6 +3,9 @@ const {
   ensureVendorPaymentSchema,
 } = require("../services/vendorPaymentService");
 const { accountingDate, requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("../services/financialYearService");
+const inventoryValuation = require("../services/inventoryValuationPostingService");
+const valuationMath = require("../services/inventoryValuationMath");
+const valuationOperations = require("../services/inventoryValuationOperationService");
 
 let billStatusColumnReady = false;
 let billMrpColumnsReady = false;
@@ -22,9 +25,8 @@ const ensureBillStatusColumn = async () => {
     return;
   }
 
-  await db.query(
-    "ALTER TABLE bills MODIFY status VARCHAR(30) NOT NULL DEFAULT 'Unpaid'",
-  );
+  const [columns] = await db.query("SHOW COLUMNS FROM bills LIKE 'status'");
+  if (columns.length !== 1 || String(columns[0].Type).toLowerCase() !== "varchar(30)" || columns[0].Null !== "NO" || columns[0].Default !== "Unpaid") valuationMath.fail("IV_BILL_SCHEMA_NOT_READY");
 
   billStatusColumnReady = true;
 };
@@ -40,30 +42,22 @@ const ensureBillMrpColumns = async () => {
   );
 
   if (!productColumnNames.has("mrp")) {
-    await db.query(
-      "ALTER TABLE products ADD COLUMN mrp DECIMAL(10,2) NOT NULL DEFAULT 0",
-    );
+    valuationMath.fail("IV_BILL_SCHEMA_NOT_READY");
   }
 
   if (!productColumnNames.has("purchase_price")) {
-    await db.query(
-      "ALTER TABLE products ADD COLUMN purchase_price DECIMAL(10,2) NOT NULL DEFAULT 0",
-    );
+    valuationMath.fail("IV_BILL_SCHEMA_NOT_READY");
   }
 
   if (!productColumnNames.has("gst")) {
-    await db.query(
-      "ALTER TABLE products ADD COLUMN gst DECIMAL(5,2) NOT NULL DEFAULT 18",
-    );
+    valuationMath.fail("IV_BILL_SCHEMA_NOT_READY");
   }
 
   const [billItemColumns] = await db.query(
     "SHOW COLUMNS FROM bill_items LIKE 'mrp'",
   );
   if (!billItemColumns.length) {
-    await db.query(
-      "ALTER TABLE bill_items ADD COLUMN mrp DECIMAL(10,2) NOT NULL DEFAULT 0",
-    );
+    valuationMath.fail("IV_BILL_SCHEMA_NOT_READY");
   }
 
   billMrpColumnsReady = true;
@@ -82,6 +76,7 @@ exports.createBill = async (req, res) => {
 
     const { vendor_id, bill_number, bill_date, due_date, items } = req.body;
     const company_id = req.user.company_id;
+    for (const item of items || []) valuationMath.operationalQuantity(item.qty ?? item.quantity ?? "0");
 
     if (!vendor_id || !bill_number || !bill_date || !items?.length) {
       return res.status(400).json({
@@ -93,41 +88,33 @@ exports.createBill = async (req, res) => {
     // Apply the existing posting-date contract before legacy schema helpers can write.
     accountingDate(bill_date, "businessDate");
     await ensureBillMrpColumns();
-    let total_amount = 0;
+    let totalMinor = 0n;
 
     const processedItems = [];
 
     /* ================= PROCESS ITEMS ================= */
     for (let item of items) {
-      const qty = Number(item.qty || 0);
-      const price = Number(item.price || 0);
-      const mrp = Number(item.mrp || 0);
-      const gst = Number(item.gst || 0);
-
-      const base = qty * price;
-      const gstAmount = (base * gst) / 100;
-      const total = base + gstAmount;
-
-      total_amount += total;
+      const amounts = valuationMath.billAmounts(item.qty ?? item.quantity ?? "0", item.price ?? "0", item.gst ?? "0");
+      const mrp = valuationMath.moneyDecimal(valuationMath.money(item.mrp ?? "0"));
+      totalMinor += valuationMath.money(amounts.total);
 
       processedItems.push({
         product_id: item.product_id,
         name: item.name,
-        quantity: qty,
-        price,
+        ...amounts,
         mrp,
-        gst,
-        total,
-        cgst: gstAmount / 2,
-        sgst: gstAmount / 2,
       });
     }
+    const total_amount = valuationMath.moneyDecimal(totalMinor);
 
     await connection.beginTransaction();
     transactionStarted = true;
     // Revalidate and hold ownership stable through the bill transaction.
     await requireBillVendor(connection, vendor_id, company_id, true);
+    const retry = await valuationOperations.beginRequest(connection, req, "bill-create");
+    if (retry) { await connection.commit(); transactionStarted = false; return res.status(retry.status).json(retry.body); }
     const financialYear = await requireFinancialYearForPosting(company_id, bill_date, connection);
+    await inventoryValuation.preflightBill(connection, req, processedItems, bill_date);
 
     /* ================= INSERT BILL ================= */
     const [billResult] = await connection.query(
@@ -151,7 +138,7 @@ exports.createBill = async (req, res) => {
     /* ================= INSERT ITEMS + UPDATE STOCK ================= */
     for (let item of processedItems) {
       const productId = Number(item.product_id);
-      const qty = Number(item.quantity);
+      const qty = item.quantity;
 
       if (!productId || !qty) {
         continue;
@@ -188,6 +175,8 @@ exports.createBill = async (req, res) => {
       );
     }
 
+    await inventoryValuation.finalizeBill(connection, req, bill_id, bill_date);
+    await valuationOperations.completeRequest(connection, req, 201, { message: "Bill created & stock increased ✅", bill_id });
     await connection.commit();
     transactionStarted = false;
 
@@ -342,6 +331,7 @@ exports.getBillById = async (req, res) => {
 exports.createBillFromGrn = async (req, res) => {
   const connection = await db.getConnection();
   try {
+    for (const item of req.body.items || []) valuationMath.operationalQuantity(item.qty ?? item.quantity ?? "0");
     await ensureBillMrpColumns();
     rejectClientFinancialYear(req.body);
     const companyId = req.user.company_id;
@@ -368,6 +358,8 @@ exports.createBillFromGrn = async (req, res) => {
         });
     }
     await connection.beginTransaction();
+    const retry = await valuationOperations.beginRequest(connection, req, "bill-from-grn");
+    if (retry) { await connection.commit(); return res.status(retry.status).json(retry.body); }
     const financialYear = await requireFinancialYearForPosting(companyId, bill_date, connection);
     const branchFilter = branchId ? " AND gr.branch_id=?" : "";
     const grnParams = [source_grn_id, companyId];
@@ -402,10 +394,10 @@ exports.createBillFromGrn = async (req, res) => {
     const billed = new Map(
       billedRows.map((row) => [
         Number(row.source_grn_item_id),
-        Number(row.billed_quantity),
+        valuationMath.operationalQuantity(String(row.billed_quantity)).q2,
       ]),
     );
-    let totalAmount = 0;
+    let totalMinor = 0n;
     const processed = [];
     for (const input of items) {
       const source = sourceItems.find(
@@ -416,48 +408,36 @@ exports.createBillFromGrn = async (req, res) => {
           new Error("A bill item does not belong to the selected GRN"),
           { status: 400 },
         );
-      const quantity = Number(input.qty ?? input.quantity ?? 0);
-      const remaining =
-        Number(source.accepted_qty) - (billed.get(Number(source.id)) || 0);
-      if (quantity <= 0)
+      const parsed = valuationMath.operationalQuantity(input.qty ?? input.quantity ?? "0");
+      const quantity = parsed.sql;
+      const remaining = valuationMath.operationalQuantity(String(source.accepted_qty)).q2 - (billed.get(Number(source.id)) || 0n);
+      if (parsed.q2 <= 0n)
         throw Object.assign(
           new Error(
             `Bill quantity must be greater than zero for ${source.product_name}`,
           ),
           { status: 400 },
         );
-      if (quantity > remaining + 0.000001)
+      if (parsed.q2 > remaining)
         throw Object.assign(
           new Error(
             `Bill quantity exceeds remaining billable quantity (${remaining}) for ${source.product_name}`,
           ),
           { status: 400 },
         );
-      const price = Number(input.price || 0),
-        mrp = Number(input.mrp || 0),
-        gst = Number(input.gst ?? input.gst_percent ?? 0);
-      if (price < 0 || mrp < 0 || gst < 0)
-        throw Object.assign(
-          new Error(`Invalid rate or tax for ${source.product_name}`),
-          { status: 400 },
-        );
-      const taxable = quantity * price,
-        gstAmount = (taxable * gst) / 100,
-        total = taxable + gstAmount;
-      totalAmount += total;
+      const amounts = valuationMath.billAmounts(quantity, input.price ?? "0", input.gst ?? input.gst_percent ?? "0");
+      const mrp = valuationMath.moneyDecimal(valuationMath.money(input.mrp ?? "0"));
+      totalMinor += valuationMath.money(amounts.total);
       processed.push({
         source_grn_item_id: source.id,
         product_id: source.product_id,
         name: source.product_name,
-        quantity,
-        price,
+        ...amounts,
         mrp,
-        gst,
-        total,
-        cgst: gstAmount / 2,
-        sgst: gstAmount / 2,
       });
     }
+    const totalAmount = valuationMath.moneyDecimal(totalMinor);
+    await inventoryValuation.preflightBill(connection, req, processed, bill_date);
     const [billResult] = await connection.query(
       `INSERT INTO bills (vendor_id,bill_number,bill_date,due_date,total_amount,status,company_id,financial_year_id,source_purchase_order_id,source_grn_id,stock_posted)
        VALUES (?,?,?,?,?,'Unpaid',?,?,?,?,0)`,
@@ -492,6 +472,8 @@ exports.createBillFromGrn = async (req, res) => {
         ],
       );
     }
+    await inventoryValuation.finalizeBill(connection, req, billResult.insertId, bill_date);
+    await valuationOperations.completeRequest(connection, req, 201, { message: `Bill created from ${grn.grn_number} without changing stock`, bill_id: billResult.insertId });
     await connection.commit();
     res
       .status(201)
@@ -535,6 +517,7 @@ exports.updateBill = async (req, res) => {
     const { id } = req.params;
     const company_id = req.user.company_id;
     const { vendor_id, bill_number, bill_date, due_date, items } = req.body;
+    for (const item of items || []) valuationMath.operationalQuantity(item.qty ?? item.quantity ?? "0");
 
     if (!vendor_id || !bill_number || !bill_date || !items?.length) {
       return res.status(400).json({ message: "Missing required fields" });
@@ -544,9 +527,11 @@ exports.updateBill = async (req, res) => {
     // Keep vendor rejection first, with an independent pure guard before any DDL.
     accountingDate(bill_date, "businessDate");
     await ensureBillMrpColumns();
-    await ensureBillStatusColumn();
     await connection.beginTransaction();
     await requireBillVendor(connection, vendor_id, company_id, true);
+    const retry = await valuationOperations.beginRequest(connection, req, "bill-edit", id);
+    if (retry) { await connection.commit(); return res.status(retry.status).json(retry.body); }
+    await ensureBillStatusColumn();
     const [billRows] = await connection.query(
       "SELECT id, status, stock_posted, source_grn_id, financial_year_id FROM bills WHERE id = ? AND company_id = ? FOR UPDATE",
       [id, company_id],
@@ -594,29 +579,21 @@ exports.updateBill = async (req, res) => {
       grnItemLimits = new Map(limits.map((row) => [Number(row.id), row]));
     }
 
-    for (const item of Number(billRows[0].stock_posted) === 1 ? oldItems : []) {
-      const quantity = Number(item.quantity || 0);
+    const draftBill = billRows[0].status === "Draft" && Number(billRows[0].stock_posted) === 0 && !billRows[0].source_grn_id;
+    await inventoryValuation.guardBillEdit(connection, req, id, items, draftBill);
+    // The valuation adapter permits cost-only revisions with an unchanged
+    // product/quantity/source set. Do not reverse/re-add stock: the legacy
+    // GREATEST subtraction would manufacture stock after partial consumption.
 
-      if (item.product_id && quantity > 0) {
-        await connection.query(
-          `UPDATE products
-           SET stock = GREATEST(stock - ?, 0)
-           WHERE id = ? AND company_id = ?`,
-          [quantity, item.product_id, company_id],
-        );
-      }
-    }
-
-    let total_amount = 0;
+    let totalMinor = 0n;
     const processedItems = [];
 
     for (const item of items) {
       const productName = String(item.product_name || item.name || "").trim();
       const productId = Number(item.product_id || 0);
-      const qty = Number(item.quantity || item.qty || 0);
-      const price = Number(item.price || 0);
-      const mrp = Number(item.mrp || 0);
-      const gst = Number(item.gst_percent || item.gst || 0);
+      const qty = valuationMath.operationalQuantity(item.quantity ?? item.qty ?? "0").sql;
+      const amounts = valuationMath.billAmounts(qty, item.price ?? "0", item.gst_percent ?? item.gst ?? "0");
+      const mrp = valuationMath.moneyDecimal(valuationMath.money(item.mrp ?? "0"));
       const sourceGrnItemId = Number(item.source_grn_item_id || 0);
 
       if ((!productId && !productName) || qty <= 0) {
@@ -627,13 +604,11 @@ exports.updateBill = async (req, res) => {
       }
       if (grnItemLimits) {
         const limit = grnItemLimits.get(sourceGrnItemId);
-        const allowed =
-          Number(limit?.accepted_qty || 0) -
-          Number(limit?.other_billed_quantity || 0);
+        const allowed = valuationMath.operationalQuantity(limit?.accepted_qty ?? "0").q2 - valuationMath.operationalQuantity(limit?.other_billed_quantity ?? "0").q2;
         if (
           !limit ||
           Number(limit.product_id) !== productId ||
-          qty > allowed + 0.000001
+          valuationMath.operationalQuantity(qty).q2 > allowed
         ) {
           await connection.rollback();
           return res
@@ -660,24 +635,16 @@ exports.updateBill = async (req, res) => {
         });
       }
 
-      const base = qty * price;
-      const gstAmount = (base * gst) / 100;
-      const total = base + gstAmount;
-
-      total_amount += total;
+      totalMinor += valuationMath.money(amounts.total);
       processedItems.push({
         product_id: productRows[0].id,
         name: productRows[0].name,
-        quantity: qty,
-        price,
+        ...amounts,
         mrp,
-        gst,
-        total,
-        cgst: gstAmount / 2,
-        sgst: gstAmount / 2,
         source_grn_item_id: sourceGrnItemId || null,
       });
     }
+    const total_amount = valuationMath.moneyDecimal(totalMinor);
 
     const [paymentRows] = await connection.query(
       `SELECT COALESCE(SUM(amount), 0) AS paid_amount
@@ -697,13 +664,14 @@ exports.updateBill = async (req, res) => {
       });
     }
 
-    const status =
+    const status = draftBill ? "Draft" :
       paidAmount >= total_amount && total_amount > 0
         ? "Paid"
         : paidAmount > 0
           ? "Partial Paid"
           : "Unpaid";
 
+    if (!draftBill) await inventoryValuation.preflightBill(connection, req, processedItems, bill_date, id);
     await connection.query(
       `UPDATE bills
        SET vendor_id = ?, bill_number = ?, bill_date = ?, due_date = ?, total_amount = ?, status = ?, financial_year_id = ?
@@ -745,9 +713,8 @@ exports.updateBill = async (req, res) => {
 
       if (Number(billRows[0].stock_posted) === 1) {
         await connection.query(
-          "UPDATE products SET stock = stock + ?, mrp = ?, purchase_price = ?, gst = ? WHERE id = ? AND company_id = ?",
+          "UPDATE products SET mrp = ?, purchase_price = ?, gst = ? WHERE id = ? AND company_id = ?",
           [
-            item.quantity,
             item.mrp,
             item.price,
             item.gst,
@@ -758,6 +725,8 @@ exports.updateBill = async (req, res) => {
       }
     }
 
+    if (!draftBill) await inventoryValuation.finalizeBill(connection, req, id, bill_date, true);
+    await valuationOperations.completeRequest(connection, req, 200, { message: "Bill updated", status });
     await connection.commit();
     res.json({ message: "Bill updated", status });
   } catch (error) {
@@ -803,21 +772,24 @@ exports.deleteBill = async (req, res) => {
       return res.status(404).json({ message: "Bill not found" });
     }
     await requireFinancialYearForMutation(company_id, bill[0].financial_year_id, connection);
+    await inventoryValuation.guardBillDelete(connection, req, id);
 
     const [items] = await connection.query(
       "SELECT product_id, quantity FROM bill_items WHERE bill_id = ? AND company_id = ?",
       [id, company_id],
     );
 
+    // Validate the entire persisted set before the first stock write.
+    for (const item of items) valuationMath.operationalQuantity(item.quantity);
     for (const item of Number(bill[0].stock_posted) === 1 ? items : []) {
-      const quantity = Number(item.quantity || 0);
+      const quantity = valuationMath.operationalQuantity(item.quantity);
 
-      if (item.product_id && quantity > 0) {
+      if (item.product_id && quantity.q2 > 0n) {
         await connection.query(
           `UPDATE products
            SET stock = GREATEST(stock - ?, 0)
            WHERE id = ? AND company_id = ?`,
-          [quantity, item.product_id, company_id],
+          [quantity.sql, item.product_id, company_id],
         );
       }
     }

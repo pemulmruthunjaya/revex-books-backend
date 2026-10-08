@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+router.use("/valuation", require("./inventoryValuationRoutes"));
 
 const authMiddleware = require("../middleware/authMiddleware");
 

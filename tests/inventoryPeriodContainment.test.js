@@ -75,9 +75,12 @@ const res = () => ({
 });
 
 test("OPEN GRN posting preserves one stock movement, inventory row, Posted state, and PO refresh", async () => {
+  const { operationalEvidence } = require("./helpers/inventoryValuationFixture");
+  const setup = await operationalEvidence({ company: "8", product: "9", actor: "18", owner: "19", type: "GRN", document: "31", line: "71", date: "2027-03-31", quantity: "2", post: true, tax: "0" });
   const harness = loadWithFakes(grnPath, {
     ...defaults,
-    query: async (sql) => {
+    query: async (sql, params) => {
+      if (sql.includes("iv_") || sql.includes("information_schema") || sql === "DO 0" || sql.includes("FROM companies") || sql.includes("FROM users") || sql.startsWith("SELECT id FROM products") || sql.startsWith("SELECT CAST(stock AS CHAR)") || sql.includes("FROM financial_years")) return setup.cx.query(sql, params);
       if (sql.includes("FROM goods_receipts") && sql.includes("FOR UPDATE")) {
         return [[{
           id: 31, company_id: 8, branch_id: 2, purchase_order_id: 21,
@@ -94,12 +97,12 @@ test("OPEN GRN posting preserves one stock movement, inventory row, Posted state
         }]];
       }
       if (sql.includes("FROM goods_receipt_items")) {
-        return [[{ purchase_order_item_id: 61, product_id: 9, accepted_qty: 2 }]];
+        return [[{ id: 71, purchase_order_item_id: 61, product_id: 9, accepted_qty: 2 }]];
       }
       return [{ affectedRows: 1, insertId: 71 }];
     },
   });
-  await harness.controller._private.postReceipt(harness.connection, req(), 31);
+  await harness.controller._private.postReceipt(harness.connection, req({ valuation_lines: [setup.valuation] }), 31);
   assert.equal(harness.calls.filter(([sql]) => String(sql).includes("INSERT INTO inventory_transactions")).length, 1);
   assert.equal(harness.calls.filter(([sql]) => String(sql).includes("UPDATE products SET stock=stock+?")).length, 1);
   assert.equal(harness.calls.filter(([sql]) => String(sql).includes("SET status='Posted'")).length, 1);
@@ -144,9 +147,9 @@ for (const code of [
   });
 }
 
-test("GRN draft creation stays non-financial while both posting paths share guarded postReceipt", () => {
+test("GRN draft creation stays non-financial and explicit posting uses guarded postReceipt", () => {
   const source = fs.readFileSync(grnPath, "utf8");
-  assert.match(source, /if \(status === "Posted"\)\s+await postReceipt\(connection, req, result\.insertId\)/);
+  assert.match(source, /if \(status !== "Draft"\) valuationMath.fail\("IV_DRAFT_THEN_APPROVAL_REQUIRED"\)/);
   assert.match(source, /exports\.post[\s\S]*await postReceipt\(connection, req, req\.params\.id\)/);
   assert.match(source, /postReceipt[\s\S]*requireFinancialYearForPosting\(companyId, receipt\.grn_date, connection\)/);
   assert.match(source, /Only draft GRNs can be deleted/);

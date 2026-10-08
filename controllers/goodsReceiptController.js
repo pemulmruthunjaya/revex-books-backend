@@ -1,5 +1,8 @@
 const db = require("../db/connection");
 const { requireFinancialYearForPosting, rejectClientFinancialYear } = require("../services/financialYearService");
+const inventoryValuation = require("../services/inventoryValuationPostingService");
+const valuationMath = require("../services/inventoryValuationMath");
+const valuationOperations = require("../services/inventoryValuationOperationService");
 
 const userId = (req) => req.user.user_id || req.user.id || null;
 const fail = (message, status = 400) =>
@@ -37,17 +40,17 @@ async function loadPoForReceipt(connection, companyId, poId, lock = false) {
 async function refreshPoStatus(connection, companyId, poId) {
   const { items } = await loadPoForReceipt(connection, companyId, poId);
   const received = items.reduce(
-    (sum, item) => sum + Number(item.received_qty || 0),
-    0,
+    (sum, item) => sum + valuationMath.operationalQuantity(item.received_qty ?? "0").q2,
+    0n,
   );
   const ordered = items.reduce(
-    (sum, item) => sum + Number(item.quantity || 0),
-    0,
+    (sum, item) => sum + valuationMath.operationalQuantity(item.quantity ?? "0").q2,
+    0n,
   );
   const status =
     received <= 0
       ? "Sent"
-      : received + 0.000001 >= ordered
+      : received >= ordered
         ? "Fully Received"
         : "Partially Received";
   await connection.query(
@@ -60,7 +63,7 @@ async function refreshPoStatus(connection, companyId, poId) {
 async function postReceipt(connection, req, receiptId) {
   const companyId = req.user.company_id;
   const [receipts] = await connection.query(
-    "SELECT * FROM goods_receipts WHERE id=? AND company_id=? FOR UPDATE",
+    "SELECT *,DATE_FORMAT(grn_date,'%Y-%m-%d') grn_date FROM goods_receipts WHERE id=? AND company_id=? FOR UPDATE",
     [receiptId, companyId],
   );
   if (!receipts.length) throw fail("GRN not found", 404);
@@ -85,18 +88,21 @@ async function postReceipt(connection, req, receiptId) {
       (entry) => Number(entry.id) === Number(item.purchase_order_item_id),
     );
     if (!poItem) throw fail("GRN item does not belong to this purchase order");
-    if (Number(item.accepted_qty) > Number(poItem.pending_qty) + 0.000001)
+    const accepted = valuationMath.operationalQuantity(item.accepted_qty);
+    if (accepted.q2 > valuationMath.operationalQuantity(poItem.pending_qty).q2)
       throw fail(
         `Accepted quantity exceeds pending quantity for ${poItem.product_name}`,
       );
     quantitiesByProduct.set(
       Number(item.product_id),
-      (quantitiesByProduct.get(Number(item.product_id)) || 0) +
-        Number(item.accepted_qty),
+      (quantitiesByProduct.get(Number(item.product_id)) || 0n) + accepted.q6,
     );
   }
+  for (const quantity of quantitiesByProduct.values()) valuationMath.operationalQuantity(valuationMath.decimal(quantity));
+  await inventoryValuation.postGrn(connection, req, receipt, items);
   for (const [productId, acceptedQty] of quantitiesByProduct) {
-    if (acceptedQty <= 0) continue;
+    if (acceptedQty <= 0n) continue;
+    const operational = valuationMath.operationalQuantity(valuationMath.decimal(acceptedQty)).sql;
     const [movement] = await connection.query(
       `INSERT INTO inventory_transactions (company_id,branch_id,product_id,transaction_type,reference_type,reference_id,quantity_in,quantity_out,transaction_date,created_by) VALUES (?,?,?,'PURCHASE_RECEIPT','GRN',?,?,0,?,?)`,
       [
@@ -104,7 +110,7 @@ async function postReceipt(connection, req, receiptId) {
         receipt.branch_id,
         productId,
         receiptId,
-        acceptedQty,
+        operational,
         receipt.grn_date,
         userId(req),
       ],
@@ -113,7 +119,7 @@ async function postReceipt(connection, req, receiptId) {
       throw fail("Unable to record inventory movement");
     const [stock] = await connection.query(
       "UPDATE products SET stock=stock+? WHERE id=? AND company_id=?",
-      [acceptedQty, productId, companyId],
+      [operational, productId, companyId],
     );
     if (!stock.affectedRows)
       throw fail("Product not found while posting stock");
@@ -279,7 +285,16 @@ exports.create = async (req, res) => {
         status = "Draft",
         items = [],
       } = req.body;
+    for (const input of items) {
+      valuationMath.operationalQuantity(input.received_qty ?? "0");
+      valuationMath.operationalQuantity(input.rejected_qty ?? "0");
+    }
+    // Evidence requires an existing immutable GRN line identity. Posting is a
+    // separate explicit action after draft preparation and owner approval.
+    if (status !== "Draft") valuationMath.fail("IV_DRAFT_THEN_APPROVAL_REQUIRED");
     await connection.beginTransaction();
+    const retry = await valuationOperations.beginRequest(connection, req, "grn-create");
+    if (retry) { await connection.commit(); return res.status(retry.status).json(retry.body); }
     const { order, items: poItems } = await loadPoForReceipt(
       connection,
       companyId,
@@ -297,6 +312,14 @@ exports.create = async (req, res) => {
           "GRN",
         )),
     ).trim();
+    const prepared = items.map(input => {
+      const poItem = poItems.find(entry => String(entry.id) === String(input.purchase_order_item_id));
+      if (!poItem) throw fail("Invalid PO item");
+      const received = valuationMath.operationalQuantity(input.received_qty ?? "0");
+      const rejected = valuationMath.operationalQuantity(input.rejected_qty ?? "0");
+      if (rejected.q6 > received.q6 || received.q6 > valuationMath.operationalQuantity(poItem.pending_qty).q6) throw fail("Invalid receipt quantities");
+      return { input, poItem, received: received.sql, rejected: rejected.sql, accepted: valuationMath.operationalQuantity(valuationMath.decimal(received.q6 - rejected.q6)).sql };
+    });
     const [result] = await connection.query(
       `INSERT INTO goods_receipts (company_id,branch_id,grn_number,purchase_order_id,vendor_id,grn_date,challan_number,challan_date,status,notes,created_by) VALUES (?,?,?,?,?,?,?,?, 'Draft',?,?)`,
       [
@@ -312,21 +335,8 @@ exports.create = async (req, res) => {
         userId(req),
       ],
     );
-    for (const input of items) {
-      const poItem = poItems.find(
-        (entry) => Number(entry.id) === Number(input.purchase_order_item_id),
-      );
-      if (!poItem) throw fail("Invalid PO item");
-      const received = Number(input.received_qty || 0),
-        rejected = Number(input.rejected_qty || 0),
-        accepted = received - rejected;
-      if (received < 0 || rejected < 0 || accepted < 0)
-        throw fail(`Invalid quantities for ${poItem.product_name}`);
-      if (received > Number(poItem.pending_qty) + 0.000001)
-        throw fail(
-          `Received quantity exceeds pending quantity for ${poItem.product_name}`,
-        );
-      if (received === 0) continue;
+    for (const { input, poItem, received, rejected, accepted } of prepared) {
+      if (received === "0.00") continue;
       await connection.query(
         `INSERT INTO goods_receipt_items (company_id,goods_receipt_id,purchase_order_item_id,product_id,received_qty,rejected_qty,accepted_qty,notes) VALUES (?,?,?,?,?,?,?,?)`,
         [
@@ -341,8 +351,7 @@ exports.create = async (req, res) => {
         ],
       );
     }
-    if (status === "Posted")
-      await postReceipt(connection, req, result.insertId);
+    await valuationOperations.completeRequest(connection, req, 201, { message: "Draft GRN created", grn_id: result.insertId, grn_number: grnNumber });
     await connection.commit();
     res.status(201).json({
       message:
@@ -377,7 +386,10 @@ exports.post = async (req, res) => {
   try {
     rejectClientFinancialYear(req.body);
     await connection.beginTransaction();
+    const retry = await valuationOperations.beginRequest(connection, req, "grn-post", String(req.params.id));
+    if (retry) { await connection.commit(); return res.status(retry.status).json(retry.body); }
     await postReceipt(connection, req, req.params.id);
+    await valuationOperations.completeRequest(connection, req, 200, { message: "GRN posted and stock increased" });
     await connection.commit();
     res.json({ message: "GRN posted and stock increased" });
   } catch (error) {
@@ -434,6 +446,8 @@ exports.createBill = async (req, res) => {
     const companyId = req.user.company_id;
     rejectClientFinancialYear(req.body);
     await connection.beginTransaction();
+    const retry = await valuationOperations.beginRequest(connection, req, "grn-bill-create", String(req.params.id));
+    if (retry) { await connection.commit(); return res.status(retry.status).json(retry.body); }
     const billDate = req.body.bill_date || new Date().toISOString().slice(0, 10);
     const financialYear = await requireFinancialYearForPosting(companyId, billDate, connection);
     const [receipts] = await connection.query(
@@ -465,14 +479,10 @@ exports.createBill = async (req, res) => {
           "BILL",
         )),
     ).trim();
-    const total = items.reduce(
-      (sum, item) =>
-        sum +
-        Number(item.accepted_qty) *
-          Number(item.price) *
-          (1 + Number(item.gst_percent) / 100),
-      0,
-    );
+    const valuationItems = items.map(item => ({ ...item, source_grn_item_id: item.id,
+      ...valuationMath.billAmounts(item.accepted_qty, item.price, item.gst_percent) }));
+    const total = valuationMath.moneyDecimal(valuationItems.reduce((sum, item) => sum + valuationMath.money(item.total), 0n));
+    await inventoryValuation.preflightBill(connection, req, valuationItems, billDate);
     const [bill] = await connection.query(
       `INSERT INTO bills (vendor_id,bill_number,bill_date,due_date,total_amount,status,company_id,financial_year_id,source_purchase_order_id,source_grn_id,stock_posted) VALUES (?,?,?,?,?,'Unpaid',?,?,?,?,0)`,
       [
@@ -487,25 +497,26 @@ exports.createBill = async (req, res) => {
         grn.id,
       ],
     );
-    for (const item of items) {
-      const taxable = Number(item.accepted_qty) * Number(item.price),
-        tax = (taxable * Number(item.gst_percent)) / 100;
+    for (const item of valuationItems) {
       await connection.query(
-        `INSERT INTO bill_items (bill_id,product_id,product_name,quantity,price,mrp,total,gst_percent,cgst,sgst) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO bill_items (bill_id,source_grn_item_id,product_id,product_name,quantity,price,mrp,total,gst_percent,cgst,sgst) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         [
           bill.insertId,
+          item.id,
           item.product_id,
           item.product_name,
-          item.accepted_qty,
+          item.quantity,
           item.price,
           item.mrp,
-          taxable + tax,
-          item.gst_percent,
-          tax / 2,
-          tax / 2,
+          item.total,
+          item.gst,
+          item.cgst,
+          item.sgst,
         ],
       );
     }
+    await inventoryValuation.finalizeBill(connection, req, bill.insertId, billDate);
+    await valuationOperations.completeRequest(connection, req, 201, { message: "Bill created from GRN without reposting stock", bill_id: bill.insertId, bill_number: billNumber });
     await connection.commit();
     res.status(201).json({
       message: "Bill created from GRN without reposting stock",
