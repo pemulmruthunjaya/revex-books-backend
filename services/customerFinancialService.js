@@ -47,6 +47,21 @@ const ADVANCE_BALANCE_SQL = `
     AND customer_id = ?
     AND status IN ('UNAPPLIED', 'PARTIALLY_APPLIED')`;
 
+const ANNUAL_CUSTOMER_OPENINGS_SQL = `
+  SELECT o.id AS opening_item_id,o.predecessor_opening_item_id,o.original_invoice_id,o.original_opening_item_id,
+    o.original_financial_year_id,o.financial_year_id,o.reference,o.effective_date,o.due_date,
+    o.original_amount,i.invoice_number,
+    COALESCE((SELECT SUM(a.amount) FROM annual_subledger_allocations a
+      WHERE a.company_id=o.company_id AND a.opening_item_id=o.id),0) AS allocated_amount,
+    COALESCE((SELECT SUM(r.amount) FROM annual_subledger_allocation_reversals r
+      JOIN annual_subledger_allocations a ON a.id=r.allocation_id AND a.company_id=r.company_id
+      WHERE a.company_id=o.company_id AND a.opening_item_id=o.id),0) AS reversed_amount
+  FROM subledger_opening_items o
+  LEFT JOIN invoices i ON i.id=o.original_invoice_id AND i.company_id=o.company_id
+  WHERE o.company_id=? AND o.party_type='CUSTOMER' AND o.customer_id=?
+    AND o.origin='ANNUAL_CARRY_FORWARD' AND o.entry_kind='ORIGINAL'
+  ORDER BY o.id`;
+
 const PAYMENT_HISTORY_SQL = `
   SELECT
     re.id AS receipt_entry_id,
@@ -60,11 +75,12 @@ const PAYMENT_HISTORY_SQL = `
     received_in.account_code AS received_in_account_code,
     re.reference_number,
     re.narration,
-    COUNT(DISTINCT p.id) AS allocation_count,
-    COALESCE(SUM(p.amount), 0.00) AS allocated_amount,
+    COUNT(DISTINCT p.id) + COALESCE(MAX(annual.allocation_count), 0) AS allocation_count,
+    COALESCE(SUM(p.amount), 0.00) + COALESCE(MAX(annual.allocated_amount), 0.00) AS allocated_amount,
     GROUP_CONCAT(DISTINCT i.invoice_number ORDER BY i.invoice_number SEPARATOR '||')
       AS invoice_numbers,
-    COALESCE(advance_totals.unapplied_amount, 0.00) AS unapplied_amount
+    COALESCE(advance_totals.unapplied_amount, 0.00) AS unapplied_amount,
+    annual.opening_references AS opening_references
   FROM receipt_entries re
   INNER JOIN accounts received_in
     ON received_in.id = re.received_in_account_id
@@ -76,6 +92,17 @@ const PAYMENT_HISTORY_SQL = `
   LEFT JOIN invoices i
     ON i.id = p.invoice_id
    AND i.company_id = p.company_id
+  LEFT JOIN (
+    SELECT a.company_id,a.receipt_entry_id,COUNT(*) allocation_count,SUM(a.amount-COALESCE(r.reversed_amount,0)) allocated_amount,
+      GROUP_CONCAT(DISTINCT COALESCE(i.invoice_number,o.reference) ORDER BY o.id SEPARATOR '||') opening_references
+    FROM annual_subledger_allocations a
+    JOIN subledger_opening_items o ON o.id=a.opening_item_id AND o.company_id=a.company_id
+    LEFT JOIN invoices i ON i.id=o.original_invoice_id AND i.company_id=o.company_id
+    LEFT JOIN (SELECT allocation_id,company_id,SUM(amount) reversed_amount FROM annual_subledger_allocation_reversals GROUP BY allocation_id,company_id) r
+      ON r.allocation_id=a.id AND r.company_id=a.company_id
+    WHERE a.party_type='CUSTOMER' AND a.receipt_entry_id IS NOT NULL
+    GROUP BY a.company_id,a.receipt_entry_id
+  ) annual ON annual.company_id=re.company_id AND annual.receipt_entry_id=re.id
   LEFT JOIN (
     SELECT company_id, customer_id, receipt_entry_id, SUM(unapplied_amount) AS unapplied_amount
     FROM customer_advances
@@ -91,7 +118,7 @@ const PAYMENT_HISTORY_SQL = `
     re.id, re.receipt_number, re.receipt_date, re.receipt_type, re.amount,
     re.payment_mode, re.received_in_account_id, received_in.account_name,
     received_in.account_code, re.reference_number, re.narration,
-    advance_totals.unapplied_amount
+    advance_totals.unapplied_amount, annual.opening_references
   ORDER BY re.receipt_date DESC, re.id DESC
   LIMIT ? OFFSET ?`;
 
@@ -139,23 +166,52 @@ const normalizeInvoice = (row) => {
   };
 };
 
-const buildFinancialSummary = (customer, invoiceRows, advanceAmount) => {
+const buildFinancialSummary = (customer, invoiceRows, advanceAmount, annualOpeningRows = []) => {
   const invoices = invoiceRows.map(normalizeInvoice);
+  const annual = annualOpeningRows.map((row) => {
+    const original = moneyToMinor(row.original_amount || 0, "Opening amount");
+    const allocated = moneyToMinor(row.allocated_amount || 0, "Opening allocations");
+    const reversed = moneyToMinor(row.reversed_amount || 0, "Opening reversals");
+    const remaining = original - allocated + reversed;
+    if (remaining < 0 || remaining > original) throw new Error("Annual opening balance is invalid");
+    return { ...row, remaining, netAllocated: allocated - reversed };
+  });
+  const carriedInvoiceIds = new Set(annual.filter((row) => row.original_invoice_id).map((row) => Number(row.original_invoice_id)));
   const totals = invoices.reduce(
     (result, invoice) => ({
       invoiced: result.invoiced + invoice._totalMinor,
       received: result.received + invoice._paidMinor,
-      outstanding: result.outstanding + invoice._outstandingMinor,
-      overdue: result.overdue + (invoice.is_overdue ? invoice._outstandingMinor : 0),
-      outstandingCount: result.outstandingCount + (invoice._outstandingMinor > 0 ? 1 : 0),
-      overdueCount: result.overdueCount + (invoice.is_overdue ? 1 : 0),
+      outstanding: result.outstanding + (!carriedInvoiceIds.has(invoice.invoice_id) ? invoice._outstandingMinor : 0),
+      overdue: result.overdue + (!carriedInvoiceIds.has(invoice.invoice_id) && invoice.is_overdue ? invoice._outstandingMinor : 0),
+      outstandingCount: result.outstandingCount + (!carriedInvoiceIds.has(invoice.invoice_id) && invoice._outstandingMinor > 0 ? 1 : 0),
+      overdueCount: result.overdueCount + (!carriedInvoiceIds.has(invoice.invoice_id) && invoice.is_overdue ? 1 : 0),
     }),
     { invoiced: 0, received: 0, outstanding: 0, overdue: 0, outstandingCount: 0, overdueCount: 0 }
   );
 
   const outstandingInvoices = invoices
-    .filter((invoice) => invoice._outstandingMinor > 0)
+    .filter((invoice) => invoice._outstandingMinor > 0 && !carriedInvoiceIds.has(invoice.invoice_id))
     .map(({ _totalMinor, _paidMinor, _outstandingMinor, ...invoice }) => invoice);
+  const carriedForwardLeaves = annual.filter((row) => !annual.some((child) => Number(child.predecessor_opening_item_id) === Number(row.opening_item_id)));
+  carriedForwardLeaves.filter((row) => row.remaining > 0).forEach((row) => outstandingInvoices.push({
+    invoice_id: null,
+    opening_item_id: Number(row.opening_item_id),
+    invoice_number: row.invoice_number || row.reference,
+    source_type: "ANNUAL_CARRY_FORWARD",
+    original_invoice_id: row.original_invoice_id === null ? null : Number(row.original_invoice_id),
+    original_financial_year_id: Number(row.original_financial_year_id),
+    invoice_date: normalizeDateOnly(row.effective_date),
+    due_date: normalizeDateOnly(row.due_date),
+    total_amount: minorToMoney(row.remaining),
+    paid_amount: 0,
+    outstanding_amount: minorToMoney(row.remaining),
+    payment_status: "UNPAID",
+    is_overdue: Boolean(row.due_date && normalizeDateOnly(row.due_date) < new Date().toISOString().slice(0, 10)),
+    overdue_days: null,
+  }));
+  const annualReceived = annual.reduce((sum, row) => sum + row.netAllocated, 0);
+  const annualInvoiced = annual.filter((row) => !row.original_invoice_id && !row.predecessor_opening_item_id)
+    .reduce((sum, row) => sum + moneyToMinor(row.original_amount || 0, "Opening amount"), 0);
 
   return {
     customer: {
@@ -165,12 +221,12 @@ const buildFinancialSummary = (customer, invoiceRows, advanceAmount) => {
       credit_limit: minorToMoney(moneyToMinor(customer.credit_limit || 0, "Credit limit")),
     },
     summary: {
-      total_invoiced: minorToMoney(totals.invoiced),
-      total_received: minorToMoney(totals.received),
-      total_outstanding: minorToMoney(totals.outstanding),
-      outstanding_invoice_count: totals.outstandingCount,
-      overdue_amount: minorToMoney(totals.overdue),
-      overdue_invoice_count: totals.overdueCount,
+      total_invoiced: minorToMoney(totals.invoiced + annualInvoiced),
+      total_received: minorToMoney(totals.received + annualReceived),
+      total_outstanding: minorToMoney(totals.outstanding + carriedForwardLeaves.reduce((sum, row) => sum + row.remaining, 0)),
+      outstanding_invoice_count: totals.outstandingCount + carriedForwardLeaves.filter((row) => row.remaining > 0).length,
+      overdue_amount: minorToMoney(totals.overdue + carriedForwardLeaves.reduce((sum, row) => sum + (row.due_date && normalizeDateOnly(row.due_date) < new Date().toISOString().slice(0, 10) ? row.remaining : 0), 0)),
+      overdue_invoice_count: totals.overdueCount + carriedForwardLeaves.filter((row) => row.remaining > 0 && row.due_date && normalizeDateOnly(row.due_date) < new Date().toISOString().slice(0, 10)).length,
       unapplied_advance_balance: minorToMoney(
         moneyToMinor(advanceAmount || 0, "Unapplied advance balance")
       ),
@@ -191,18 +247,26 @@ const getCustomerFinancialSummary = async (companyId, customerId, executor = db)
     ADVANCE_BALANCE_SQL,
     [companyId, customerId]
   );
+  let annualOpeningRows = [];
+  try {
+    [annualOpeningRows] = await executor.query(ANNUAL_CUSTOMER_OPENINGS_SQL, [companyId, customerId]);
+  } catch (error) {
+    if (!["ER_NO_SUCH_TABLE", "ER_BAD_FIELD_ERROR"].includes(error?.code)) throw error;
+  }
 
   return buildFinancialSummary(
     customerRows[0],
     invoiceRows,
-    advanceRows[0]?.unapplied_advance_balance || 0
+    advanceRows[0]?.unapplied_advance_balance || 0,
+    annualOpeningRows
   );
 };
 
 const normalizePaymentHistoryRow = (row) => {
-  const invoiceNumbers = row.invoice_numbers
-    ? [...new Set(String(row.invoice_numbers).split("||").filter(Boolean))]
-    : [];
+  const invoiceNumbers = [row.invoice_numbers, row.opening_references]
+    .filter(Boolean)
+    .flatMap((value) => String(value).split("||").filter(Boolean));
+  const uniqueInvoiceNumbers = [...new Set(invoiceNumbers)];
   const isAdvance = row.receipt_type === "ADVANCE";
 
   return {
@@ -221,7 +285,7 @@ const normalizePaymentHistoryRow = (row) => {
     allocated_amount: isAdvance
       ? 0
       : minorToMoney(moneyToMinor(row.allocated_amount || 0, "Allocated amount")),
-    invoice_numbers: isAdvance ? [] : invoiceNumbers,
+    invoice_numbers: isAdvance ? [] : uniqueInvoiceNumbers,
     unapplied_amount: isAdvance
       ? minorToMoney(moneyToMinor(row.unapplied_amount || 0, "Unapplied amount"))
       : 0,
@@ -259,6 +323,7 @@ const getCustomerPaymentHistory = async (
 
 module.exports = {
   ADVANCE_BALANCE_SQL,
+  ANNUAL_CUSTOMER_OPENINGS_SQL,
   CUSTOMER_SQL,
   ELIGIBLE_INVOICES_SQL,
   PAYMENT_HISTORY_SQL,

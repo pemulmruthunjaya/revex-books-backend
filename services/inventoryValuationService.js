@@ -27,9 +27,22 @@ async function actor(cx, company, actorId, owner = false) {
   if (rows.length !== 1 || (owner && rows[0].role !== "owner")) m.fail("IV_ACTOR_NOT_AUTHORIZED");
 }
 async function openDate(cx, company, date) {
-  const [years] = await cx.query("SELECT id,status FROM financial_years WHERE company_id=? AND ? BETWEEN start_date AND end_date ORDER BY id FOR SHARE", [id(company), m.date(date)]);
+  const [years] = await cx.query("SELECT id,status FROM financial_years WHERE company_id=? AND ? BETWEEN start_date AND end_date ORDER BY id FOR UPDATE", [id(company), m.date(date)]);
   if (years.length !== 1 || years[0].status !== "OPEN") m.fail("IV_OPEN_FY_REQUIRED");
   return years[0];
+}
+async function lockReplayPeriods(cx, x, rows, date, additionalDates = []) {
+  // Callers already hold the tenant/product/evidence locks. Validate the entire
+  // date set before the first business write, not one line at a time while
+  // posting. Exclusive FY locks prevent concurrent close/reconciliation.
+  m.date(date);
+  const movementDates = rows.filter(row => ["OPENING", "RECEIPT", "ISSUE", "CUSTOMER_RETURN", "VENDOR_RETURN"].includes(row.kind))
+    .map(row => ["OPENING", "RECEIPT"].includes(row.kind) ? appliedBasis(rows, row).effective_date : row.effective_date)
+    .filter(affected => affected >= date);
+  const dates = [...new Set([date, ...additionalDates, ...movementDates])].sort();
+  const result = new Map();
+  for (const affected of dates) result.set(affected, await openDate(cx, x.company_id, affected));
+  return result;
 }
 async function lock(cx, x) {
   const params = scope(x);
@@ -135,6 +148,7 @@ async function recordCost(cx, x) {
   if (previous && previous.source_id !== source.id) m.fail("IV_REVISION_SOURCE_MISMATCH");
   const duplicate = costs.find(r => r.idempotency_key === x.idempotency_key);
   if (!duplicate && ((costs.length && !previous) || costs.some(r => r.supersedes_id === previous?.id))) m.fail("IV_REVISION_CONFLICT");
+  await lockReplayPeriods(cx, x, rows, source.effective_date);
   return append(cx, x, { ...ref(source), kind: "COST", supersedes_id: previous?.id || null, idempotency_key: x.idempotency_key, payload: x.evidence });
 }
 async function approveCost(cx, x) {
@@ -166,13 +180,37 @@ async function rejectCost(cx, x) {
 
 function appliedBasis(rows, movement) {
   let revision = find(rows, movement.payload.revision_id, "COST"), sourceId = movement.source_id;
-  for (const change of rows.filter(r => ["COST_REPLACEMENT", "STOCK_REPLACEMENT"].includes(r.kind) && r.target_id === movement.id && !r.payload.partial)) {
-    if (change.kind === "STOCK_REPLACEMENT") sourceId = change.payload.new_source_id;
+  let effectiveDate = movement.effective_date, sequence = movement.sequence;
+  const pending = rows.filter(r => ["COST_REPLACEMENT", "STOCK_REPLACEMENT"].includes(r.kind) && r.target_id === movement.id && !r.payload.partial).map(change => {
+    let predecessor = find(rows, change.payload.revision_id, "COST").supersedes_id;
+    if (change.kind === "STOCK_REPLACEMENT") {
+      const proposals = rows.filter(row => row.kind === "STOCK_CORRECTION" && row.target_id === movement.id &&
+        (change.payload.correction_id ? row.id === change.payload.correction_id : row.payload.new_revision_id === change.payload.revision_id && row.payload.new_source_id === change.payload.new_source_id));
+      if (proposals.length !== 1) m.fail("IV_CORRECTION_SOURCE_INVALID");
+      predecessor = proposals[0].payload.old_revision_id;
+    }
+    return { change, predecessor };
+  });
+  // Correction chronology follows immutable predecessor lineage, not posting
+  // date: an approved replacement may move a receipt to an earlier date.
+  while (pending.length) {
+    const matches = pending.filter(item => item.predecessor === revision.id);
+    if (matches.length !== 1) m.fail("IV_REVISION_CONFLICT");
+    const { change } = matches[0];
+    pending.splice(pending.indexOf(matches[0]), 1);
+    if (change.kind === "STOCK_REPLACEMENT") {
+      sourceId = change.payload.new_source_id;
+      const replacementDate = find(rows, sourceId, "ACQUISITION").effective_date;
+      if (replacementDate !== effectiveDate) {
+        effectiveDate = replacementDate;
+        sequence = change.sequence;
+      }
+    }
     revision = find(rows, change.payload.revision_id, "COST");
     if (revision.source_id !== sourceId) m.fail("IV_REVISION_SOURCE_MISMATCH");
   }
   if (revision.source_id !== sourceId) m.fail("IV_REVISION_SOURCE_MISMATCH");
-  return { revision, source_id: sourceId };
+  return { revision, source_id: sourceId, effective_date: effectiveDate, sequence };
 }
 function provisionalRemainder(rows, cost, links, received, covered) {
   const components = require("./inventoryValuationComponentService");
@@ -198,8 +236,11 @@ function projection(rows) {
   const movements = [];
   for (const row of rows.filter(r => ["OPENING", "RECEIPT", "ISSUE", "CUSTOMER_RETURN", "VENDOR_RETURN"].includes(r.kind))) {
     let payload = row.payload;
+    let effectiveDate = row.effective_date, sequence = row.sequence;
     if (["OPENING", "RECEIPT"].includes(row.kind)) {
-      const cost = approved(rows, appliedBasis(rows, row).revision);
+      const basis = appliedBasis(rows, row);
+      const cost = approved(rows, basis.revision);
+      effectiveDate = basis.effective_date; sequence = basis.sequence;
       payload = { ...payload, quantity: cost.payload.quantity, total_minor: cost.payload.total_minor };
       if (row.document_type === "GRN") {
         const links = latestBillLinks(rows, row.source_id);
@@ -210,7 +251,7 @@ function projection(rows) {
         payload.total_minor = (finalValue + provisionalRemainder(rows, cost, links, received, covered)).toString();
       }
     }
-    movements.push({ id: row.id, kind: row.kind, date: row.effective_date, sequence: String(row.sequence), source_line: row.source_line, target: row.target_id, ...payload });
+    movements.push({ id: row.id, kind: row.kind, date: effectiveDate, sequence: String(sequence), source_line: row.source_line, target: row.target_id, ...payload });
   }
   return m.replay(movements);
 }
@@ -227,16 +268,18 @@ function currentReceipt(rows, sourceId) {
   return null;
 }
 async function previewBillCost(cx, x, rows, source, revision, billId, billDate, correctionId = null) {
+  const previous = latestBillLinks(rows, source.id).find(r => r.document_id === String(billId));
+  if (source.document_type === "SUPPLIER") {
+    if (previous && previous.effective_date !== billDate) m.fail("IV_DIRECT_STOCK_DATE_IMMUTABLE");
+    if (source.effective_date !== m.date(billDate)) m.fail("IV_DIRECT_STOCK_DATE_MISMATCH");
+  }
   const components = require("./inventoryValuationComponentService");
   const companyRows = await components.read(cx, x.company_id);
   components.verifyCost(companyRows, source, revision.payload);
   components.verifyBillClaims(companyRows, source, revision, billId);
   const movement = currentReceipt(rows, source.id);
   requireOpening(rows, source.effective_date);
-  await openDate(cx, x.company_id, source.effective_date);
-  await openDate(cx, x.company_id, billDate);
-  for (const date of new Set(rows.filter(r => r.effective_date >= source.effective_date && ["OPENING", "RECEIPT", "ISSUE", "CUSTOMER_RETURN", "VENDOR_RETURN"].includes(r.kind)).map(r => r.effective_date))) await openDate(cx, x.company_id, date);
-  const previous = latestBillLinks(rows, source.id).find(r => r.document_id === String(billId));
+  await lockReplayPeriods(cx, x, rows, source.effective_date, [billDate]);
   const seal = result => {
     billProofs.set(result, { cx, company: String(x.company_id), product: String(x.product_id), source: source.id, revision: revision.id, billId: billId === null ? null : String(billId), billDate, correctionId });
     return result;
@@ -294,15 +337,14 @@ async function applyBillCost(cx, x, input) {
 async function saveReplay(cx, x, effectiveDate, key) {
   const rows = await records(cx, x);
   // Revising an early receipt must not silently rewrite a subsequent frozen FY.
-  for (const date of new Set(rows.filter(r => r.effective_date >= effectiveDate && ["OPENING", "RECEIPT", "ISSUE", "CUSTOMER_RETURN", "VENDOR_RETURN"].includes(r.kind)).map(r => r.effective_date))) await openDate(cx, x.company_id, date);
+  await lockReplayPeriods(cx, x, rows, effectiveDate);
   const result = projection(rows);
   const inputFingerprint = m.fingerprint(rows.filter(r => r.kind !== "REPLAY").map(r => ({ id: r.id, fingerprint: r.fingerprint })));
   return append(cx, x, { kind: "REPLAY", effective_date: effectiveDate, document_type: "VALUATION", document_id: id(x.product_id), source_line: id(x.product_id), idempotency_key: key,
     payload: { ...result, input_fingerprint: inputFingerprint, algorithm: "PERPETUAL_HALF_UP_Q6_MINOR_V1", blockers: ["GL_COGS_RECONCILIATION_NOT_IMPLEMENTED"] } });
 }
 async function validateReplayBeforeWrite(cx, x, rows, date, synthetic) {
-  await openDate(cx, x.company_id, date);
-  for (const affected of new Set(rows.filter(r => r.effective_date >= date && ["OPENING", "RECEIPT", "ISSUE", "CUSTOMER_RETURN", "VENDOR_RETURN"].includes(r.kind)).map(r => r.effective_date))) await openDate(cx, x.company_id, affected);
+  await lockReplayPeriods(cx, x, rows, date);
   const sequence = (rows.filter(r => r.effective_date === date).reduce((max, r) => BigInt(r.sequence) > max ? BigInt(r.sequence) : max, 0n) + 1n).toString();
   return projection([...rows, { id: "preview", effective_date: date, sequence, target_id: null, source_id: null, source_line: "preview", ...synthetic }]);
 }
@@ -335,11 +377,11 @@ async function finalizeAcquisition(cx, x) {
   if (movement.kind === "RECEIPT" && m.quantity(prior.payload.quantity) !== m.quantity(revision.payload.quantity)) m.fail("IV_RECEIPT_QUANTITY_REVISION_UNSUPPORTED");
   const components = require("./inventoryValuationComponentService");
   components.verifyCost(await components.read(cx, x.company_id), find(rows, revision.source_id, "ACQUISITION"), revision.payload);
-  if (!retry) await validateReplayBeforeWrite(cx, x, rows, movement.effective_date, { kind: "COST_REPLACEMENT", target_id: movement.id, payload: { revision_id: revision.id } });
+  if (!retry) await validateReplayBeforeWrite(cx, x, rows, basis.effective_date, { kind: "COST_REPLACEMENT", target_id: movement.id, payload: { revision_id: revision.id } });
   const currentRef = ref(find(rows, basis.source_id, "ACQUISITION"));
   const reverse = await append(cx, x, { ...currentRef, kind: "COST_REVERSAL", target_id: prior.id, idempotency_key: `${x.idempotency_key}:reverse`, payload: { movement_id: movement.id, revision_id: prior.id, total_minor: prior.payload.total_minor, quantity: prior.payload.quantity } });
   const replacement = await append(cx, x, { ...currentRef, kind: "COST_REPLACEMENT", target_id: movement.id, idempotency_key: `${x.idempotency_key}:replace`, payload: { reversal_id: reverse.id, revision_id: revision.id, variance_minor: (BigInt(revision.payload.total_minor) - BigInt(prior.payload.total_minor)).toString() } });
-  if (!retry) await saveReplay(cx, x, movement.effective_date, `${x.idempotency_key}:replay`);
+  if (!retry) await saveReplay(cx, x, basis.effective_date, `${x.idempotency_key}:replay`);
   return replacement;
 }
 async function postMovement(cx, x) {
@@ -371,4 +413,4 @@ async function linkBill(cx, x, record) {
 
 const { wrap } = require("./inventoryValuationOperationService");
 module.exports = { ...Object.fromEntries(Object.entries({ createAcquisition, recordCost, submitCost, rejectCost, approveCost, postAcquisition, finalizeAcquisition, postMovement, applyBillCost }).map(([name, fn]) => [name, wrap(name, fn)])),
-  appliedBasis, latestBillLinks, currentReceipt, previewBillCost, projection, records, prepare, linkBill, find, approved, requireOpening, openDate, id, uuid, append, actor, saveReplay, ref, decodeRecord };
+  appliedBasis, latestBillLinks, currentReceipt, previewBillCost, projection, records, prepare, linkBill, find, approved, requireOpening, openDate, lockReplayPeriods, id, uuid, append, actor, saveReplay, ref, decodeRecord };

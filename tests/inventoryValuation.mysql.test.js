@@ -9,12 +9,12 @@ const identityGuard = require("./helpers/inventoryValuationMysqlGuard");
 const enabled = process.env.IV_MYSQL_PROOF === "DISPOSABLE_LOOPBACK_ONLY";
 
 test("isolated inventory valuation migration, concurrency, rollback and replay proof", { skip: !enabled }, async t => {
-  const database = `iv_proof_${randomUUID().replace(/-/g, "")}`;
+  const database = process.env.IV_MYSQL_PROOF_DATABASE;
   const config = identityGuard.target(process.env, database);
   const mysql = require("mysql2/promise");
   const admin = await mysql.createConnection(config);
   assert.match(database, /^iv_proof_[a-f0-9]{32}$/);
-  let pool, created = false;
+  let pool;
   const migration = require("../db/migrations/2026-10-05-immutable-inventory-valuation");
   const v = require("../services/inventoryValuationService");
   const schema = require("../services/inventoryValuationSchema");
@@ -22,9 +22,12 @@ test("isolated inventory valuation migration, concurrency, rollback and replay p
   const { evidence } = require("./helpers/inventoryValuationFixture");
   const x = { company_id: "1", product_id: "1", actor_id: "1" };
   try {
-    const [[identity]] = await admin.query("SELECT @@port port,VERSION() version");
+    const [[identity]] = await admin.query("SELECT @@port port,VERSION() version,DATABASE() db,CURRENT_USER() user");
     identityGuard.server(identity);
-    await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`); created = true;
+    assert.equal(identity.db, database);
+    assert.ok(!identity.user.startsWith("root@"));
+    const [[empty]] = await admin.query("SELECT COUNT(*) n FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()");
+    assert.equal(Number(empty.n), 0, "preallocated disposable database must be empty");
     pool = mysql.createPool({ ...config, database, connectionLimit: 6 });
     await pool.query("CREATE TABLE companies (id BIGINT UNSIGNED PRIMARY KEY) ENGINE=InnoDB");
     await pool.query("CREATE TABLE products (id BIGINT UNSIGNED PRIMARY KEY,company_id BIGINT UNSIGNED NOT NULL,stock DECIMAL(10,2) NOT NULL DEFAULT 0,opening_stock DECIMAL(10,2) NOT NULL DEFAULT 0) ENGINE=InnoDB");
@@ -315,6 +318,61 @@ test("isolated inventory valuation migration, concurrency, rollback and replay p
       await assert.rejects(transaction(cx => v.recordCost(cx, { ...x, source_id: recipients[0].id, evidence: evidence({ allocations: [{ component_id: result[0].id, kind: "FREIGHT_INWARD", reference: input.reference, total_minor: "101", basis: "WEIGHT", lines: result[0].payload.lines, calculated: result[0].payload.calculated, line: recipients[0].id }], total_minor: (1000n + BigInt(result[0].payload.calculated.find(r => r.line === recipients[0].id).amount_minor)).toString() }), idempotency_key: "obsolete-allocation" })), /IV_COMPONENT_REVISION_SUPERSEDED/);
       assert.equal(await counts(), before);
     });
+    await t.test("direct-stock cross-FY date correction locks periods, preserves immutable history and rolls back atomically", async () => {
+      // Authored only; this test is behind the same explicit disposable-target
+      // guards as the rest of this file and must not run in non-live validation.
+      const context = { ...x, product_id: "30" }, corrections = require("../services/inventoryValuationCorrectionService");
+      await pool.query("INSERT INTO products(id,company_id) VALUES (30,1)");
+      await pool.query("INSERT INTO financial_years VALUES (9001,1,'2027-04-01','2028-03-31','OPEN')");
+      await transaction(cx => opening(cx, context));
+      const acquire = async (date, key) => transaction(async cx => {
+        const source = await v.createAcquisition(cx, { ...context, date, document_type: "SUPPLIER", document_id: key, source_line: "1", reference: "synthetic date correction", idempotency_key: `${key}:source` });
+        const cost = await v.recordCost(cx, { ...context, source_id: source.id, evidence: evidence({ state: "FINAL", basis: "SUPPLIER_DOCUMENT" }), idempotency_key: `${key}:cost` });
+        await approve(cx, cost, key, context);
+        return { source, cost };
+      });
+      const first = await acquire("2027-03-30", "date-original");
+      await transaction(async cx => {
+        await cx.query("INSERT INTO bills VALUES (300,1)");
+        await cx.query("INSERT INTO bill_items VALUES (3000,300,30,10.00)");
+        await v.applyBillCost(cx, context, { source_id: first.source.id, revision_id: first.cost.id, bill_id: "300", bill_date: "2027-03-30", line_id: "3000" });
+        await cx.query("UPDATE products SET stock=10.00 WHERE id=30 AND company_id=1");
+      });
+      const proposed = await acquire("2027-04-05", "date-replacement");
+      const originalRows = await transaction(cx => v.records(cx, context));
+      const receipt = originalRows.find(row => row.kind === "RECEIPT"), link = v.latestBillLinks(originalRows, first.source.id)[0];
+      const request = { ...context, bill_id: "300", movement_id: receipt.id, previous_bill_link_id: link.id, new_source_id: proposed.source.id, new_revision_id: proposed.cost.id, reason: "synthetic approved date replacement", idempotency_key: "date-correction" };
+      await pool.query("UPDATE financial_years SET status='RECONCILIATION' WHERE id=9001");
+      await assert.rejects(transaction(cx => corrections.create(cx, request)), error => error.code === "IV_OPEN_FY_REQUIRED");
+      assert.equal(m.canonical(await transaction(cx => v.records(cx, context))), m.canonical(originalRows));
+      await pool.query("UPDATE financial_years SET status='OPEN' WHERE id=9001");
+      const correction = await transaction(cx => corrections.create(cx, request));
+      await transaction(cx => corrections.approve(cx, { ...context, actor_id: "2", correction_id: correction.id, reason: "synthetic approval", idempotency_key: "date-correction-approved" }));
+      const input = { source_id: proposed.source.id, revision_id: proposed.cost.id, correction_id: correction.id, bill_id: "300", bill_date: "2027-04-05", line_id: "3000" };
+      const before = await transaction(cx => v.records(cx, context));
+      await assert.rejects(transaction(async cx => { await v.applyBillCost(cx, context, input); throw new Error("synthetic journal failure"); }), /synthetic journal failure/);
+      assert.equal(m.canonical(await transaction(cx => v.records(cx, context))), m.canonical(before));
+      const owner = await pool.getConnection(), closer = await pool.getConnection();
+      try {
+        await owner.beginTransaction();
+        await v.prepare(owner, context);
+        await v.lockReplayPeriods(owner, context, await v.records(owner, context), "2027-03-30", ["2027-04-05"]);
+        await closer.query("SET SESSION innodb_lock_wait_timeout=1");
+        await closer.beginTransaction();
+        await assert.rejects(closer.query("UPDATE financial_years SET status='CLOSED' WHERE id=9001"), error => error.code === "ER_LOCK_WAIT_TIMEOUT");
+        await closer.rollback();
+        await owner.rollback();
+      } finally { await owner.rollback(); await closer.rollback(); owner.release(); closer.release(); }
+      const results = await Promise.all([transaction(cx => v.applyBillCost(cx, context, input)), transaction(cx => v.applyBillCost(cx, context, input))]);
+      assert.equal(results[0].id, results[1].id);
+      const after = await transaction(cx => v.records(cx, context));
+      assert.equal(v.appliedBasis(after, receipt).effective_date, "2027-04-05");
+      assert.equal(after.filter(row => row.kind === "STOCK_REVERSAL").length, 1);
+      assert.equal(after.filter(row => row.kind === "STOCK_REPLACEMENT").length, 1);
+      for (const row of before) assert.equal(m.canonical(after.find(item => item.id === row.id)), m.canonical(row));
+      const [[stock]] = await pool.query("SELECT CAST(stock AS CHAR) stock FROM products WHERE id=30");
+      assert.equal(stock.stock, "10.00");
+    });
     await t.test("incompatible existing index rejects migration without modifying evidence", async () => {
       const before = await transaction(cx => v.records(cx, x));
       await pool.query("CREATE INDEX iv_unexpected ON iv_records(creator_id)");
@@ -347,9 +405,86 @@ test("isolated inventory valuation migration, concurrency, rollback and replay p
       await pool.query(`CREATE TRIGGER iv_records_no_update BEFORE UPDATE ON iv_records FOR EACH ROW ${schema.triggerBody}`);
       assert.equal((await schema.inspect(pool)).ready, true);
     });
+    await t.test("persisted GL bridge uses real atomic journals, original-date replay locks and immutable database guards", async () => {
+      // Authored only. This runs solely inside the parent disposable-instance
+      // guards and never uses the application connection or a shared database.
+      const gl = require("../services/inventoryGlService");
+      const glMigration = require("../db/migrations/2026-10-09-inventory-gl-protection");
+      await pool.query("CREATE TABLE financial_year_close_runs (id BIGINT UNSIGNED PRIMARY KEY,status VARCHAR(20) NOT NULL,closing_journal_entry_id BIGINT UNSIGNED NULL,opening_journal_entry_id BIGINT UNSIGNED NULL) ENGINE=InnoDB");
+      await pool.query("CREATE TABLE accounts (id BIGINT UNSIGNED PRIMARY KEY,company_id BIGINT UNSIGNED NOT NULL,account_type VARCHAR(20) NOT NULL,status INT NOT NULL) ENGINE=InnoDB");
+      await pool.query("CREATE TABLE journal_entries (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,journal_no VARCHAR(60) NOT NULL,journal_date DATE NOT NULL,narration TEXT,total_debit DECIMAL(15,2) NOT NULL,total_credit DECIMAL(15,2) NOT NULL,created_by BIGINT UNSIGNED NOT NULL,company_id BIGINT UNSIGNED NOT NULL,financial_year_id BIGINT UNSIGNED NOT NULL,source_type VARCHAR(50) NOT NULL,source_id BIGINT UNSIGNED NOT NULL,status INT NOT NULL DEFAULT 1,UNIQUE KEY uq_journal_source(company_id,source_type,source_id)) ENGINE=InnoDB");
+      await pool.query("CREATE TABLE journal_entry_details (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,journal_entry_id BIGINT UNSIGNED NOT NULL,account_id BIGINT UNSIGNED NOT NULL,debit DECIMAL(15,2) NOT NULL,credit DECIMAL(15,2) NOT NULL,description TEXT,FOREIGN KEY(journal_entry_id) REFERENCES journal_entries(id)) ENGINE=InnoDB");
+      const install = await glMigration.migrate(pool, { confirmation: "APPLY_INVENTORY_GL_PROTECTION_V1" });
+      assert.ok(install.applied.length);
+      assert.deepEqual((await glMigration.migrate(pool, { confirmation: "APPLY_INVENTORY_GL_PROTECTION_V1" })).applied, []);
+      await pool.query("INSERT INTO companies VALUES (3)");
+      await pool.query("INSERT INTO products (id,company_id) VALUES (300,3)");
+      await pool.query("INSERT INTO users VALUES (301,3,'accountant',1),(302,3,'owner',1)");
+      await pool.query("INSERT INTO financial_years VALUES (3001,3,'2026-04-01','2027-03-31','OPEN'),(3002,3,'2027-04-01','2028-03-31','OPEN')");
+      const context = { company_id: "3", product_id: "300", actor_id: "301" };
+      const review = async (cx, revision, key) => {
+        await v.submitCost(cx, { ...context, revision_id: revision.id, reason: "synthetic submission", idempotency_key: `${key}-submit` });
+        await v.approveCost(cx, { ...context, actor_id: "302", revision_id: revision.id, reason: "synthetic independent approval", idempotency_key: `${key}-approve` });
+      };
+      await transaction(async cx => {
+        const source = await v.createAcquisition(cx, { ...context, document_type: "OPENING", document_id: "synthetic-gl", source_line: "300", date: "2026-04-01", reference: "synthetic zero opening", idempotency_key: "gl-opening" });
+        const cost = await v.recordCost(cx, { ...context, source_id: source.id, evidence: evidence({ state: "FINAL", basis: "OPENING", quantity: "0", purchase_minor: "0", total_minor: "0" }), idempotency_key: "gl-opening-cost" });
+        await review(cx, cost, "gl-opening");
+        await v.postAcquisition(cx, { ...context, source_id: source.id, revision_id: cost.id, idempotency_key: "gl-opening-post" });
+      });
+      let account = 310;
+      for (const [role, type] of Object.entries(gl.roles)) {
+        await pool.query("INSERT INTO accounts VALUES (?,3,?,1)", [account, type]);
+        await transaction(cx => gl.assignRole(cx, { company_id: "3", actor_id: "302", role, account_id: String(account++), effective_date: "2026-04-01", idempotency_key: `gl-role-${role}` }));
+      }
+      await transaction(cx => gl.approveCutover(cx, { company_id: "3", actor_id: "302", date: "2026-04-01", reason: "synthetic approved cutover", idempotency_key: "gl-cutover" }));
+      await pool.query("INSERT INTO goods_receipts VALUES (300,3,'Draft')");
+      await pool.query("INSERT INTO goods_receipt_items VALUES (3000,3,300,300,10,0,10)");
+      let source, cost;
+      await transaction(async cx => {
+        source = await v.createAcquisition(cx, { ...context, document_type: "GRN", document_id: "300", source_line: "3000", date: "2027-03-30", reference: "synthetic receipt", idempotency_key: "gl-source" });
+        cost = await v.recordCost(cx, { ...context, source_id: source.id, evidence: evidence(), idempotency_key: "gl-cost" });
+        await review(cx, cost, "gl-cost");
+      });
+      const request = { ...context, source_id: source.id, revision_id: cost.id, idempotency_key: "gl-receipt" };
+      const before = (await pool.query("SELECT COUNT(*) n FROM iv_records WHERE company_id=3"))[0][0].n;
+      await assert.rejects(transaction(async cx => { await v.postAcquisition(cx, request); throw new Error("synthetic downstream stock failure"); }), /synthetic downstream stock failure/);
+      assert.equal((await pool.query("SELECT COUNT(*) n FROM iv_records WHERE company_id=3"))[0][0].n, before);
+      assert.equal(Number((await pool.query("SELECT COUNT(*) n FROM journal_entries WHERE company_id=3"))[0][0].n), 0);
+      const concurrent = await Promise.all([transaction(cx => v.postAcquisition(cx, request)), transaction(cx => v.postAcquisition(cx, request))]);
+      assert.equal(concurrent[0].id, concurrent[1].id);
+      assert.equal(Number((await pool.query("SELECT COUNT(*) n FROM journal_entries WHERE company_id=3"))[0][0].n), 1);
+      let final;
+      await transaction(async cx => {
+        final = await v.recordCost(cx, { ...context, source_id: source.id, supersedes_id: cost.id, evidence: evidence({ state: "FINAL", basis: "SUPPLIER_DOCUMENT", purchase_minor: "1200", total_minor: "1200" }), idempotency_key: "gl-final" });
+        await review(cx, final, "gl-final");
+      });
+      await pool.query("INSERT INTO bills VALUES (400,3)");
+      await pool.query("INSERT INTO bill_items VALUES (4000,400,300,10)");
+      const bill = { source_id: source.id, revision_id: final.id, bill_id: "400", bill_date: "2027-04-05", line_id: "4000" };
+      await pool.query("UPDATE financial_years SET status='RECONCILIATION' WHERE id=3001");
+      await assert.rejects(transaction(cx => v.applyBillCost(cx, context, bill)), { code: "IV_OPEN_FY_REQUIRED" });
+      await pool.query("UPDATE financial_years SET status='OPEN' WHERE id=3001");
+      await transaction(cx => v.applyBillCost(cx, context, bill));
+      const posts = await gl.events(pool, "3", "GL_POST");
+      const latest = gl.currentTargets(posts);
+      assert.deepEqual(latest.journals.map(j => j.date), ["2027-03-30", "2027-04-05"]);
+      await gl.verifyJournals(pool, "3", posts);
+      const journal = latest.journals[0].id;
+      for (const sql of ["UPDATE journal_entries SET narration='changed' WHERE id=?", "DELETE FROM journal_entries WHERE id=?", "UPDATE journal_entry_details SET debit=debit+1 WHERE journal_entry_id=?", "DELETE FROM journal_entry_details WHERE journal_entry_id=?"]) await assert.rejects(pool.query(sql, [journal]), error => error.sqlMessage === "IV_GL_LINKED_JOURNAL_IMMUTABLE");
+      await assert.rejects(pool.query("INSERT INTO journal_entry_details (journal_entry_id,account_id,debit,credit) VALUES (?,310,1,0)", [journal]), error => error.sqlMessage === "IV_GL_LINKED_JOURNAL_IMMUTABLE");
+      const held = await pool.getConnection(), contender = await pool.getConnection();
+      try {
+        await held.beginTransaction(); await gl.transaction(held, "3"); await v.openDate(held, "3", "2027-03-30");
+        await contender.query("SET SESSION innodb_lock_wait_timeout=1"); await contender.beginTransaction();
+        await assert.rejects(contender.query("UPDATE financial_years SET status='CLOSED' WHERE id=3001"), error => error.code === "ER_LOCK_WAIT_TIMEOUT");
+      } finally { await contender.rollback(); await held.rollback(); contender.release(); held.release(); }
+      await pool.query("DROP TRIGGER iv_gl_detail_no_insert");
+      await pool.query("CREATE TRIGGER iv_gl_detail_no_insert BEFORE INSERT ON journal_entry_details FOR EACH ROW SET @iv_gl_bad_guard=1");
+      await assert.rejects(glMigration.migrate(pool, { confirmation: "APPLY_INVENTORY_GL_PROTECTION_V1" }), /IV_GL_SCHEMA_INCOMPATIBLE/);
+    });
   } finally {
     if (pool) await pool.end();
-    if (created) { assert.match(database, /^iv_proof_[a-f0-9]{32}$/); await admin.query(`DROP DATABASE \`${database}\``); }
     await admin.end();
   }
 });

@@ -45,10 +45,12 @@ async function postGrn(cx, req, receipt, items) {
   const batches = new Map();
   for (const input of pending) {
     const key = String(input.product_id), rows = batches.get(key) || await v.records(cx, input);
+    await v.lockReplayPeriods(cx, input, rows, v.find(rows, input.source_id, "ACQUISITION").effective_date);
     rows.push(previewReceipt(rows, v.find(rows, input.source_id, "ACQUISITION"), v.find(rows, input.revision_id, "COST"), input.source_id));
     m.operationalQuantity(v.projection(rows).quantity);
     batches.set(key, rows);
   }
+  for (const [product, rows] of batches) await require("./inventoryGlService").prepare(cx, context(req, product), rows);
   for (const input of pending) await v.postAcquisition(cx, input);
 }
 async function preflightBill(cx, req, items, billDate, billId = null) {
@@ -78,14 +80,15 @@ async function preflightBill(cx, req, items, billDate, billId = null) {
     const key = String(items[i].product_id), rows = batches.get(key) || await v.records(cx, context(req, key));
     const input = evidence[i], proof = proofs[i], source = v.find(rows, input.acquisition_id, "ACQUISITION"), revision = v.find(rows, input.revision_id, "COST");
     const before = v.projection(rows);
-    if (proof.correction) rows.push({ kind: "STOCK_REPLACEMENT", target_id: proof.correction.movement.id, payload: { revision_id: revision.id, new_source_id: source.id } });
+    if (proof.correction) rows.push({ kind: "STOCK_REPLACEMENT", sequence: (rows.filter(r => r.effective_date === source.effective_date).reduce((n, r) => BigInt(r.sequence) > n ? BigInt(r.sequence) : n, 0n) + 1n).toString(), target_id: proof.correction.movement.id, payload: { revision_id: revision.id, new_source_id: source.id } });
     else if (!proof.movement) rows.push(previewReceipt(rows, source, revision, i));
     else if (source.document_type !== "GRN") rows.push({ kind: "COST_REPLACEMENT", target_id: proof.movement.id, payload: { revision_id: revision.id } });
-    rows.push({ kind: "BILL_LINK", id: `preview-bill-${i}`, source_id: source.id, target_id: revision.id, document_id: String(billId), supersedes_id: (proof.correction?.previous || proof.previous)?.id || null, payload: { quantity: revision.payload.quantity } });
+    rows.push({ kind: "BILL_LINK", id: `preview-bill-${i}`, effective_date: billDate, source_id: source.id, target_id: revision.id, document_id: String(billId), supersedes_id: (proof.correction?.previous || proof.previous)?.id || null, payload: { quantity: revision.payload.quantity } });
     const after = v.projection(rows); m.operationalQuantity(after.quantity);
     if (proof.correction) { proof.correction.before = before; proof.correction.after = after; }
     batches.set(key, rows);
   }
+  for (const [product, rows] of batches) await require("./inventoryGlService").prepare(cx, context(req, product), rows);
   req[requestProof] = { cx, billDate, signatures: items.map(itemSignature), evidence: m.fingerprint(evidence), proofs };
 }
 async function checkStockCapacity(cx, req, items) {
@@ -114,6 +117,24 @@ async function guardBillEdit(cx, req, billId, items, draft = false) {
   if (draft) { if (history.length) m.fail("IV_DRAFT_HAS_POSTED_HISTORY"); return; }
   const evidence = list(req);
   const prior = history.filter(r => !history.some(next => next.supersedes_id === r.id));
+  if (req.body?.bill_date !== undefined) {
+    for (const product of [...new Set(prior.map(row => String(row.product_id)))].sort()) {
+      const x = context(req, product);
+      await v.prepare(cx, x);
+      const rows = await v.records(cx, x);
+      for (const link of prior.filter(row => String(row.product_id) === product)) {
+        const source = v.find(rows, link.source_id, "ACQUISITION");
+        const actual = v.find(rows, link.id, "BILL_LINK");
+        if (source.document_type === "SUPPLIER" && actual.effective_date !== req.body.bill_date) {
+          const replacement = evidence.find(item => item.correction_id && rows.some(row => row.id === item.correction_id && row.kind === "STOCK_CORRECTION" && row.payload.previous_bill_link_id === actual.id));
+          if (!replacement) m.fail("IV_DIRECT_STOCK_DATE_IMMUTABLE");
+          const replacementSource = v.find(rows, replacement.acquisition_id, "ACQUISITION");
+          if (replacementSource.effective_date !== req.body.bill_date) m.fail("IV_DIRECT_STOCK_DATE_MISMATCH");
+          await require("./inventoryValuationCorrectionService").preview(cx, x, rows, replacement.correction_id, billId, replacement.acquisition_id, replacement.revision_id);
+        }
+      }
+    }
+  }
   const oldSources = [...new Set(prior.map(r => r.source_id))].sort();
   if (!oldSources.length || items.length !== evidence.length) m.fail("IV_HISTORICAL_BILL_UNSUPPORTED");
   const replacementSources = [];

@@ -199,6 +199,9 @@ exports.createChallan = async (req, res) => {
 
   try {
     rejectClientFinancialYear(req.body);
+    await connection.beginTransaction();
+    await require("../services/inventoryGlService").rejectUnsupported(connection, req.user.company_id);
+    await connection.rollback();
     await ensureDeliveryChallanTables();
 
     const companyId = req.user.company_id;
@@ -244,6 +247,7 @@ exports.createChallan = async (req, res) => {
     }
 
     await connection.beginTransaction();
+    await require("../services/inventoryGlService").rejectUnsupported(connection, companyId);
     await requireFinancialYearForPosting(companyId, challan_date, connection);
 
     const challanNumber = await getNextChallanNumber(companyId, type);
@@ -339,12 +343,17 @@ exports.deleteChallan = async (req, res) => {
 
   try {
     rejectClientFinancialYear(req.body);
+    await connection.beginTransaction();
+    await require("../services/inventoryGlService").rejectUnsupported(connection, req.user.company_id);
+    await connection.rollback();
     await ensureDeliveryChallanTables();
 
     const companyId = req.user.company_id;
     const { id } = req.params;
 
     await connection.beginTransaction();
+
+    await require("../services/inventoryGlService").rejectUnsupported(connection, companyId);
 
     const [challans] = await connection.query(
       "SELECT * FROM delivery_challans WHERE id = ? AND company_id = ? FOR UPDATE",

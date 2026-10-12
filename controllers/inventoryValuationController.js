@@ -6,6 +6,8 @@ const readiness = require("../services/inventoryValuationReadinessService");
 // Factory keeps imports inert and permits mocked transaction executors.
 module.exports = function createController(pool) {
   const fields = {
+    "gl-role": ["role", "account_id", "effective_date", "idempotency_key"],
+    "gl-cutover": ["date", "reason", "idempotency_key"],
     correction: ["product_id", "bill_id", "movement_id", "previous_bill_link_id", "new_source_id", "new_revision_id", "reason", "idempotency_key"],
     "approve-correction": ["product_id", "correction_id", "reason", "idempotency_key"],
     component: ["product_id", "date", "document_id", "component_line", "kind", "basis", "total_minor", "recipients", "reference", "recoverability", "supersedes_id", "idempotency_key"],
@@ -19,6 +21,8 @@ module.exports = function createController(pool) {
   const methods = { component: require("../services/inventoryValuationComponentService").create, acquisition: v.createAcquisition, cost: v.recordCost, submit: v.submitCost, approve: v.approveCost, reject: v.rejectCost };
   methods.correction = require("../services/inventoryValuationCorrectionService").create;
   methods["approve-correction"] = require("../services/inventoryValuationCorrectionService").approve;
+  methods["gl-role"] = require("../services/inventoryGlService").assignRole;
+  methods["gl-cutover"] = require("../services/inventoryGlService").approveCutover;
   const errorResponse = (res, error) => res.status(error.code?.startsWith("IV_") || error.code === "INVENTORY_QUANTITY_PRECISION_UNSUPPORTED" ? 409 : 500)
     .json({ code: error.code?.startsWith("IV_") || error.code === "INVENTORY_QUANTITY_PRECISION_UNSUPPORTED" ? error.code : "IV_OPERATION_FAILED" });
   const mutate = operation => async (req, res) => {
@@ -27,7 +31,7 @@ module.exports = function createController(pool) {
       if (!req.user?.company_id || !(req.user.user_id || req.user.id)) return res.status(401).json({ code: "IV_AUTHENTICATION_REQUIRED" });
       if (!req.body || Array.isArray(req.body) || Object.keys(req.body).some(key => !fields[operation].includes(key))) m.fail("IV_UNSUPPORTED_EVIDENCE_FIELD");
       if (operation === "cost") m.validateCost(req.body.evidence);
-      if (["approve", "reject", "approve-correction"].includes(operation) && req.user.role !== "owner") return res.status(403).json({ code: "IV_OWNER_APPROVAL_REQUIRED" });
+      if (["approve", "reject", "approve-correction", "gl-role", "gl-cutover"].includes(operation) && req.user.role !== "owner") return res.status(403).json({ code: "IV_OWNER_APPROVAL_REQUIRED" });
       cx = await pool.getConnection();
       await cx.beginTransaction();
       const x = { ...req.body, company_id: req.user.company_id, actor_id: req.user.user_id || req.user.id };

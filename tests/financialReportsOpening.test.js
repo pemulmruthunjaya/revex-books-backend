@@ -1,5 +1,11 @@
 const assert = require("node:assert/strict");
 const accountingSummary = require("../controllers/accountingSummary");
+const db = require("../db/connection");
+const originalQuery = db.query;
+db.query = async sql => {
+  if (sql.includes("FROM iv_operations")) return [[]]; // explicit legacy basis
+  throw new Error("Unexpected database call in isolated report fixture");
+};
 
 const originalSummary = accountingSummary.getAccountingSummary;
 accountingSummary.getAccountingSummary = async () => ({
@@ -47,4 +53,4 @@ const run = async () => {
 
 run()
   .catch((error) => { console.error(error); process.exitCode = 1; })
-  .finally(() => { accountingSummary.getAccountingSummary = originalSummary; });
+  .finally(() => { accountingSummary.getAccountingSummary = originalSummary; db.query = originalQuery; });

@@ -12,7 +12,7 @@ function validate(rows, x, requireApproval = false) {
   const old = basis(rows, movement);
   const source = valuation.find(rows, x.new_source_id, "ACQUISITION");
   const revision = valuation.approved(rows, valuation.find(rows, x.new_revision_id, "COST"));
-  if (movement.document_type !== "SUPPLIER" || source.document_type !== "SUPPLIER" || source.effective_date !== movement.effective_date || revision.source_id !== source.id || revision.payload.state !== "FINAL" || revision.payload.basis !== "SUPPLIER_DOCUMENT") m.fail("IV_CORRECTION_SOURCE_INVALID");
+  if (movement.document_type !== "SUPPLIER" || source.document_type !== "SUPPLIER" || revision.source_id !== source.id || revision.payload.state !== "FINAL" || revision.payload.basis !== "SUPPLIER_DOCUMENT") m.fail("IV_CORRECTION_SOURCE_INVALID");
   if (previous.document_id !== String(x.bill_id) || previous.source_id !== old.source_id || previous.target_id !== old.revision.id || rows.some(r => r.kind === "BILL_LINK" && r.supersedes_id === previous.id)) m.fail("IV_CORRECTION_STALE");
   if (source.id === old.source_id && revision.supersedes_id !== old.revision.id) m.fail("IV_REVISION_CONFLICT");
   if (source.id !== old.source_id && rows.some(r => (r.kind === "RECEIPT" && r.source_id === source.id) || (r.kind === "STOCK_REPLACEMENT" && r.payload.new_source_id === source.id) || (r.kind === "BILL_LINK" && r.source_id === source.id))) m.fail("IV_SOURCE_ALREADY_POSTED");
@@ -22,8 +22,8 @@ function validate(rows, x, requireApproval = false) {
 async function create(cx, x) {
   await v().prepare(cx, x);
   const rows = await v().records(cx, x), plan = validate(rows, x);
-  await v().openDate(cx, x.company_id, plan.movement.effective_date);
-  return v().append(cx, x, { ...v().ref(plan.movement), kind: "STOCK_CORRECTION", target_id: plan.movement.id, idempotency_key: x.idempotency_key,
+  await v().lockReplayPeriods(cx, x, rows, [plan.old.effective_date, plan.source.effective_date].sort()[0], [plan.old.effective_date, plan.source.effective_date, plan.previous.effective_date]);
+  return v().append(cx, x, { ...v().ref(plan.movement), effective_date: plan.old.effective_date, kind: "STOCK_CORRECTION", target_id: plan.movement.id, idempotency_key: x.idempotency_key,
     payload: { bill_id: String(x.bill_id), previous_bill_link_id: plan.previous.id, old_revision_id: plan.old.revision.id,
       new_source_id: plan.source.id, new_revision_id: plan.revision.id, reason: m.text(x.reason),
       old_quantity: plan.old.revision.payload.quantity, new_quantity: plan.revision.payload.quantity } });
@@ -31,7 +31,8 @@ async function create(cx, x) {
 async function approve(cx, x) {
   await v().prepare(cx, x); await v().actor(cx, x.company_id, x.actor_id, true);
   const rows = await v().records(cx, x), correction = v().find(rows, x.correction_id, "STOCK_CORRECTION");
-  validate(rows, { ...correction.payload, movement_id: correction.target_id });
+  const plan = validate(rows, { ...correction.payload, movement_id: correction.target_id });
+  await v().lockReplayPeriods(cx, x, rows, [plan.old.effective_date, plan.source.effective_date].sort()[0], [plan.old.effective_date, plan.source.effective_date, plan.previous.effective_date]);
   if (rows.some(r => r.kind === "CORRECTION_APPROVAL" && r.target_id === correction.id)) m.fail("IV_ALREADY_APPROVED");
   return v().append(cx, x, { ...v().ref(correction), kind: "CORRECTION_APPROVAL", target_id: correction.id, idempotency_key: x.idempotency_key, payload: { reason: m.text(x.reason) } });
 }
@@ -39,9 +40,10 @@ async function preview(cx, x, rows, correctionId, billId, sourceId, revisionId) 
   const correction = v().find(rows, correctionId, "STOCK_CORRECTION");
   if (correction.payload.bill_id !== String(billId) || correction.payload.new_source_id !== sourceId || correction.payload.new_revision_id !== revisionId) m.fail("IV_CORRECTION_REQUEST_MISMATCH");
   const plan = validate(rows, { ...correction.payload, movement_id: correction.target_id, correction_id: correction.id }, true);
-  for (const date of new Set(rows.filter(r => r.effective_date >= plan.movement.effective_date).map(r => r.effective_date))) await v().openDate(cx, x.company_id, date);
+  await v().lockReplayPeriods(cx, x, rows, [plan.old.effective_date, plan.source.effective_date].sort()[0], [plan.old.effective_date, plan.source.effective_date, plan.previous.effective_date]);
   const before = v().projection(rows);
-  const replacement = { kind: "STOCK_REPLACEMENT", target_id: plan.movement.id, payload: { revision_id: revisionId, new_source_id: sourceId } };
+  const sequence = (rows.filter(r => r.effective_date === plan.source.effective_date).reduce((maximum, row) => BigInt(row.sequence) > maximum ? BigInt(row.sequence) : maximum, 0n) + 1n).toString();
+  const replacement = { kind: "STOCK_REPLACEMENT", sequence, target_id: plan.movement.id, payload: { revision_id: revisionId, new_source_id: sourceId } };
   const after = v().projection([...rows, replacement]);
   const [products] = await cx.query("SELECT CAST(stock AS CHAR) stock FROM products WHERE company_id=? AND id=? FOR UPDATE", [x.company_id, x.product_id]);
   if (products.length !== 1 || m.operationalQuantity(products[0].stock).q6 !== m.operationalQuantity(before.quantity).q6) m.fail("IV_STOCK_HISTORY_INCOMPLETE");
@@ -67,9 +69,9 @@ async function preview(cx, x, rows, correctionId, billId, sourceId, revisionId) 
   return { ...plan, correction, before, after };
 }
 async function apply(cx, x, plan, key) {
-  const reverse = await v().append(cx, x, { ...v().ref(plan.movement), kind: "STOCK_REVERSAL", target_id: plan.movement.id, idempotency_key: `${key}:stock-reverse`,
+  const reverse = await v().append(cx, x, { ...v().ref(plan.movement), effective_date: plan.old.effective_date, kind: "STOCK_REVERSAL", target_id: plan.movement.id, idempotency_key: `${key}:stock-reverse`,
     payload: { correction_id: plan.correction.id, revision_id: plan.old.revision.id, quantity: plan.old.revision.payload.quantity, total_minor: plan.old.revision.payload.total_minor } });
-  const replacement = await v().append(cx, x, { ...v().ref(plan.movement), kind: "STOCK_REPLACEMENT", target_id: plan.movement.id, idempotency_key: `${key}:stock-replace`,
+  const replacement = await v().append(cx, x, { ...v().ref(plan.movement), effective_date: plan.source.effective_date, kind: "STOCK_REPLACEMENT", target_id: plan.movement.id, idempotency_key: `${key}:stock-replace`,
     payload: { correction_id: plan.correction.id, reversal_id: reverse.id, revision_id: plan.revision.id, new_source_id: plan.source.id,
       quantity: plan.revision.payload.quantity, total_minor: plan.revision.payload.total_minor } });
   const delta = m.operationalQuantity(plan.after.quantity).q6 - m.operationalQuantity(plan.before.quantity).q6;

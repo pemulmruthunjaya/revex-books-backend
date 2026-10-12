@@ -11,6 +11,8 @@ exports.getProfitLoss = async (req, res) => {
 
   try {
     const company_id = req.user.company_id;
+    const journalReport = await require("../services/inventoryGlReportService").maybeReport(db, company_id, req.query, "profit-loss");
+    if (journalReport) return res.status(200).json(journalReport);
 
     /**
      * =====================================================

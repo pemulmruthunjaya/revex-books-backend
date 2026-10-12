@@ -75,7 +75,12 @@ const ensureVendorPaymentSchema = async () => {
   schemaReady = true;
 };
 
-const findPayableAccount = async (connection, companyId) => {
+const findPayableAccount = async (connection, companyId, date) => {
+  const gl = require("./inventoryGlService");
+  if (await gl.cutover(connection, companyId, true)) {
+    const assignments = await gl.bindings(connection, companyId, [date], true);
+    return { id: assignments.get(`${date}:ACCOUNTS_PAYABLE`).account_id };
+  }
   const [rows] = await connection.query(
     `SELECT * FROM accounts
      WHERE company_id=? AND status=1 AND account_type='LIABILITY'
@@ -103,6 +108,10 @@ const findPayableAccount = async (connection, companyId) => {
 };
 
 const recordVendorPayment = async (body, user) => {
+  if (Object.prototype.hasOwnProperty.call(body, "opening_allocations")) {
+    const annual = require("./annualSubledgerService");
+    return annual.transaction(db, connection => annual.postSettlement(connection, body, user, "VENDOR"));
+  }
   rejectClientFinancialYear(body);
   await ensureVendorPaymentSchema();
   const companyId = user.company_id;
@@ -161,7 +170,7 @@ const recordVendorPayment = async (body, user) => {
     if (!accountRows.length || !isCashBankAccount(accountRows[0])) {
       throw paymentError("Paid From must be a valid Cash or Bank account");
     }
-    const payable = await findPayableAccount(connection, companyId);
+    const payable = await findPayableAccount(connection, companyId, body.payment_date);
     const [paymentResult] = await connection.query(
       `INSERT INTO vendor_payments
        (vendor_id,bill_id,amount,payment_date,payment_method,paid_from_account_id,

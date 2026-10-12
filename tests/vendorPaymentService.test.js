@@ -20,6 +20,7 @@ const run = async () => {
     release: () => {},
     query: async (sql, params) => {
       calls.push({ sql, params });
+      if (sql.includes("FROM iv_operations")) return [[]]; // no approved GL cutover
       if (sql.includes("FROM financial_years")) return [[{ id: 2026, company_id: 2, code: "FY26", name: "FY 2026", start_date: "2026-04-01", end_date: "2027-03-31", status: "OPEN", is_default: 1, source: "MANUAL", created_by: 3 }]];
       if (sql.includes("SELECT id,journal_entry_id FROM vendor_payments")) return [[]];
       if (sql.includes("FROM bills b INNER JOIN vendors")) {

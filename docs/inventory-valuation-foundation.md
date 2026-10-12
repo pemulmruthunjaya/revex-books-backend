@@ -149,15 +149,83 @@ the approved provisional unit basis; later bills consume only remaining quantity
 A reduction restores just that portion to provisional/unbilled coverage.
 GRN-backed bill edits do not change physical stock.
 
-A direct-stock quantity/source correction requires a separate owner-approved
-STOCK_CORRECTION and unchanged product scope. The replacement source has the
-same original effective date. History/stock must reconcile before correction.
+A direct-stock acquisition must have exactly the supplier bill date. An initial
+mismatch fails with `IV_DIRECT_STOCK_DATE_MISMATCH`; an ordinary posted date edit
+fails with `IV_DIRECT_STOCK_DATE_IMMUTABLE`, before business writes. Earlier
+physical receipt requires the GRN workflow, not a direct-stock bill.
+
+A direct-stock quantity/source/date correction requires a separate owner-approved
+STOCK_CORRECTION and unchanged product scope. A date correction uses a new immutable
+acquisition whose date equals the replacement bill date. Both old and replacement
+periods, and every period affected by replay, must be OPEN and locked. History/stock
+must reconcile before correction. Moving supply after an existing issue fails if
+replay would create negative stock. Correction chronology follows predecessor
+lineage, not effective-date sorting, so backdated replacements do not resurrect
+an older revision.
 The correction appends STOCK_REVERSAL/STOCK_REPLACEMENT and a successor BILL_LINK,
 applies one exact physical delta, and appends replay; original receipts remain.
 Affected dates must all be OPEN. Missing, stale, unapproved or historical-unlinked
 corrections are rejected. Ordinary cost-only edits leave physical stock unchanged.
 Draft/unposted bills remain editable without pretending to have posted evidence.
 Valued bills cannot be destructively deleted.
+
+## Persisted GL bridge and approved cutover
+
+`inventoryGlPlan.js` is the pure, non-posting accounting planner.
+It plans original-dated receipt/issue replay deltas, supplier-bill-dated linked
+GRNI clearance and recoverable tax/AP, and same-date direct-stock Inventory/tax/AP
+without GRNI. It rejects unsupported outbound types and missing component
+counterparty evidence. Its as-of GRNI plan retains liabilities until the dated
+bill clears them; unresolved provisional quantities prevent close readiness.
+
+`inventoryGlService.js` persists approved effective-dated GL_ROLE, GL_CUTOVER
+and chained GL_POST envelopes in the foundation's immutable `iv_operations`.
+Each posting records exact valuation references, predecessor/target fingerprints,
+role bindings, original dates/FYs and actual journal/detail fingerprints. A
+transaction-owned company lock serializes the complete operation; every affected
+FY and product is locked before writing. Private connection-bound preflight
+proofs prevent a posting call from becoming an automatic historical repair.
+
+Owner-only `/gl-role` and `/gl-cutover` actions are under the existing valuation
+API permission boundary. Cutover requires independently approved opening evidence
+for every product, OPEN FY, exact physical stock and existing journal Inventory
+balance, zero COGS/GRNI, and no unsupported historical operational documents.
+It never guesses costs or posts the opening twice. Later new products require
+explicitly approved zero opening evidence in an OPEN period. Role changes cannot
+silently transfer a nonzero ledger balance to another account.
+
+GRN/bill service operations and sales invoice creation use the same connection
+as valuation, stock and documents. Supplier-date corrections retain immutable
+old journals and add original-date reversal/replacement journals. Source keys
+include a deterministic batch/date digest, preserving the existing journal-source
+unique index while permitting subsequent replay deltas. Returns stay disabled;
+challan mutations are rejected after cutover. Landed-cost/discount allocations
+without approved GL counterparties remain explicitly blocked.
+
+The additive `2026-10-09-inventory-gl-protection.sql` installs journal/detail and
+role-account protection triggers. Its import-inert companion runner embeds its
+frozen trigger verifier, pins canonical-LF SQL SHA-256, preflights every trigger,
+rejects incompatibility without repair and creates only missing compatible
+objects after explicit confirmation. No startup, package script or request
+executes it. The October 5 foundation migration is unchanged.
+
+Readiness compares current valuation targets against chained persisted postings,
+actual journal rows, exact source-line coverage and as-of Inventory/COGS/GRNI
+controls. Unresolved provisional receipts block close. Without approved cutover,
+`GL_COGS_RECONCILIATION_NOT_IMPLEMENTED` remains in force. FY close uses the same
+snapshot/locked evidence and REQUIRED valued inventory snapshots, never the old
+quantity-only NOT_AVAILABLE shortcut. Locking rechecks bridge readiness.
+
+Post-cutover Trial Balance, Profit and Loss and Balance Sheet use journals,
+including COGS instead of expensing stock purchases. Explicit date ranges within
+one FY are required; mixed legacy/cutover or multi-FY ranges fail closed. P&L
+excludes annual transfer journals; balance-sheet/trial-balance include them.
+Report and readiness reads do not mutate schema or repair accounting.
+
+The additional guarded MySQL date-correction and persisted-GL tests cover actual
+transactions, concurrent retry, rollback, original dates, locks, journal guards
+and incompatible triggers. They are authored, not executed in this local phase.
+Passing mocked tests does not authorize migration, close rollout or deployment.
 
 ## Idempotency and replay
 
@@ -189,7 +257,9 @@ provisional/unapplied revision heads, stale/unapplied component allocation,
 orphan links, missing receipt history, duplicates/gaps/counter mismatches and
 unsupported sales/return/challan history, even when quantities net to zero.
 Query, parsing, fingerprint or snapshot-release errors fail closed.
-Overall readiness always remains GL/COGS-blocked.
+Without approved GL cutover, overall readiness remains GL/COGS-blocked. The
+bridge reuses this valuation inspection inside its consistent snapshot and adds
+independent source/actual-journal reconciliation for supported sales.
 
 ## Versioned migration roles
 
@@ -222,10 +292,51 @@ The guarded MySQL suite contains real disposable-schema DDL, transactions,
 concurrent requests, lock timeout, rollback, replay, malformed SQL inserts,
 ownership/global UUID protections, immutable history and schema incompatibility
 checks. It must not run without separate authorization. Its explicit guards
-require DISPOSABLE_LOOPBACK_ONLY and port 3307; only its newly created randomly
+require DISPOSABLE_LOOPBACK_ONLY, host port 3407, MySQL 9.7.2 and internal port
+3306; only its newly created randomly
 named proof database is removed.
 
-No existing FY-close path, historical migration, package/lockfile, startup
-configuration or unrelated FY artifact is part of this change. No production
+The subsequent authorized GL phase integrates the existing FY-close draft.
+Historical migrations, package/lockfiles, startup configuration and unrelated
+FY artifacts remain preserved. No production
 access, external requests, migration execution, installation, staging, commit,
 push, deployment or email is authorized by this local prerequisite.
+
+## Five-finding GL/FY audit correction (2026-10-11)
+
+Post-cutover reports and close readiness refuse any expense through their cutoff
+with `IV_GL_UNPOSTED_EXPENSE`. Expenses currently have no authoritative journal
+linkage contract; this phase neither guesses linkage nor posts expense journals.
+An independently approved zero opening after a historical cutoff contributes
+zero at that cutoff, provided no earlier movement exists. Nonzero or missing
+opening evidence continues to block.
+
+Annual journals are verified against finalized close runs and immutable close
+lines: exact journal/detail identities, FY/date, accounts, amounts and totals.
+Source-type labels alone grant no exemption. Finalized run updates and linked
+annual header/detail mutations are database-protected by the additive GL
+protection contract. Its current canonical-LF SQL SHA-256 is
+`08223d14752a881dacf2360676bb5c45393194fae0cc011bcf2b8a0df4b702e4`.
+The draft migration has not been executed; an installed incompatible older
+trigger definition is rejected, never silently replaced.
+
+The frozen annual SQL remains unchanged. Its explicit companion runner is
+`db/migrations/2026-10-04-annual-subledger-carry-forward.js`, requiring
+`APPLY_ANNUAL_CARRY_FORWARD_V1`. It pins SQL SHA-256
+`3909ecd9b111b3687e146ef9b69527689c06dd69cd31a7aa8986d5ce4a12826f`,
+inspects every owned existing object and FK prerequisite before DDL, and plans
+only missing compatible objects. The original SQL is a versioned definition,
+not a resumable SOURCE script. Use only the explicit runner after separate
+authorization. There is no startup/CLI invocation, connection configuration,
+retry, backfill or destructive repair. Interrupted DDL remains committed; a
+separately authorized rerun re-inspects before resuming. CHECK comparisons use
+expression trees to preserve operator semantics despite MySQL grouping.
+
+Persisted lifecycle tests execute begin/finalize/lock service logic against a
+transactional SQL fixture, including simultaneous identical requests, stale
+previews, snapshot-failure rollback and balanced journal tampering. The guarded
+`annualCloseLifecycle.mysql.test.js` authors the same operations using actual
+transactions and the real bridge in a separately provisioned synthetic schema;
+its seed prerequisites and exact loopback/version/database guards are explicit
+in the file. It preserves evidence and does not auto-migrate or clean up.
+MySQL tests require separate authorization and are not part of non-live runs.

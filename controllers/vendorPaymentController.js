@@ -34,11 +34,19 @@ exports.getVendorPayments = async (req, res) => {
       params.push(req.query.bill_id);
     }
     const [payments] = await db.query(
-      `SELECT vp.*,v.name vendor_name,b.bill_number,a.account_name paid_from_account_name,
+      `SELECT vp.*,v.name vendor_name,COALESCE(b.bill_number,annual.opening_references) bill_number,a.account_name paid_from_account_name,
               je.journal_no payment_entry_number
        FROM vendor_payments vp
        INNER JOIN vendors v ON v.id=vp.vendor_id AND v.company_id=vp.company_id
        LEFT JOIN bills b ON b.id=vp.bill_id AND b.company_id=vp.company_id
+       LEFT JOIN (
+         SELECT asa.company_id,asa.vendor_payment_id,
+           GROUP_CONCAT(DISTINCT o.reference ORDER BY o.id SEPARATOR ', ') opening_references
+         FROM annual_subledger_allocations asa
+         JOIN subledger_opening_items o ON o.id=asa.opening_item_id AND o.company_id=asa.company_id
+         WHERE asa.party_type='VENDOR' AND asa.vendor_payment_id IS NOT NULL
+         GROUP BY asa.company_id,asa.vendor_payment_id
+       ) annual ON annual.company_id=vp.company_id AND annual.vendor_payment_id=vp.id
        LEFT JOIN accounts a ON a.id=vp.paid_from_account_id AND a.company_id=vp.company_id
        LEFT JOIN journal_entries je ON je.id=vp.journal_entry_id AND je.company_id=vp.company_id
        WHERE ${clauses.join(" AND ")}

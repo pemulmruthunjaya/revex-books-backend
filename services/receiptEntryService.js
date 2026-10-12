@@ -359,6 +359,12 @@ const assertIdempotentReceiptEquivalent = async (executor, existing, body, compa
 };
 
 const postReceipt = async (connection, body, user, context = {}) => {
+  if (Object.prototype.hasOwnProperty.call(body, "opening_allocations")) {
+    if (String(body.receipt_type || "").toUpperCase() !== "CUSTOMER") {
+      throw require("./annualSubledgerService").error("ANNUAL_INVALID_PARTY", 400);
+    }
+    return require("./annualSubledgerService").postSettlement(connection, body, user, "CUSTOMER");
+  }
   rejectClientFinancialYear(body);
   const companyId = Number(user.company_id);
   const createdBy = Number(user.user_id);
@@ -693,6 +699,10 @@ const postReceipt = async (connection, body, user, context = {}) => {
 };
 
 const createReceipt = async (body, user) => {
+  if (Object.prototype.hasOwnProperty.call(body, "opening_allocations")) {
+    const annual = require("./annualSubledgerService");
+    return annual.transaction(db, connection => postReceipt(connection, body, user));
+  }
   await ensureReceiptEntrySchema();
   const connection = await db.getConnection();
   const idempotencyKey = clean(body.idempotency_key, 80);

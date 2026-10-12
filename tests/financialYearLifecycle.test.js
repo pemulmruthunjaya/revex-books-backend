@@ -74,6 +74,16 @@ test("all unspecified transitions are denied", async () => {
   }
 });
 
+test("reopening an in-progress close runs its rollback hook inside the lifecycle transaction", async () => {
+  const fixture = executorFor("CLOSING", "RECONCILIATION");
+  let hookCalled = false;
+  await transitionFinancialYear({ companyId: 4, financialYearId: 21, targetStatus: "RECONCILIATION", actorUserId: 13, reason: "Review again" }, fixture.executor, {
+    beforeReopenClose: async (_connection, current) => { hookCalled = current.status === "CLOSING"; },
+  });
+  assert.equal(hookCalled, true);
+  assert.deepEqual(fixture.calls.filter((x) => typeof x === "string"), ["BEGIN", "COMMIT", "RELEASE"]);
+});
+
 test("controlled trial blocks every transition into CLOSING, CLOSED, or LOCKED before database work", async () => {
   for (const [from, to] of [["RECONCILIATION", "CLOSING"], ["CLOSING", "CLOSED"], ["CLOSED", "LOCKED"], ["LOCKED", "LOCKED"]]) {
     const fixture = executorFor(from, to);

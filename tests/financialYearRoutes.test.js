@@ -14,7 +14,9 @@ test("static default and resolve routes precede the dynamic id route", () => {
   const paths = routes.map((route) => route.path);
   assert.ok(paths.indexOf("/default") < paths.indexOf("/:id"));
   assert.ok(paths.indexOf("/resolve") < paths.indexOf("/:id"));
-  assert.deepEqual(paths, ["/", "/default", "/resolve", "/:id/events", "/:id", "/", "/:id/default", "/:id/transitions"]);
+  assert.deepEqual(paths, ["/", "/default", "/resolve", "/subledger/items", "/operations/:key", "/subledger/reversals",
+    "/:id/close-readiness", "/:id/close-preview", "/:id/begin-close", "/:id/finalize-close", "/:id/permanent-lock",
+    "/:id/events", "/:id", "/", "/:id/default", "/:id/transitions"]);
 });
 
 test("route surface contains only approved reads and owner-protected writes", () => {
@@ -22,6 +24,14 @@ test("route surface contains only approved reads and owner-protected writes", ()
     ["/", "get"],
     ["/default", "get"],
     ["/resolve", "get"],
+    ["/subledger/items", "get"],
+    ["/operations/:key", "get"],
+    ["/subledger/reversals", "post"],
+    ["/:id/close-readiness", "get"],
+    ["/:id/close-preview", "get"],
+    ["/:id/begin-close", "post"],
+    ["/:id/finalize-close", "post"],
+    ["/:id/permanent-lock", "post"],
     ["/:id/events", "get"],
     ["/:id", "get"],
     ["/", "post"],
@@ -42,7 +52,7 @@ test("index mounts FY routes behind authentication and subscription enforcement 
 test("owner authorization rejects staff writes and allows owner writes", () => {
   const makeRes = () => ({ statusCode: null, body: null, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } });
   const writeRoutes = router.stack.filter((layer) => layer.route?.methods.post);
-  assert.equal(writeRoutes.length, 3);
+  assert.equal(writeRoutes.length, 7);
   for (const layer of writeRoutes) {
     const authorization = layer.route.stack[0].handle;
     const staffRes = makeRes();

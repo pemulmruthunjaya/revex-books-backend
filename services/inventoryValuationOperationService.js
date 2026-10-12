@@ -37,7 +37,13 @@ function wrap(action, fn) {
     const fingerprintArgs = action === "applyBillCost" ? args.map(({ proof, ...input }) => input) : args;
     const op = await begin(cx, x.company_id, x.actor_id, key, action, { x, args: fingerprintArgs });
     if (op.completed) return op.result;
-    return complete(cx, op, await fn(cx, x, ...args));
+    const posting = ["postAcquisition", "finalizeAcquisition", "postMovement", "applyBillCost"].includes(action);
+    try {
+      if (posting) await require("./inventoryGlService").guardOperation(cx, x, action, args[0]);
+      const result = await fn(cx, x, ...args);
+      if (posting) await require("./inventoryGlService").post(cx, x);
+      return await complete(cx, op, result);
+    } finally { if (posting) require("./inventoryGlService").clearProof(cx, x); }
   };
 }
 const requestOperation = Symbol("inventory-operation");

@@ -28,6 +28,7 @@ const ERROR_RESPONSES = {
   DEFAULT_FINANCIAL_YEAR_CONFLICT: [409, "Unable to change the default financial year"],
   FINANCIAL_YEAR_TRANSITION_NOT_ALLOWED: [409, "This financial year transition is not allowed"],
   FINANCIAL_YEAR_TRANSITION_CONFLICT: [409, "Financial year changed during transition"],
+  FINANCIAL_YEAR_CLOSE_RUN_CONFLICT: [409, "The pending close run cannot be safely reopened"],
   FINANCIAL_YEAR_DRAFT: [409, "Financial year is still in Draft status"],
   FINANCIAL_YEAR_RECONCILIATION_RESTRICTED: [409, "Financial year is under reconciliation"],
   FINANCIAL_YEAR_CLOSING_RESTRICTED: [409, "Financial year is being closed"],
@@ -205,14 +206,37 @@ const createFinancialYearController = ({ service = financialYearService, logger 
       return res.status(400).json({ success: false, code: "UNSUPPORTED_FIELD", message: "Request contains unsupported transition fields" });
     }
     try {
-      const result = await service.transitionFinancialYear({
+      const input = {
         companyId,
         financialYearId: req.params.id,
         targetStatus: body.target_status,
         reason: body.reason,
         confirmation: body.confirmation,
         actorUserId: actorContext(req),
-      });
+      };
+      const hooks = {
+        beforeReopenClose: async (connection, current) => {
+          const [runs] = await connection.query(`SELECT id,destination_financial_year_id,generation_uuid,algorithm_version,source_fingerprint,status,lock_version
+            FROM financial_year_close_runs WHERE company_id=? AND source_financial_year_id=?
+              AND status NOT IN ('FAILED','ROLLED_BACK') ORDER BY id FOR UPDATE`, [companyId, current.id]);
+          if (!runs.length) return;
+          if (runs.length !== 1 || runs[0].status !== "READY") {
+            throw new service.FinancialYearServiceError("FINANCIAL_YEAR_CLOSE_RUN_CONFLICT", "Pending close evidence cannot be rolled back safely", 409);
+          }
+          const run = runs[0];
+          const [sequenceRows] = await connection.query("SELECT COALESCE(MAX(event_sequence),0)+1 next_sequence FROM financial_year_close_events WHERE company_id=? AND close_run_id=?", [companyId, run.id]);
+          const [updated] = await connection.query(`UPDATE financial_year_close_runs
+            SET status='ROLLED_BACK',rolled_back_by=?,rolled_back_at=CURRENT_TIMESTAMP(6),failure_code='FY_CLOSE_REOPENED',failure_reason=?,lock_version=lock_version+1
+            WHERE id=? AND company_id=? AND status='READY' AND lock_version=?`, [actorContext(req), body.reason, run.id, companyId, run.lock_version]);
+          if (updated.affectedRows !== 1) throw new service.FinancialYearServiceError("FINANCIAL_YEAR_CLOSE_RUN_CONFLICT", "Pending close run changed concurrently", 409);
+          await connection.query(`INSERT INTO financial_year_close_events
+            (company_id,close_run_id,source_financial_year_id,destination_financial_year_id,generation_uuid,event_sequence,event_type,previous_status,new_status,actor_user_id,reason_code,reason,request_identity,source_fingerprint,algorithm_version,metadata)
+            VALUES (?,?,?,?,?,?,'ROLLED_BACK','READY','ROLLED_BACK',?,'FY_CLOSE_REOPENED',?,?,?, ?,?)`,
+          [companyId, run.id, current.id, run.destination_financial_year_id, run.generation_uuid, sequenceRows[0].next_sequence,
+            actorContext(req), body.reason, `reopen:${current.id}:${run.id}`, run.source_fingerprint, run.algorithm_version, JSON.stringify({ reason: "reopened before finalization" })]);
+        },
+      };
+      const result = await service.transitionFinancialYear(input, undefined, hooks);
       return res.json({ success: true, data: result.financialYear, changed: result.changed, event: result.event });
     } catch (error) { return sendError(res, error, logger); }
   };

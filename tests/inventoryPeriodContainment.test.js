@@ -8,7 +8,7 @@ const fyPath = require.resolve("../services/financialYearService");
 const grnPath = require.resolve("../controllers/goodsReceiptController");
 const challanPath = require.resolve("../controllers/deliveryChallanController");
 
-const loadWithFakes = (controllerPath, { query, posting, forDate, mutation }) => {
+const loadWithFakes = (controllerPath, { query, posting, forDate, mutation, glActive = false }) => {
   const calls = [];
   let committed = false;
   let rolledBack = false;
@@ -19,6 +19,11 @@ const loadWithFakes = (controllerPath, { query, posting, forDate, mutation }) =>
     release: () => {},
     query: async (sql, params = []) => {
       calls.push([sql, params]);
+      if (controllerPath === challanPath) {
+        if (sql === "DO 0") return [{ serverStatus: 3 }];
+        if (sql.includes("FROM companies")) return [[{ id: params[0] }]];
+        if (sql.includes("FROM iv_operations")) return [glActive ? [{ operation_key: "synthetic-cutover", result: require("../services/inventoryGlService").seal({ date: "2026-04-01" }) }] : []];
+      }
       return query(sql, params);
     },
   };
@@ -63,6 +68,15 @@ const defaults = {
   forDate: async () => ({ id: 14, status: "OPEN" }),
   mutation: async () => ({ id: 14, status: "OPEN" }),
 };
+
+for (const operation of ["createChallan", "deleteChallan"]) test(`${operation}: approved GL cutover rejects unsupported stock paths before all DDL/DML`, async () => {
+  const harness = loadWithFakes(challanPath, { ...defaults, glActive: true, query: async () => { throw new Error("unexpected legacy access"); } });
+  const response = res();
+  await harness.controller[operation](req({ challan_date: "2026-04-01", items: [{ product_id: 9, quantity: "1" }] }), response);
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.payload.code, "IV_GL_OUTBOUND_UNSUPPORTED");
+  assert.equal(harness.calls.some(([sql]) => /^(CREATE|ALTER|INSERT|UPDATE|DELETE)/.test(sql)), false);
+});
 const req = (body = {}) => ({
   body,
   params: { id: "31" },

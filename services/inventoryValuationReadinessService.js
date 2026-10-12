@@ -4,18 +4,26 @@ const v = require("./inventoryValuationService");
 const m = require("./inventoryValuationMath");
 const components = require("./inventoryValuationComponentService");
 
-async function inspectInventoryValuation(cx, companyId) {
+async function inspectInventoryValuation(cx, companyId, { withinSnapshot = false, valuationOnly = false, allowSales = false } = {}) {
   const blockers = new Set(["GL_COGS_RECONCILIATION_NOT_IMPLEMENTED"]);
   const fingerprints = [];
   let snapshot = false, fingerprint;
   try {
     const [status] = await cx.query("DO 0");
-    if (!Number.isInteger(status.serverStatus) || status.serverStatus & 1) m.fail("IV_DEDICATED_READ_CONNECTION_REQUIRED");
-    await cx.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
-    await cx.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
-    snapshot = true;
+    if (!Number.isInteger(status.serverStatus) || (withinSnapshot ? !(status.serverStatus & 1) : status.serverStatus & 1)) m.fail("IV_DEDICATED_READ_CONNECTION_REQUIRED");
+    if (!withinSnapshot) {
+      await cx.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await cx.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      snapshot = true;
+    }
     const state = await schema.inspect(cx);
     if (!state.ready) m.fail(state.conflicts.length ? "IV_SCHEMA_INCOMPATIBLE" : "IV_SCHEMA_NOT_READY");
+    if (!valuationOnly && await require("./inventoryGlService").cutover(cx, companyId)) {
+      const [[today]] = await cx.query("SELECT DATE_FORMAT(CURRENT_DATE(),'%Y-%m-%d') as_of");
+      const result = await require("./inventoryGlService").inspect(cx, companyId, today.as_of);
+      if (snapshot) { await cx.rollback(); snapshot = false; }
+      return { ...result, valuation_ready: result.ready };
+    }
     const [products] = await cx.query("SELECT id,CAST(stock AS CHAR) stock,CAST(opening_stock AS CHAR) opening_stock FROM products WHERE company_id=? ORDER BY id", [v.id(companyId)]);
     const companyRows = await components.read(cx, companyId, false);
     const componentHeads = companyRows.filter(r => ["COMPONENT", "COMPONENT_REVISION"].includes(r.kind) && !companyRows.some(n => n.supersedes_id === r.id));
@@ -36,7 +44,7 @@ async function inspectInventoryValuation(cx, companyId) {
       "SELECT ii.id FROM invoice_items ii INNER JOIN invoices i ON i.id=ii.invoice_id WHERE i.company_id=? LIMIT 1",
       "SELECT id FROM return_items WHERE company_id=? LIMIT 1",
       "SELECT id FROM delivery_challan_items WHERE company_id=? LIMIT 1",
-    ]) { const [unsupported] = await cx.query(sql, [companyId]); if (unsupported.length) blockers.add("IV_UNSUPPORTED_HISTORICAL_MOVEMENT"); }
+    ]) { if (allowSales && sql.includes("invoice_items")) continue; const [unsupported] = await cx.query(sql, [companyId]); if (unsupported.length) blockers.add("IV_UNSUPPORTED_HISTORICAL_MOVEMENT"); }
     for (const product of products) {
       const x = { company_id: companyId, product_id: product.id }, rows = await v.records(cx, x, false);
       const result = v.projection(rows);
@@ -94,6 +102,7 @@ async function inspectInventoryValuation(cx, companyId) {
         const links = activeLinks.filter(r => r.source_line === String(bill.id) && r.document_id === String(bill.bill_id));
         if (links.length !== 1) { blockers.add("IV_UNLINKED_BILL_HISTORY"); continue; }
         const link = links[0], cost = v.approved(rows, v.find(rows, link.target_id, "COST")), source = v.find(rows, link.source_id, "ACQUISITION");
+        if (source.document_type === "SUPPLIER" && source.effective_date !== bill.bill_date) blockers.add("IV_DIRECT_STOCK_DATE_MISMATCH");
         const actual = m.operationalQuantity(bill.quantity), expected = m.operationalQuantity(cost.payload.quantity), linked = m.operationalQuantity(link.payload.quantity);
         if (actual.q2 !== expected.q2 || actual.q6 !== expected.q6 || actual.q2 * 10000n !== linked.q6 || linked.q2 !== actual.q2) blockers.add("IV_BILL_QUANTITY_MISMATCH");
         if (cost.source_id !== source.id || String(bill.product_id) !== String(product.id) || bill.bill_date !== link.effective_date ||
@@ -134,7 +143,7 @@ async function inspectInventoryValuation(cx, companyId) {
         "SELECT ii.id FROM invoice_items ii INNER JOIN invoices i ON i.id=ii.invoice_id WHERE i.company_id=? AND ii.product_id=? LIMIT 1",
         "SELECT id FROM return_items WHERE company_id=? AND product_id=? LIMIT 1",
         "SELECT id FROM delivery_challan_items WHERE company_id=? AND product_id=? LIMIT 1",
-      ]) { const [unsupported] = await cx.query(sql, [companyId, product.id]); if (unsupported.length) blockers.add("IV_UNSUPPORTED_HISTORICAL_MOVEMENT"); }
+      ]) { if (allowSales && sql.includes("invoice_items")) continue; const [unsupported] = await cx.query(sql, [companyId, product.id]); if (unsupported.length) blockers.add("IV_UNSUPPORTED_HISTORICAL_MOVEMENT"); }
     }
     fingerprint = m.fingerprint(fingerprints);
   } catch (error) { blockers.add(error.code?.startsWith("IV_") || error.code === "INVENTORY_QUANTITY_PRECISION_UNSUPPORTED" ? error.code : "IV_HISTORY_SCHEMA_NOT_READY"); }

@@ -56,11 +56,19 @@ exports.getVendorLedger = async (req, res) => {
         vp.bill_id,
         vp.amount,
         vp.payment_date,
-        b.bill_number
+        COALESCE(b.bill_number, annual.opening_references) AS bill_number
       FROM vendor_payments vp
       LEFT JOIN bills b
         ON b.id = vp.bill_id
        AND b.company_id = vp.company_id
+      LEFT JOIN (
+        SELECT a.company_id,a.vendor_payment_id,
+          GROUP_CONCAT(DISTINCT o.reference ORDER BY o.id SEPARATOR ', ') opening_references
+        FROM annual_subledger_allocations a
+        JOIN subledger_opening_items o ON o.id=a.opening_item_id AND o.company_id=a.company_id
+        WHERE a.party_type='VENDOR' AND a.vendor_payment_id IS NOT NULL
+        GROUP BY a.company_id,a.vendor_payment_id
+      ) annual ON annual.company_id=vp.company_id AND annual.vendor_payment_id=vp.id
       WHERE vp.vendor_id = ?
         AND vp.company_id = ?
       ORDER BY vp.payment_date ASC, vp.id ASC
@@ -127,6 +135,25 @@ exports.getVendorLedger = async (req, res) => {
         sortOrder: 2
       });
     });
+
+    const [annualReversals] = await db.query(
+      `SELECT r.reversal_date,SUM(r.amount) amount,
+        GROUP_CONCAT(DISTINCT o.reference ORDER BY o.id SEPARATOR ', ') opening_references
+       FROM annual_subledger_allocation_reversals r
+       JOIN annual_subledger_allocations a ON a.id=r.allocation_id AND a.company_id=r.company_id
+       JOIN subledger_opening_items o ON o.id=a.opening_item_id AND o.company_id=a.company_id
+       WHERE r.company_id=? AND a.vendor_id=? AND a.party_type='VENDOR'
+       GROUP BY r.reversal_date,r.idempotency_key ORDER BY r.reversal_date,r.idempotency_key`,
+      [company_id, vendor_id]
+    );
+    annualReversals.forEach((reversal) => entries.push({
+      date: reversal.reversal_date,
+      type: "ANNUAL PAYMENT REVERSAL",
+      reference: reversal.opening_references || "Annual opening allocation",
+      debit: Number(reversal.amount || 0),
+      credit: 0,
+      sortOrder: 2,
+    }));
 
     entries.sort((a, b) => {
       const dateA = new Date(a.date || 0).getTime();

@@ -456,7 +456,6 @@ const ensureInvoiceCreationSchema = async () => {
 };
 
 const createInvoiceRecord = async ({ body, user, connection = db }) => {
-    await ensureInvoiceCreationSchema();
     rejectClientFinancialYear(body);
 
     const { invoice_date, items } = body;
@@ -467,6 +466,8 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
     if (!invoice_date || !items?.length) {
       throw invoiceCreationError("Missing required fields");
     }
+    // Match close/valuation lock ordering: tenant before affected FY rows.
+    await require("../services/inventoryGlService").transaction(connection, company_id);
     const financialYear = await requireFinancialYearForPosting(company_id, invoice_date, connection);
 
     if (requestId) {
@@ -479,6 +480,14 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
         return { message: "Invoice request already processed", ...existing[0], duplicate: true };
       }
     }
+
+    const inventoryGl = require("../services/inventoryGlService");
+    const valued = await inventoryGl.preflightSale(connection, company_id, created_by, invoice_date, items);
+    if (valued) await require("../services/reportSchemaService").assertReportSchemaReady(connection, [
+      { table: "invoices", columns: ["request_id", "financial_year_id", "overall_discount_amount", "additional_discount_amount", "round_off_amount"] },
+      { table: "invoice_items", columns: ["product_id", "quantity", "mrp", "discount_amount", "serial_numbers_json", "expiry_date"] },
+    ]);
+    else await ensureInvoiceCreationSchema();
 
     const party = await resolveInvoicePersistence({
       body,
@@ -497,7 +506,6 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
 
     // ✅ VALIDATE STOCK
     for (let item of items) {
-      console.log("👉 Checking item:", item);
 
       if (!item.product_id) {
         throw invoiceCreationError(`product_id missing for ${item.name}`);
@@ -543,7 +551,7 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
         product_id: item.product_id,
         name: String(item.name || productRows[0].name).trim(),
         ...advanced,
-        quantity: qty,
+        quantity: require("../services/inventoryValuationMath").operationalQuantity(item.quantity).sql,
         price,
         mrp,
         discount_type: discount.discountType,
@@ -608,7 +616,7 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
 
     // ✅ INSERT ITEMS + DEDUCT STOCK
     for (let item of processedItems) {
-      await connection.query(
+      const [lineResult] = await connection.query(
         `INSERT INTO invoice_items 
         (invoice_id, company_id, product_id, item_name, description, quantity, unit, serial_numbers_json, batch_no, manufactured_date, expiry_date,
          unit_price, mrp, discount_type, discount_value, discount_amount, total_price, gst_rate)
@@ -634,6 +642,13 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
           item.gst
         ]
       );
+
+      if (valued) await require("../services/inventoryValuationService").postMovement(connection, {
+        company_id, product_id: item.product_id, actor_id: created_by,
+        kind: "ISSUE", date: invoice_date, quantity: item.quantity,
+        document_type: "SALES_INVOICE", document_id: String(invoice_id), source_line: String(lineResult.insertId),
+        idempotency_key: `sale:${invoice_id}:${lineResult.insertId}`,
+      });
 
       await connection.query(
         `UPDATE products 

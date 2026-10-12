@@ -79,6 +79,20 @@ test("unpaid, partial, paid, decimal and overpayment calculations use actual pay
   ]);
 });
 
+test("multi-year annual carry chain counts receipts across lineage and only the leaf balance once", () => {
+  const result = buildFinancialSummary(customer, [invoice({ total_amount: "100.00", paid_amount: "0.00" })], 0, [
+    { opening_item_id: 20, original_invoice_id: 1, original_financial_year_id: 3, reference: "INV-1", original_amount: "100.00", allocated_amount: "20.00", reversed_amount: "0.00", effective_date: "2026-04-01", due_date: "2026-12-31" },
+    { opening_item_id: 30, predecessor_opening_item_id: 20, original_invoice_id: 1, original_financial_year_id: 3, reference: "INV-1", original_amount: "80.00", allocated_amount: "30.00", reversed_amount: "0.00", effective_date: "2027-04-01", due_date: "2026-12-31" },
+  ]);
+  assert.equal(result.summary.total_invoiced, 100);
+  assert.equal(result.summary.total_received, 50);
+  assert.equal(result.summary.total_outstanding, 50);
+  assert.equal(result.summary.outstanding_invoice_count, 1);
+  assert.equal(result.outstanding_invoices.length, 1);
+  assert.equal(result.outstanding_invoices[0].opening_item_id, 30);
+  assert.equal(result.outstanding_invoices[0].original_invoice_id, 1);
+});
+
 test("overdue, due today, future, and missing due dates are represented consistently", () => {
   const rows = [
     invoice({ invoice_id: 1, overdue_days: 4 }),
@@ -102,18 +116,20 @@ test("service returns null for absent or cross-company customer without querying
   assert.deepEqual(calls[0].params, [99, 4]);
 });
 
-test("service uses exactly three bounded company/customer queries", async () => {
+test("service uses bounded company/customer queries and a separate annual-opening query", async () => {
   const calls = [];
   const executor = { async query(sql, params) {
     calls.push({ sql, params });
     if (calls.length === 1) return [[customer]];
     if (calls.length === 2) return [[invoice({ invoice_type: null })]];
-    return [[{ unapplied_advance_balance: "12.34" }]];
+    if (calls.length === 3) return [[{ unapplied_advance_balance: "12.34" }]];
+    return [[]];
   } };
   const result = await getCustomerFinancialSummary(4, 7, executor);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
   assert.deepEqual(calls[1].params, [4, 4, 7]);
   assert.deepEqual(calls[2].params, [4, 7]);
+  assert.deepEqual(calls[3].params, [4, 7]);
   assert.equal(result.outstanding_invoices[0].invoice_type, null);
   assert.equal(result.summary.unapplied_advance_balance, 12.34);
 });

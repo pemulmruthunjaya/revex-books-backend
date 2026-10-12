@@ -459,6 +459,7 @@ const transitionFinancialYear = async (input, executor = db, hooks = {}) => {
         fail("FINANCIAL_YEAR_LOCK_CONFIRMATION_REQUIRED", "Type LOCK to confirm this transition", 400);
       }
       if (key === "RECONCILIATION:CLOSING" && hooks.beforeBeginClose) await hooks.beforeBeginClose(connection, current);
+      if (key === "CLOSING:RECONCILIATION" && hooks.beforeReopenClose) await hooks.beforeReopenClose(connection, current);
       if (key === "CLOSING:CLOSED" && hooks.beforeClose) await hooks.beforeClose(connection, current);
       const [updated] = await connection.query(
         "UPDATE financial_years SET status=? WHERE id=? AND company_id=? AND status=?",
