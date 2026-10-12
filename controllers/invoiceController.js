@@ -522,7 +522,10 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
 
       const availableStock = productRows[0].stock;
 
-      if (availableStock < item.quantity) {
+      // mysql2 returns DECIMAL stock as text: compare fixed-point quantities,
+      // never lexicographically (e.g. "10.00" < "2.00").
+      const quantityMath = require("../services/inventoryValuationMath");
+      if (quantityMath.operationalQuantity(availableStock).q2 < quantityMath.operationalQuantity(item.quantity).q2) {
         throw invoiceCreationError(
           `Insufficient stock for ${item.name}. Available: ${availableStock}`
         );
