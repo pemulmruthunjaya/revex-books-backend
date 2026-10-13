@@ -53,8 +53,10 @@ async function schema(cx) {
     if (!column || !["int", "int(11)", "decimal(12,2)"].includes(type) || column.IS_NULLABLE !== "YES" || column.EXTRA || column.GENERATION_EXPRESSION || column.COLUMN_COMMENT || column.CHARACTER_SET_NAME !== null || column.COLLATION_NAME !== null ||
         (target.default === null ? column.COLUMN_DEFAULT !== null : exactQ2(column.COLUMN_DEFAULT) !== "0") ||
         !id || !/^(?:int(?:\(11\))?|bigint(?:\(20\))?)(?: unsigned)?$/i.test(id.COLUMN_TYPE) || id.IS_NULLABLE !== "NO") fail("Q2_SCHEMA_INCOMPATIBLE");
-    // Reject generated dependencies rather than guess expression equivalence.
-    if (columns.some(c => c.GENERATION_EXPRESSION || /GENERATED|INVISIBLE/i.test(c.EXTRA))) fail("Q2_SCHEMA_INCOMPATIBLE");
+    // DEFAULT_GENERATED describes an expression default (e.g. CURRENT_TIMESTAMP),
+    // not a generated column. Preserve its metadata verbatim in the fingerprint.
+    // Still reject actual generated/invisible dependencies without guessing equivalence.
+    if (columns.some(c => c.GENERATION_EXPRESSION || /GENERATED|INVISIBLE/i.test(c.EXTRA.replace(/\bDEFAULT_GENERATED\b/gi, "")))) fail("Q2_SCHEMA_INCOMPATIBLE");
     for (const c of columns) quote(c.COLUMN_NAME);
     const indexes = await read(cx, "SELECT INDEX_NAME,SEQ_IN_INDEX,COLUMN_NAME,NON_UNIQUE,SUB_PART,INDEX_TYPE,IS_VISIBLE,EXPRESSION FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? ORDER BY INDEX_NAME,SEQ_IN_INDEX", args);
     const pk = indexes.filter(i => i.INDEX_NAME === "PRIMARY");

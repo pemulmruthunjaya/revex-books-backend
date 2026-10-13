@@ -3,6 +3,96 @@ const test = require("node:test"), assert = require("node:assert/strict");
 const { Q2Fixture, runner, FakeCore } = require("./helpers/q2MigrationFixture");
 const options = { confirmation: runner.CONFIRMATION, dedicatedConnection: true };
 
+// Native MySQL timestamp metadata/rendering, including the production default.
+// Replace the fixture's unrelated column so its row fingerprint covers the timestamp too.
+class TimestampFixture extends Q2Fixture {
+  constructor(onUpdate = false) {
+    super(); this.onUpdate = onUpdate;
+    for (const rows of this.data) for (const row of rows) row.note = "2026-10-13 07:36:00";
+  }
+  columns(i) {
+    const rows = super.columns(i);
+    Object.assign(rows[2], { COLUMN_NAME: "created_at", DATA_TYPE: "timestamp", COLUMN_TYPE: "timestamp", COLUMN_DEFAULT: "CURRENT_TIMESTAMP",
+      EXTRA: this.onUpdate ? "DEFAULT_GENERATED on update CURRENT_TIMESTAMP" : "DEFAULT_GENERATED", CHARACTER_SET_NAME: null, COLLATION_NAME: null });
+    return rows;
+  }
+  async execute(sql, args) {
+    const result = await super.execute(sql, args);
+    if (sql.startsWith("SHOW CREATE")) result[0][0]["Create Table"] = result[0][0]["Create Table"].replace("`note` varchar(30) DEFAULT NULL", "`created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP" + (this.onUpdate ? " ON UPDATE CURRENT_TIMESTAMP" : ""));
+    return result;
+  }
+}
+
+test("Q2 native DEFAULT_GENERATED timestamp defaults and ON UPDATE survive migration and idempotent reinspection", async () => {
+  for (const onUpdate of [false, true]) {
+    const cx = new TimestampFixture(onUpdate);
+    const before = await runner.inspect(cx);
+    assert.equal(before.classification, "MIGRATION_REQUIRED");
+    const ddl = (await cx.query("SHOW CREATE TABLE `products`"))[0][0]["Create Table"];
+    assert.ok(ddl.includes("`created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP"));
+    assert.equal(ddl.includes(" ON UPDATE CURRENT_TIMESTAMP"), onUpdate);
+    const result = await runner.migrate(cx, options);
+    assert.deepEqual(result.snapshot, before.snapshot);
+    const after = await runner.inspect(cx);
+    assert.equal(after.fingerprint, before.fingerprint);
+    assert.equal(after.classification, "ALREADY_APPLIED");
+    assert.deepEqual((await runner.migrate(cx, options)).applied, []);
+    assert.equal(cx.ddl.length, 2);
+  }
+});
+
+test("Q2 timestamp default and ON UPDATE changes remain visible to schema fingerprints", async () => {
+  for (const metadataOnly of [false, true]) {
+    const cx = new TimestampFixture();
+    cx.onDdl = c => {
+      if (metadataOnly) c.editColumns = rows => { rows[2].COLUMN_DEFAULT = "CURRENT_TIMESTAMP(6)"; };
+      else c.onUpdate = true;
+    };
+    await assert.rejects(runner.migrate(cx, options), { code: "Q2_POSTFLIGHT_MISMATCH" });
+    assert.equal(cx.locked, false);
+  }
+});
+
+test("Q2 true VIRTUAL/STORED generated columns and expressions reject before locks or DDL", async () => {
+  for (const extra of ["VIRTUAL GENERATED", "STORED GENERATED", "DEFAULT_GENERATED VIRTUAL GENERATED", "INVISIBLE"]) {
+    for (const expression of ["", "(`stock` + 1)"]) {
+      const cx = new TimestampFixture();
+      cx.editColumns = rows => Object.assign(rows[2], { EXTRA: extra, GENERATION_EXPRESSION: expression });
+      await assert.rejects(runner.migrate(cx, options), { code: "Q2_SCHEMA_INCOMPATIBLE" });
+      assert.equal(cx.ddl.length, 0); assert.equal(cx.calls.some(s => s.startsWith("LOCK TABLES")), false);
+    }
+  }
+  const cx = new TimestampFixture();
+  cx.editColumns = rows => { rows[2].GENERATION_EXPRESSION = "(`stock` + 1)"; };
+  await assert.rejects(runner.migrate(cx, options), { code: "Q2_SCHEMA_INCOMPATIBLE" });
+  assert.equal(cx.ddl.length, 0); assert.equal(cx.calls.some(s => s.startsWith("LOCK TABLES")), false);
+});
+
+test("Q2 realistic SHOW CREATE generated-column fixtures remain unsupported with timestamp defaults present", async () => {
+  for (const storage of ["VIRTUAL", "STORED"]) {
+    class GeneratedFixture extends TimestampFixture {
+      columns(i) {
+        return [...super.columns(i), { ...super.columns(i)[0], COLUMN_NAME: "derived_quantity", ORDINAL_POSITION: 4,
+          IS_NULLABLE: "YES", EXTRA: storage + " GENERATED", GENERATION_EXPRESSION: "(`" + runner.targets[i].column + "` + 1)" }];
+      }
+      async execute(sql, args) {
+        const result = await super.execute(sql, args);
+        if (sql.startsWith("SHOW CREATE")) {
+          const quantity = sql.includes("bill_items") ? "quantity" : "stock";
+          result[0][0]["Create Table"] = result[0][0]["Create Table"].replace("  PRIMARY KEY", "  `derived_quantity` int GENERATED ALWAYS AS ((`" + quantity + "` + 1)) " + storage + ",\n  PRIMARY KEY");
+        }
+        return result;
+      }
+    }
+    const cx = new GeneratedFixture();
+    const ddl = (await cx.query("SHOW CREATE TABLE `products`"))[0][0]["Create Table"];
+    assert.ok(ddl.includes("DEFAULT CURRENT_TIMESTAMP"));
+    assert.ok(ddl.includes("`derived_quantity` int GENERATED ALWAYS AS ((`stock` + 1)) " + storage));
+    await assert.rejects(runner.migrate(cx, options), { code: "Q2_SCHEMA_INCOMPATIBLE" });
+    assert.equal(cx.ddl.length, 0); assert.equal(cx.calls.some(s => s.startsWith("LOCK TABLES")), false);
+  }
+});
+
 test("Q2 signed fixed-point boundaries, NULL and exact trailing zeros; no coercion or rounding", () => {
   for (const [input, expected] of [[null, null], ["0", "0"], ["-0.00", "0"], ["1", "100"], ["1.2", "120"], ["1.20", "120"], ["1.23", "123"], ["1.230000", "123"], ["-2147483648", "-214748364800"], ["9999999999.99", "999999999999"], ["-9999999999.99", "-999999999999"]]) assert.equal(runner.exactQ2(input), expected);
   for (const input of ["1.234", "1.000001", "1e2", "+1", "01", " 1", "", "NaN", 1, undefined, "1."]) assert.throws(() => runner.exactQ2(input), { code: "Q2_VALUE_NOT_EXACT" });
