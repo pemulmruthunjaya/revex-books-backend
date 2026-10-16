@@ -10,8 +10,8 @@ const schemaRows = () => Object.entries(COLUMN_CONTRACT).flatMap(([TABLE_NAME, c
   EXTRA: value.extra, CHARACTER_SET_NAME: value.charset, COLLATION_NAME: value.collation,
 })));
 const indexRows = () => INDEX_CONTRACT.flatMap(([TABLE_NAME, INDEX_NAME, nonUnique, columns]) => columns.map((COLUMN_NAME, index) => ({ TABLE_NAME, INDEX_NAME, NON_UNIQUE: Number(nonUnique), SEQ_IN_INDEX: index + 1, COLUMN_NAME, SUB_PART: null })));
-const foreignKeyRows = () => FOREIGN_KEY_CONTRACT.map(([TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME]) => ({ TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, UPDATE_RULE: "RESTRICT", DELETE_RULE: "RESTRICT" }));
-const checkRows = () => Object.entries(CHECK_CONTRACT).map(([CONSTRAINT_NAME, CHECK_CLAUSE]) => ({ CONSTRAINT_NAME, CHECK_CLAUSE }));
+const foreignKeyRows = () => FOREIGN_KEY_CONTRACT.map(([TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME]) => ({ TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, REFERENCED_TABLE_SCHEMA: "synthetic", EXPECTED_SCHEMA: "synthetic", UPDATE_RULE: "RESTRICT", DELETE_RULE: "RESTRICT" }));
+const checkRows = () => Object.entries(CHECK_CONTRACT).map(([CONSTRAINT_NAME, CHECK_CLAUSE]) => ({ CONSTRAINT_NAME, CHECK_CLAUSE, ENFORCED: "YES" }));
 const readyExecutor = (mutate = () => {}) => ({ async query(sql) {
   assert.match(sql, /^SELECT /);
   if (sql.includes("information_schema.TABLES")) { const rows = [{ TABLE_NAME: "companies", TABLE_TYPE: "BASE TABLE", COLUMN_NAME: "status", COLUMN_TYPE: "enum('active','inactive')", IS_NULLABLE: "YES", COLUMN_DEFAULT: "active", EXTRA: "" }]; mutate("company", rows); return [rows]; }

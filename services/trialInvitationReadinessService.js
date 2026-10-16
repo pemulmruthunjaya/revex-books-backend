@@ -74,7 +74,27 @@ const fail = () => { throw new SchemaReadinessError("TR1B_SCHEMA_NOT_READY", "Re
 const normalized = (value) => value === null || value === undefined ? null : String(value).toLowerCase();
 const normalizedClause = (value) => typeof value === "string" ? value.replace(/\\'/g, "'").toLowerCase().replace(/_utf8mb4/g, "").replace(/[`()\s]/g, "") : null;
 
-const assertTrialInvitationReadiness = async ({ executor, environment = process.env } = {}) => {
+// All writes and every readiness table/FK target. Table metadata locks also
+// protect their columns, indexes, CHECKs, FKs and attached trigger definitions.
+// One deterministic order is shared by every internal provision invocation.
+const INTERNAL_PROVISIONING_TABLES = Object.freeze([...new Set([
+  "companies", "users", "user_company_memberships", "branches", "user_branch_memberships",
+  "business_profiles", "company_business_settings", "company_subscriptions", "subscription_periods",
+  "subscription_events", "trial_invitations", "trial_invitation_operations", "plans", "platform_admins", "trial_requests",
+  ...Object.keys(COLUMN_CONTRACT), ...FOREIGN_KEY_CONTRACT.map(fk => fk[3]),
+])].sort());
+const assertInternalProvisioningStorage = async ({ executor, pinMetadata = false }) => {
+  // Within the owned transaction, retain metadata locks until COMMIT/ROLLBACK
+  // so a concurrent engine change cannot invalidate this pre-write guarantee.
+  if (pinMetadata) for (const table of INTERNAL_PROVISIONING_TABLES) await executor.query(`SELECT 1 FROM \`${table}\` LIMIT 0`);
+  const [rows] = await executor.query(`SELECT TABLE_NAME,TABLE_TYPE,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN (${INTERNAL_PROVISIONING_TABLES.map(() => "?").join(",")})`, INTERNAL_PROVISIONING_TABLES);
+  if (rows.length !== INTERNAL_PROVISIONING_TABLES.length || new Set(rows.map(r => r.TABLE_NAME)).size !== rows.length ||
+      INTERNAL_PROVISIONING_TABLES.some(name => !rows.some(r => r.TABLE_NAME === name && r.TABLE_TYPE === "BASE TABLE" && r.ENGINE === "InnoDB"))) {
+    throw new SchemaReadinessError("PILOT_TRANSACTIONAL_STORAGE_REQUIRED", "Required transactional storage is not ready");
+  }
+};
+
+const assertTrialInvitationReadiness = async ({ executor, environment = process.env, schemaOnly = false, requireInternal = false, allowMissingInternalTriggers = false } = {}) => {
   // Existing company schema is a prerequisite, separate from the five new tables.
   const [companyStatus] = await executor.query("SELECT t.TABLE_NAME,t.TABLE_TYPE,c.COLUMN_NAME,c.COLUMN_TYPE,c.IS_NULLABLE,c.COLUMN_DEFAULT,c.EXTRA FROM information_schema.TABLES t JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA=t.TABLE_SCHEMA AND c.TABLE_NAME=t.TABLE_NAME WHERE t.TABLE_SCHEMA=DATABASE() AND t.TABLE_NAME='companies' AND c.COLUMN_NAME='status'");
   const company = companyStatus[0];
@@ -84,30 +104,45 @@ const assertTrialInvitationReadiness = async ({ executor, environment = process.
   const tables = Object.keys(COLUMN_CONTRACT);
   const [columns] = await executor.query(`SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,CHARACTER_SET_NAME,COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN (${tables.map(() => "?").join(",")})`, tables);
   const actualColumns = new Map(columns.map((row) => [`${row.TABLE_NAME}.${row.COLUMN_NAME}`, row]));
-  for (const [table, definitions] of Object.entries(COLUMN_CONTRACT)) for (const [name, expected] of Object.entries(definitions)) {
+  const internal = actualColumns.has("trial_invitations.provenance");
+  if (requireInternal && !internal) fail();
+  if (requireInternal) await assertInternalProvisioningStorage({ executor });
+  if (internal && actualColumns.get("trial_invitations.provenance").COLUMN_DEFAULT !== "PUBLIC_TRIAL_REQUEST") fail();
+  const contract = require("./internalPilotSchemaContract");
+  const columnContract = internal ? { ...COLUMN_CONTRACT, trial_invitations: { ...COLUMN_CONTRACT.trial_invitations, trial_request_id: c("bigint unsigned", true), last_sent_at: c("datetime(6)", true), ...contract.extraColumns } } : COLUMN_CONTRACT;
+  const indexContract = internal ? [...INDEX_CONTRACT, ["trial_invitations", "uq_trial_invitation_internal_key", false, ["internal_key_hash"]]] : INDEX_CONTRACT;
+  for (const [table, definitions] of Object.entries(columnContract)) for (const [name, expected] of Object.entries(definitions)) {
     const row = actualColumns.get(`${table}.${name}`); if (!row) fail();
     if (normalized(row.COLUMN_TYPE) !== expected.type || (row.IS_NULLABLE === "YES") !== expected.nullable || normalized(row.COLUMN_DEFAULT) !== expected.defaultValue || normalized(row.EXTRA) !== expected.extra || normalized(row.CHARACTER_SET_NAME) !== expected.charset || normalized(row.COLLATION_NAME) !== expected.collation) fail();
   }
-  for (const table of tables.filter((name) => name !== "users")) if (columns.filter((row) => row.TABLE_NAME === table).length !== Object.keys(COLUMN_CONTRACT[table]).length) fail();
+  for (const table of tables.filter((name) => name !== "users")) if (columns.filter((row) => row.TABLE_NAME === table).length !== Object.keys(columnContract[table]).length) fail();
 
   const scopedTables = tables.slice(1);
   const [indexes] = await executor.query(`SELECT TABLE_NAME,INDEX_NAME,NON_UNIQUE,SEQ_IN_INDEX,COLUMN_NAME,SUB_PART FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN (${scopedTables.map(() => "?").join(",")}) ORDER BY TABLE_NAME,INDEX_NAME,SEQ_IN_INDEX`, scopedTables);
-  for (const [table, name, nonUnique, names] of INDEX_CONTRACT) {
+  for (const [table, name, nonUnique, names] of indexContract) {
     const rows = indexes.filter((row) => row.TABLE_NAME === table && row.INDEX_NAME === name);
     if (rows.length !== names.length || rows.some((row, index) => Number(row.NON_UNIQUE) !== Number(nonUnique) || Number(row.SEQ_IN_INDEX) !== index + 1 || row.COLUMN_NAME !== names[index] || row.SUB_PART !== null)) fail();
   }
-  const scopedIndexKeys = new Set(INDEX_CONTRACT.map(([table, name]) => `${table}.${name}`));
+  const scopedIndexKeys = new Set(indexContract.map(([table, name]) => `${table}.${name}`));
   if (new Set(indexes.map((row) => `${row.TABLE_NAME}.${row.INDEX_NAME}`)).size !== scopedIndexKeys.size || indexes.some((row) => !scopedIndexKeys.has(`${row.TABLE_NAME}.${row.INDEX_NAME}`))) fail();
 
-  const [foreignKeys] = await executor.query("SELECT k.TABLE_NAME,k.CONSTRAINT_NAME,k.COLUMN_NAME,k.REFERENCED_TABLE_NAME,k.REFERENCED_COLUMN_NAME,r.UPDATE_RULE,r.DELETE_RULE FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME=k.CONSTRAINT_NAME AND r.TABLE_NAME=k.TABLE_NAME WHERE k.CONSTRAINT_SCHEMA=DATABASE() AND k.REFERENCED_TABLE_NAME IS NOT NULL");
+  const [foreignKeys] = await executor.query("SELECT k.TABLE_NAME,k.CONSTRAINT_NAME,k.COLUMN_NAME,k.REFERENCED_TABLE_SCHEMA,DATABASE() AS EXPECTED_SCHEMA,k.REFERENCED_TABLE_NAME,k.REFERENCED_COLUMN_NAME,r.UPDATE_RULE,r.DELETE_RULE FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME=k.CONSTRAINT_NAME AND r.TABLE_NAME=k.TABLE_NAME WHERE k.CONSTRAINT_SCHEMA=DATABASE() AND k.REFERENCED_TABLE_NAME IS NOT NULL");
   const scopedForeignKeys = foreignKeys.filter((row) => scopedTables.includes(row.TABLE_NAME)); if (scopedForeignKeys.length !== FOREIGN_KEY_CONTRACT.length) fail();
+  if (scopedForeignKeys.some(row => typeof row.EXPECTED_SCHEMA !== "string" || !row.EXPECTED_SCHEMA || row.REFERENCED_TABLE_SCHEMA !== row.EXPECTED_SCHEMA)) fail();
   for (const expected of FOREIGN_KEY_CONTRACT) if (!scopedForeignKeys.some((row) => expected.every((value, index) => value === [row.TABLE_NAME, row.CONSTRAINT_NAME, row.COLUMN_NAME, row.REFERENCED_TABLE_NAME, row.REFERENCED_COLUMN_NAME][index]) && row.UPDATE_RULE === "RESTRICT" && row.DELETE_RULE === "RESTRICT")) fail();
 
-  const [checks] = await executor.query("SELECT tc.TABLE_NAME,c.CONSTRAINT_NAME,c.CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS c JOIN information_schema.TABLE_CONSTRAINTS tc ON tc.CONSTRAINT_SCHEMA=c.CONSTRAINT_SCHEMA AND tc.CONSTRAINT_NAME=c.CONSTRAINT_NAME WHERE c.CONSTRAINT_SCHEMA=DATABASE() AND tc.TABLE_NAME IN ('trial_requests','trial_request_submissions','trial_request_rate_buckets','trial_invitations','trial_invitation_operations')");
-  if (checks.length !== Object.keys(CHECK_CONTRACT).length) fail();
+  const [checks] = await executor.query("SELECT tc.TABLE_NAME,c.CONSTRAINT_NAME,c.CHECK_CLAUSE,tc.ENFORCED FROM information_schema.CHECK_CONSTRAINTS c JOIN information_schema.TABLE_CONSTRAINTS tc ON tc.CONSTRAINT_SCHEMA=c.CONSTRAINT_SCHEMA AND tc.CONSTRAINT_NAME=c.CONSTRAINT_NAME WHERE c.CONSTRAINT_SCHEMA=DATABASE() AND tc.TABLE_NAME IN ('trial_requests','trial_request_submissions','trial_request_rate_buckets','trial_invitations','trial_invitation_operations')");
+  if (checks.some(row => row.ENFORCED !== "YES")) fail();
+  if (checks.length !== Object.keys(CHECK_CONTRACT).length + Number(internal)) fail();
   for (const [name, clause] of Object.entries(CHECK_CONTRACT)) { const row = checks.find((item) => item.CONSTRAINT_NAME === name); if (!row || normalizedClause(row.CHECK_CLAUSE) !== normalizedClause(clause)) fail(); }
-  if (configurationIssues(environment).length) throw new SchemaReadinessError("TR1B_GATEWAY_CONFIGURATION_INVALID", "Required trial request gateway configuration is not ready");
+  if (internal) {
+    const check = checks.find(r => r.CONSTRAINT_NAME === contract.checkName);
+    if (!check || check.TABLE_NAME !== "trial_invitations" || contract.expression(check.CHECK_CLAUSE) !== contract.expression(contract.checkClause())) fail();
+    const [triggers] = await executor.query("SELECT TRIGGER_NAME,ACTION_TIMING,EVENT_MANIPULATION,EVENT_OBJECT_TABLE,ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND EVENT_OBJECT_TABLE IN ('trial_invitations','trial_invitation_operations')");
+    contract.verifyTriggers(triggers, allowMissingInternalTriggers);
+  }
+  if (!schemaOnly && configurationIssues(environment).length) throw new SchemaReadinessError("TR1B_GATEWAY_CONFIGURATION_INVALID", "Required trial request gateway configuration is not ready");
   return true;
 };
 
-module.exports = { CHECK_CONTRACT, COLUMN_CONTRACT, FOREIGN_KEY_CONTRACT, INDEX_CONTRACT, assertTrialInvitationReadiness };
+module.exports = { CHECK_CONTRACT, COLUMN_CONTRACT, FOREIGN_KEY_CONTRACT, INDEX_CONTRACT, INTERNAL_PROVISIONING_TABLES, assertInternalProvisioningStorage, assertTrialInvitationReadiness };

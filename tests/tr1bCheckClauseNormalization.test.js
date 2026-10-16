@@ -61,8 +61,8 @@ function executor(clauses) {
     if (sql.includes('information_schema.TABLES')) return [[{ TABLE_NAME: "companies", TABLE_TYPE: "BASE TABLE", COLUMN_NAME: "status", COLUMN_TYPE: "enum('active','inactive')", IS_NULLABLE: "YES", COLUMN_DEFAULT: "active", EXTRA: "" }]];
     if (sql.includes('information_schema.COLUMNS')) return [Object.entries(COLUMN_CONTRACT).flatMap(([TABLE_NAME, columns]) => Object.entries(columns).map(([COLUMN_NAME, c]) => ({ TABLE_NAME, COLUMN_NAME, COLUMN_TYPE: c.type, IS_NULLABLE: c.nullable ? 'YES' : 'NO', COLUMN_DEFAULT: c.defaultValue, EXTRA: c.extra, CHARACTER_SET_NAME: c.charset, COLLATION_NAME: c.collation })))];
     if (sql.includes('information_schema.STATISTICS')) return [INDEX_CONTRACT.flatMap(([TABLE_NAME, INDEX_NAME, nonUnique, names]) => names.map((COLUMN_NAME, i) => ({ TABLE_NAME, INDEX_NAME, NON_UNIQUE: Number(nonUnique), SEQ_IN_INDEX: i + 1, COLUMN_NAME, SUB_PART: null })))];
-    if (sql.includes('REFERENTIAL_CONSTRAINTS')) return [FOREIGN_KEY_CONTRACT.map(([TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME]) => ({ TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, UPDATE_RULE: 'RESTRICT', DELETE_RULE: 'RESTRICT' }))];
-    if (sql.includes('CHECK_CONSTRAINTS')) return [Object.entries(clauses).map(([CONSTRAINT_NAME, CHECK_CLAUSE]) => ({ CONSTRAINT_NAME, CHECK_CLAUSE }))];
+    if (sql.includes('REFERENTIAL_CONSTRAINTS')) return [FOREIGN_KEY_CONTRACT.map(([TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME]) => ({ TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, REFERENCED_TABLE_SCHEMA: 'synthetic', EXPECTED_SCHEMA: 'synthetic', UPDATE_RULE: 'RESTRICT', DELETE_RULE: 'RESTRICT' }))];
+    if (sql.includes('CHECK_CONSTRAINTS')) return [Object.entries(clauses).map(([CONSTRAINT_NAME, CHECK_CLAUSE]) => ({ CONSTRAINT_NAME, CHECK_CLAUSE, ENFORCED: 'YES' }))];
     throw new Error('Unexpected probe');
   } };
 }
