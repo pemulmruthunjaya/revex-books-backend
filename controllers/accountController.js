@@ -6,6 +6,7 @@ const {
   signedAccountOpening,
 } = require("../services/openingBalanceService");
 const { sendUnexpectedError } = require("../utils/errorResponse");
+const { accountConstraintError } = require("../services/accountConstraintError");
 
 const accountError = (message, status = 400) => Object.assign(new Error(message), { status });
 const accountValues = (body) => {
@@ -34,8 +35,9 @@ const validateParent = async (connection, parentId, companyId, ownId = null) => 
 };
 
 const sendAccountError = (req, res, error) => {
-  if (error.code === "ER_DUP_ENTRY") {
-    return res.status(400).json({ success: false, message: "Account code or opening event already exists" });
+  error = accountConstraintError(error);
+  if (error.code === "ACCOUNT_CODE_SCHEMA_NOT_READY") {
+    return res.status(503).json({ success: false, code: error.code, message: error.message });
   }
   if (error.status && error.status < 500) {
     return res.status(error.status).json({ success: false, message: error.message, ...(error.code ? { code: error.code } : {}) });
@@ -71,7 +73,6 @@ exports.createAccount = async (req, res) => {
     return res.status(201).json({ success: true, message: "Account created successfully", account_id: result.insertId });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.error("CREATE ACCOUNT ERROR:", error);
     return sendAccountError(req, res, error);
   } finally {
     if (connection) connection.release();
@@ -148,7 +149,6 @@ exports.updateAccount = async (req, res) => {
     return res.status(200).json({ success: true, message: "Account updated successfully" });
   } catch (error) {
     if (connection) await connection.rollback();
-    console.error("UPDATE ACCOUNT ERROR:", error);
     return sendAccountError(req, res, error);
   } finally {
     if (connection) connection.release();
