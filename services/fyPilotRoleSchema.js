@@ -18,6 +18,7 @@ const compact = s => String(s).replace(/`/g, "").replace(/\s+/g, " ").trim();
 // strip arbitrary escapes, introducers, grouping, literal contents or collations.
 const nativeExpression = "(case when ((`role` not in (_utf8mb4'CASH',_utf8mb4'BANK')) and (`effective_to_financial_year_id` is null)) then `role` else NULL end)";
 const metadataExpression = nativeExpression.replace("_utf8mb4'CASH'", "_latin1\\'CASH\\'").replace("_utf8mb4'BANK'", "_latin1\\'BANK\\'");
+const escapedUtf8mb4Expression = nativeExpression.replace("_utf8mb4'CASH'", "_utf8mb4\\'CASH\\'").replace("_utf8mb4'BANK'", "_utf8mb4\\'BANK\\'");
 const nativeColumn = "`singleton_active_role` varchar(40) COLLATE utf8mb4_unicode_ci GENERATED ALWAYS AS (" + nativeExpression + ") STORED,";
 async function assertReady(cx) {
   const [columns] = await cx.query("SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='system_account_role_assignments' ORDER BY ORDINAL_POSITION");
@@ -28,7 +29,7 @@ async function assertReady(cx) {
     if (["created_at", "updated_at"].includes(column)) {
       if (String(c.COLUMN_DEFAULT).toLowerCase() !== "current_timestamp(6)" || c.EXTRA.toLowerCase() !== (column === "updated_at" ? "default_generated on update current_timestamp(6)" : "default_generated") || c.GENERATION_EXPRESSION) fail();
     } else if (column === "singleton_active_role") {
-      if (![nativeExpression, metadataExpression].includes(c.GENERATION_EXPRESSION) || c.EXTRA !== "STORED GENERATED" || c.COLUMN_DEFAULT !== null) fail();
+      if (![nativeExpression, metadataExpression, escapedUtf8mb4Expression].includes(c.GENERATION_EXPRESSION) || c.EXTRA !== "STORED GENERATED" || c.COLUMN_DEFAULT !== null) fail();
       const [native] = await cx.query("SHOW CREATE TABLE `system_account_role_assignments`");
       if (native.length !== 1 || native[0].Table !== "system_account_role_assignments" || typeof native[0]["Create Table"] !== "string") fail();
       const lines = native[0]["Create Table"].split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith("`singleton_active_role` "));

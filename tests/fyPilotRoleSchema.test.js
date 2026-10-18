@@ -16,6 +16,17 @@ function fixture(){
 test("annual-role schema accepts native MySQL inherited defaults and generated expression",async()=>{await assertReady(fixture());});
 function observedFixture(){const f=fixture();f.columns[11].GENERATION_EXPRESSION=f.columns[11].GENERATION_EXPRESSION.replace("_utf8mb4'CASH'","_latin1\\'CASH\\'").replace("_utf8mb4'BANK'","_latin1\\'BANK\\'");return f;}
 test("observed escaped latin1 metadata requires exact independent native utf8mb4 corroboration",async()=>{const f=observedFixture();await assertReady(f);assert.equal(f.writes,0);});
+function observedUtf8mb4Fixture(){const f=observedFixture();f.columns[11].GENERATION_EXPRESSION=f.columns[11].GENERATION_EXPRESSION.replaceAll("_latin1","_utf8mb4");return f;}
+test("observed escaped utf8mb4 metadata requires exact independent native STORED corroboration",async()=>{const f=observedUtf8mb4Fixture();await assertReady(f);assert.equal(f.writes,0);});
+for(const [label,change]of Object.entries({
+  changedLiteral:f=>f.columns[11].GENERATION_EXPRESSION=f.columns[11].GENERATION_EXPRESSION.replace("CASH","CASHX"),
+  changedRoleSet:f=>f.columns[11].GENERATION_EXPRESSION=f.columns[11].GENERATION_EXPRESSION.replace("BANK","INVENTORY"),
+  changedOperator:f=>f.columns[11].GENERATION_EXPRESSION=f.columns[11].GENERATION_EXPRESSION.replace(" and "," or "),
+  missingNative:f=>f.native=[],
+  mismatchingNative:f=>f.native[0]["Create Table"]=f.native[0]["Create Table"].replace("'BANK'","'BANKX'"),
+  mismatchingCollation:f=>f.native[0]["Create Table"]=f.native[0]["Create Table"].replace("COLLATE utf8mb4_unicode_ci GENERATED","COLLATE utf8mb4_bin GENERATED"),
+  virtualNative:f=>f.native[0]["Create Table"]=f.native[0]["Create Table"].replace("STORED","VIRTUAL"),
+}))test(`escaped utf8mb4 metadata with ${label} rejects before writes`,async()=>{const f=observedUtf8mb4Fixture();change(f);await assert.rejects(assertReady(f),{code:"FY_PILOT_ROLE_SCHEMA_INCOMPATIBLE"});assert.equal(f.writes,0);});
 for(const [label,change]of Object.entries({
   nativeLiteral:f=>f.native[0]["Create Table"]=f.native[0]["Create Table"].replace("'CASH'","'CASHX'"),
   nativeOperator:f=>f.native[0]["Create Table"]=f.native[0]["Create Table"].replace(" and "," or "),
