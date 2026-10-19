@@ -22,6 +22,23 @@ All eight specified accounts must already exist, active and zero-opening. AP
 must be code 2000, not a randomly selected alternative. The runner rejects any
 extra/missing account, prior mapping/cutover or business history.
 
+The history guard permits only validated provisioning/setup evidence, under
+the same transaction locks: one Company 9 business profile with the approved
+name/email and provisioning timestamp `2026-10-16 06:23:21`; one PLAN_2 Pro
+14-day trial subscription (`trialing`) and its single linked `active` trial
+period from `2026-10-16 06:23:21` to `2026-10-30 06:23:21` (database UTC values).
+No additional/overlapping periods or duplicate/conflicting profiles are allowed.
+
+Exactly eleven owner-19 Company-9 successful POST audit records are required:
+one FY creation (201), one OPEN transition (200), one default selection (200),
+and eight account creations (201). Paths, module/action, resource references,
+FY request body and distinct account codes/names/types/zero opening amounts
+must corroborate the approved masters. Audit payloads are never logged or
+returned. Unknown routes, other actors, failed requests, missing/duplicate
+actions and operational audit history fail closed. This is not an audit-table
+exemption. All other operational and unknown tenant tables remain blocked.
+The complete setup rows are included in before/after preservation checks.
+
 Five immutable inventory role events cover 2026-10-17 onward. Four annual roles
 cover FY2026-27 onward (no end FY). AP is shared; the eight resolved account IDs
 are otherwise distinct. Zero products produces an empty cutover opening list

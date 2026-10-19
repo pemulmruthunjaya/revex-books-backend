@@ -20,8 +20,42 @@ test("isolated Company 9 activation: persisted rollback, retries, contention and
     // exact OPEN/default FY and the eight approved zero accounts, all contracts
     // already installed. A real company/database is never an allowed target.
     for(const table of ["iv_operations","iv_records","system_account_role_assignments","journal_entries","journal_entry_details","opening_balance_events","products"]){const [[n]]=await a.query(`SELECT COUNT(*) n FROM ${table}`);assert.equal(Number(n.n),0);}
-    const baseline=async()=>Promise.all(["accounts","companies","users","financial_years","user_company_memberships"].map(async t=>(await a.query(`SELECT * FROM ${t} ORDER BY 1`))[0]));
+    // Production-shaped, synthetic provisioning evidence; no external identities,
+    // mailbox access or business transactions. Schema is operator-prepared.
+    const [[fy]]=await a.query("SELECT id,code,DATE_FORMAT(start_date,'%Y-%m-%d') start_date,DATE_FORMAT(end_date,'%Y-%m-%d') end_date FROM financial_years WHERE company_id=9");
+    await a.query("INSERT INTO plans(id,code,name,price,is_active,default_trial_days) VALUES(2,'PLAN_2','Pro',0,1,14)");
+    await a.query("INSERT INTO business_profiles(id,company_id,name,email,created_at) VALUES(3,9,'RevEx FY Pilot','pilot.owner@revexbooks.com','2026-10-16 06:23:21')");
+    await a.query("INSERT INTO company_subscriptions(id,company_id,plan_id,status,billing_cycle,trial_duration_days,trial_start_at,trial_end_at,current_period_start_at,current_period_end_at) VALUES(9,9,2,'trialing','none',14,'2026-10-16 06:23:21','2026-10-30 06:23:21','2026-10-16 06:23:21','2026-10-30 06:23:21')");
+    await a.query("INSERT INTO subscription_periods(id,subscription_id,company_id,plan_id,period_type,billing_cycle,starts_at,ends_at,status) VALUES(11,9,9,2,'trial','none','2026-10-16 06:23:21','2026-10-30 06:23:21','active')");
+    const audit=async(id,path,status,body,resource=null)=>a.query("INSERT INTO audit_logs(id,company_id,user_id,module_key,action,method,path,resource_id,status_code,details) VALUES(?,9,19,?,'create','POST',?,?,?,?)",[id,path==='/api/accounts'?'accounting':'system',path,resource,status,JSON.stringify({params:{},body})]);
+    await audit(139,'/api/financial-years',201,{code:fy.code,start_date:fy.start_date,end_date:fy.end_date,status:'DRAFT'});
+    await audit(140,`/api/financial-years/${fy.id}/transitions`,200,{target_status:'OPEN'},String(fy.id));
+    await audit(141,`/api/financial-years/${fy.id}/default`,200,{},String(fy.id));
+    const [masters]=await a.query("SELECT account_code,account_name,account_type,CAST(opening_balance AS CHAR) opening_balance FROM accounts WHERE company_id=9 ORDER BY account_code");
+    for(let i=0;i<masters.length;i++)await audit(142+i,'/api/accounts',201,masters[i]);
+    const baseline=async()=>Promise.all(["accounts","companies","users","financial_years","user_company_memberships","business_profiles","company_subscriptions","subscription_periods","audit_logs","plans"].map(async t=>(await a.query(`SELECT * FROM ${t} ORDER BY 1`))[0]));
     const before=await baseline();
+    const rejectWithoutWrites=async(code)=>{
+      const proto=require('mysql2').Connection.prototype,original=proto.query;let writes=0;
+      proto.query=function(sql,args,done){if(this===a.connection&&/^(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\b/i.test(sql))writes++;return original.call(this,sql,args,done);};
+      try{await assert.rejects(runner.activate(a,options),{code});assert.equal(writes,0);}finally{proto.query=original;}
+    };
+    await a.query("UPDATE audit_logs SET path='/api/invoices' WHERE id=142");
+    await rejectWithoutWrites('FY_PILOT_SETUP_EVIDENCE_MISMATCH');
+    await a.query("UPDATE audit_logs SET path='/api/accounts' WHERE id=142");
+    await a.query("UPDATE subscription_periods SET status='scheduled',updated_at=updated_at WHERE id=11");
+    await rejectWithoutWrites('FY_PILOT_SETUP_EVIDENCE_MISMATCH');
+    await a.query("UPDATE subscription_periods SET status='active',updated_at=? WHERE id=11",[before[7][0].updated_at]);
+    await a.query("INSERT INTO business_profiles(id,company_id,name,email,created_at) SELECT 4,company_id,name,email,created_at FROM business_profiles WHERE id=3");
+    await rejectWithoutWrites('FY_PILOT_SETUP_EVIDENCE_MISMATCH');
+    await a.query("DELETE FROM business_profiles WHERE id=4");
+    await a.query("INSERT INTO unknown_pilot_history(id,company_id) VALUES(1,9)");
+    await rejectWithoutWrites('FY_PILOT_HISTORY_EXISTS');
+    await a.query("DELETE FROM unknown_pilot_history WHERE id=1");
+    await a.query("INSERT INTO expenses(id,company_id,title,amount,expense_date) VALUES(1,9,'Synthetic prohibited expense',1,'2026-10-17')");
+    await rejectWithoutWrites('FY_PILOT_HISTORY_EXISTS');
+    await a.query("DELETE FROM expenses WHERE id=1");
+    assert.deepEqual(await baseline(),before);
     const originalAP=before[0].filter(row=>String(row.company_id)==="9"&&row.account_code==="2000");
     assert.equal(originalAP.length,1);
     // A real incompatible prerequisite rejects without provisioning any row.

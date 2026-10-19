@@ -18,6 +18,7 @@ const accounts = Object.freeze({
 });
 const annualRoles = ["ACCOUNTS_PAYABLE", "ACCOUNTS_RECEIVABLE", "OPENING_BALANCE_EQUITY", "RETAINED_EARNINGS"];
 const setupTables = new Set(["users", "user_company_memberships", "branches", "user_branch_memberships", "company_business_settings", "company_subscriptions", "subscription_events", "trial_invitations", "trial_invitation_internal_provenance", "financial_years", "financial_year_events", "accounts", "iv_operations", "system_account_role_assignments"]);
+const validatedSetupTables = new Set(["business_profiles", "subscription_periods", "audit_logs"]);
 const requiredTables = ["companies", "users", "user_company_memberships", "accounts", "financial_years", "system_account_role_assignments", "iv_operations", "products", "invoices", "bills", "goods_receipts", "inventory_transactions", "journal_entries", "journal_entry_details", "opening_balance_events", "expenses", "subledger_opening_items"];
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const read = async (cx, sql, args = []) => (await cx.query(sql, args))[0];
@@ -65,15 +66,68 @@ async function base(cx, tables) {
     mapping[role] = matches[0].id;
   }
   if (new Set(Object.values(mapping)).size !== 8) fail("FY_PILOT_ACCOUNTS_MISMATCH");
+  const setup = await setupEvidence(cx, fy[0], found);
   // Every tenant-bearing table outside the explicitly enumerated setup contracts
   // is empty. Unknown tenant tables therefore fail closed, not silently ignored.
   const columns = await read(cx, "SELECT TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND COLUMN_NAME='company_id' ORDER BY TABLE_NAME");
   for (const row of columns) {
     if (!tables.includes(row.TABLE_NAME)) fail("FY_PILOT_SCHEMA_CHANGED");
-    if (!setupTables.has(row.TABLE_NAME) && (await read(cx, `SELECT company_id FROM ${name(row.TABLE_NAME)} WHERE company_id=9 FOR UPDATE`)).length) fail("FY_PILOT_HISTORY_EXISTS");
+    if (!setupTables.has(row.TABLE_NAME) && !validatedSetupTables.has(row.TABLE_NAME) && (await read(cx, `SELECT company_id FROM ${name(row.TABLE_NAME)} WHERE company_id=9 FOR UPDATE`)).length) fail("FY_PILOT_HISTORY_EXISTS");
   }
   if ((await read(cx, "SELECT d.id FROM journal_entry_details d JOIN accounts a ON a.id=d.account_id WHERE a.company_id=9 FOR UPDATE")).length) fail("FY_PILOT_HISTORY_EXISTS");
-  return { fy: fy[0].id, mapping, accounts: found, company, user, membership, years };
+  return { fy: fy[0].id, mapping, accounts: found, company, user, membership, years, setup };
+}
+async function setupEvidence(cx, fy, found) {
+  // These are validated setup records, never a blanket history exemption.
+  // All reads run under the same transaction/MDL as base(), and all returned
+  // evidence participates in the before/after preservation fingerprint.
+  const reject = () => fail("FY_PILOT_SETUP_EVIDENCE_MISMATCH");
+  const start = "2026-10-16 06:23:21", end = "2026-10-30 06:23:21";
+  const profiles = await read(cx, "SELECT * FROM business_profiles WHERE company_id=9 ORDER BY id FOR UPDATE");
+  if (profiles.length !== 1 || String(profiles[0].company_id) !== "9" || profiles[0].name !== "RevEx FY Pilot" || profiles[0].email !== "pilot.owner@revexbooks.com" || profiles[0].created_at !== start) reject();
+  const plans = await read(cx, "SELECT id,code,name,is_active,default_trial_days FROM plans WHERE code='PLAN_2' ORDER BY id FOR UPDATE");
+  if (plans.length !== 1 || plans[0].code !== "PLAN_2" || plans[0].name !== "Pro" || String(plans[0].is_active) !== "1" || String(plans[0].default_trial_days) !== "14") reject();
+  const subscriptions = await read(cx, "SELECT * FROM company_subscriptions WHERE company_id=9 ORDER BY id FOR UPDATE");
+  if (subscriptions.length !== 1) reject();
+  const sub = subscriptions[0];
+  if (String(sub.company_id) !== "9" || String(sub.plan_id) !== String(plans[0].id) || sub.status !== "trialing" || sub.billing_cycle !== "none" || String(sub.trial_duration_days) !== "14" || sub.trial_start_at !== start || sub.trial_end_at !== end || sub.current_period_start_at !== start || sub.current_period_end_at !== end) reject();
+  const periods = await read(cx, "SELECT * FROM subscription_periods WHERE company_id=9 ORDER BY id FOR UPDATE");
+  if (periods.length !== 1) reject();
+  const period = periods[0];
+  if (String(period.company_id) !== "9" || String(period.subscription_id) !== String(sub.id) || String(period.plan_id) !== String(plans[0].id) || period.period_type !== "trial" || period.billing_cycle !== "none" || period.status !== "active" || period.starts_at !== start || period.ends_at !== end) reject();
+  const audits = await read(cx, "SELECT * FROM audit_logs WHERE company_id=9 ORDER BY id FOR UPDATE");
+  if (audits.length !== 11 || new Set(audits.map(a => String(a.id))).size !== 11) reject();
+  const seen = new Set();
+  for (const a of audits) {
+    if (String(a.company_id) !== "9" || String(a.user_id) !== "19" || a.method !== "POST" || a.action !== "create") reject();
+    let details;
+    try { details = typeof a.details === "string" ? JSON.parse(a.details) : a.details; } catch { reject(); }
+    if (!details || !details.body || typeof details.body !== "object" || Array.isArray(details.body)) reject();
+    const body = details.body;
+    let key;
+    if (a.path === "/api/accounts") {
+      if (a.module_key !== "accounting" || Number(a.status_code) !== 201 || a.resource_id !== null) reject();
+      const account = found.find(r => r.account_code === body.account_code);
+      if (!account || body.account_name !== account.account_name || body.account_type !== account.account_type || !/^(?:0+)(?:\.0+)?$/.test(String(body.opening_balance ?? "0"))) reject();
+      key = `account:${account.account_code}`;
+    } else {
+      if (a.module_key !== "system") reject();
+      if (a.path === "/api/financial-years") {
+        if (Number(a.status_code) !== 201 || a.resource_id !== null || body.code !== fy.code || body.start_date !== fy.start_date || body.end_date !== fy.end_date || (body.status !== undefined && body.status !== "DRAFT")) reject();
+        key = "fy:create";
+      } else if (a.path === `/api/financial-years/${fy.id}/transitions`) {
+        if (Number(a.status_code) !== 200 || String(a.resource_id) !== fy.id || body.target_status !== "OPEN") reject();
+        key = "fy:open";
+      } else if (a.path === `/api/financial-years/${fy.id}/default`) {
+        if (Number(a.status_code) !== 200 || String(a.resource_id) !== fy.id || Object.keys(body).length) reject();
+        key = "fy:default";
+      } else reject();
+    }
+    if (seen.has(key)) reject();
+    seen.add(key);
+  }
+  if (seen.size !== 11) reject();
+  return { profiles, plans, subscriptions, periods, audits };
 }
 async function annual(cx) {
   return read(cx, "SELECT role,CAST(account_id AS CHAR) account_id,CAST(effective_from_financial_year_id AS CHAR) fy,effective_to_financial_year_id,protected_at,protected_by_close_run_id,CAST(created_by AS CHAR) created_by FROM system_account_role_assignments WHERE company_id=9 ORDER BY role FOR UPDATE");
