@@ -108,7 +108,10 @@ async function setupEvidence(cx, fy, found) {
     if (a.path === "/api/accounts") {
       if (a.module_key !== "accounting" || Number(a.status_code) !== 201 || a.resource_id !== null) reject();
       const account = found.find(r => r.account_code === body.account_code);
-      if (!account || body.account_name !== account.account_name || body.account_type !== account.account_type || !/^(?:0+)(?:\.0+)?$/.test(String(body.opening_balance ?? "0"))) reject();
+      const opening = body.opening_balance ?? "0";
+      // Match the complete string (including rejecting a trailing newline), without coercing arrays/objects.
+      const zeroOpening = opening === 0 || (typeof opening === "string" && (opening === "" || /^0+(?:\.0+)?(?![\s\S])/.test(opening)));
+      if (!account || body.account_name !== account.account_name || body.account_type !== account.account_type || !zeroOpening) reject();
       key = `account:${account.account_code}`;
     } else {
       if (a.module_key !== "system") reject();

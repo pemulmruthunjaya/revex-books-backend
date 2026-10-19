@@ -140,3 +140,17 @@ test("full setup evidence is unchanged by activation, rollback and identical ret
   const f=new Fixture(),before=JSON.stringify([f.profiles,f.plans,f.subscriptions,f.periods,f.audits]);
   await run(f,async(r,x)=>{await r.activate(f,x);await r.activate(f,x);assert.equal(JSON.stringify([f.profiles,f.plans,f.subscriptions,f.periods,f.audits]),before);});
 });
+
+for(const value of ["","0","00","0.0","0.00",0])test(`audit zero representation ${JSON.stringify(value)} permits activation and retry`,async()=>{
+  const f=new Fixture(),d=JSON.parse(f.audits[10].details);d.body.opening_balance=value;f.audits[10].details=JSON.stringify(d);
+  const before=JSON.stringify(f.audits);
+  await run(f,async(r,x)=>{assert.equal((await r.activate(f,x)).replay,false);assert.equal((await r.activate(f,x)).replay,true);assert.equal(f.writes,11);assert.equal(JSON.stringify(f.audits),before);});
+});
+for(const value of [" ","\t","\n"," 0","0 ","0\n","0\r\n","+0","-0","-0.00","0e0","0E+0","0x0","1","0.01","0.",".0","0..0","zero",[],[0],["0"],{},false,true,1,-1])test(`audit nonzero or malformed representation ${JSON.stringify(value)} rejects before writes`,async()=>{
+  const f=new Fixture(),d=JSON.parse(f.audits[10].details);d.body.opening_balance=value;f.audits[10].details=JSON.stringify(d);
+  await run(f,async(r,x)=>{await assert.rejects(r.activate(f,x),{code:"FY_PILOT_SETUP_EVIDENCE_MISMATCH"});assert.equal(f.writes,0);assert.deepEqual(f.roles,[]);assert.deepEqual(f.operations,[]);assert.equal(f.active,false);});
+});
+test("blank audit opening never permits a nonzero live account balance",async()=>{
+  const f=new Fixture(),d=JSON.parse(f.audits[10].details);d.body.opening_balance="";f.audits[10].details=JSON.stringify(d);f.accounts[7].opening_balance="0.01";
+  await run(f,async(r,x)=>{await assert.rejects(r.activate(f,x),{code:"FY_PILOT_ACCOUNTS_MISMATCH"});assert.equal(f.writes,0);assert.deepEqual(f.roles,[]);assert.deepEqual(f.operations,[]);});
+});
