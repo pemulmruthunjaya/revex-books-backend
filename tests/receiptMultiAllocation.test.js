@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const { roleRow, isRoleQuery } = require("./helpers/accountsReceivableFixture");
 const {
   assertIdempotentReceiptEquivalent,
   moneyToMinor,
@@ -32,6 +33,7 @@ const makeConnection = ({ invoices, paidRows = [], failOnPayment = 0 } = {}) => 
     calls,
     async query(sql, params) {
       calls.push({ sql, params });
+      if (isRoleQuery(sql)) return [[roleRow(4, 2026)]];
       if (sql.includes("FROM receipt_entries") && sql.includes("idempotency_key")) return [[]];
       if (sql.includes("SELECT a.*") && sql.includes("parent_account_name")) {
         return [[{ id: 10, account_name: "Cash in Hand", account_type: "ASSET", parent_account_name: "", description: "" }]];

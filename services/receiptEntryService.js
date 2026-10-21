@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const { resolveAccountsReceivable } = require("./accountsReceivableResolver");
 const db = require("../db/connection");
 const { requireFinancialYearForPosting, requireFinancialYearForMutation, rejectClientFinancialYear } = require("./financialYearService");
 
@@ -508,13 +509,7 @@ const postReceipt = async (connection, body, user, context = {}) => {
         return { ...invoice, alreadyPaidMinor, totalMinor, outstandingMinor };
       });
       singleInvoice = invoices.length === 1 ? invoices[0] : null;
-      receivedFromAccount = await ensureSystemAccount(connection, companyId, {
-        code: `SYS-AR-${companyId}`,
-        name: "Accounts Receivable",
-        type: "ASSET",
-        alternateCode: "1100",
-        alternateName: "Customer Receivables",
-      });
+      receivedFromAccount = await resolveAccountsReceivable(connection, companyId, financialYear.id);
     } else if (receiptType === "ADVANCE") {
       receivedFromAccount = await ensureSystemAccount(connection, companyId, {
         code: `SYS-ADV-${companyId}`,
@@ -703,11 +698,15 @@ const createReceipt = async (body, user) => {
     const annual = require("./annualSubledgerService");
     return annual.transaction(db, connection => postReceipt(connection, body, user));
   }
-  await ensureReceiptEntrySchema();
   const connection = await db.getConnection();
   const idempotencyKey = clean(body.idempotency_key, 80);
   try {
     await connection.beginTransaction();
+    if (String(body.receipt_type || "").toUpperCase() === "CUSTOMER") {
+      const fy = await requireFinancialYearForPosting(Number(user.company_id), body.receipt_date, connection);
+      await resolveAccountsReceivable(connection, user.company_id, fy.id);
+    }
+    await ensureReceiptEntrySchema();
     const result = await postReceipt(connection, body, user);
     if (result.duplicate) await connection.rollback();
     else await connection.commit();

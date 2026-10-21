@@ -481,6 +481,7 @@ const createInvoiceRecord = async ({ body, user, connection = db }) => {
       }
     }
 
+    await require("../services/accountsReceivableResolver").resolveAccountsReceivable(connection, company_id, financialYear.id);
     const inventoryGl = require("../services/inventoryGlService");
     const valued = await inventoryGl.preflightSale(connection, company_id, created_by, invoice_date, items);
     if (valued) await require("../services/reportSchemaService").assertReportSchemaReady(connection, [

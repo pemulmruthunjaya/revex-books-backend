@@ -132,6 +132,8 @@ const postSettlement = async (cx, body, user, partyType) => {
     assertExpectedBalance(balance, selection[i]);
   }
   const role = partyType === "CUSTOMER" ? "ACCOUNTS_RECEIVABLE" : "ACCOUNTS_PAYABLE";
+  const receivable = partyType === "CUSTOMER"
+    ? await require("./accountsReceivableResolver").resolveAccountsReceivable(cx, companyId, fyId) : null;
   const [accounts] = await cx.query(`SELECT a.*,p.account_name parent_account_name,r.role FROM accounts a
     LEFT JOIN accounts p ON p.id=a.parent_account_id AND p.company_id=a.company_id
     LEFT JOIN system_account_role_assignments r
@@ -143,7 +145,7 @@ const postSettlement = async (cx, body, user, partyType) => {
           (SELECT fy.end_date FROM financial_years fy WHERE fy.id=r.effective_to_financial_year_id))
     WHERE a.company_id=? AND a.status=1 AND (a.id=? OR r.role=?) ORDER BY a.id FOR UPDATE`, [fyId, fyId, companyId, cashId, role]);
   const cash = accounts.find(row => Number(row.id) === cashId && ["CASH", "BANK"].includes(row.role) && row.account_type === "ASSET");
-  const controls = accounts.filter(row => row.role === role && row.account_type === (partyType === "CUSTOMER" ? "ASSET" : "LIABILITY"));
+  const controls = receivable ? [receivable] : accounts.filter(row => row.role === role && row.account_type === "LIABILITY");
   if (!cash || controls.length !== 1) fail("ANNUAL_ACCOUNT_ROLE_REQUIRED");
   if (partyType === "CUSTOMER") {
     const receiptService = require("./receiptEntryService");

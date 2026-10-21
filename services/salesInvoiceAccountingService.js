@@ -1,17 +1,11 @@
 const { ensureSystemAccount } = require("./receiptEntryService");
 const { requireFinancialYearForMutation } = require("./financialYearService");
+const { resolveAccountsReceivable } = require("./accountsReceivableResolver");
 
 const money = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
-const getSalesAccounts = async (connection, companyId) => {
-  const receivable = await ensureSystemAccount(connection, companyId, {
-    code: `SYS-AR-${companyId}`,
-    name: "Accounts Receivable",
-    type: "ASSET",
-    alternateCode: "1100",
-    alternateName: "Customer Receivables",
-    description: "System Accounts Receivable ledger",
-  });
+const getSalesAccounts = async (connection, companyId, financialYearId) => {
+  const receivable = await resolveAccountsReceivable(connection, companyId, financialYearId);
   const sales = await ensureSystemAccount(connection, companyId, {
     code: `SYS-SALES-${companyId}`,
     name: "Sales",
@@ -66,7 +60,7 @@ const postSalesInvoiceJournal = async (connection, invoice) => {
   );
   if (existing.length) return { ...existing[0], duplicate: true };
 
-  const accounts = await getSalesAccounts(connection, companyId);
+  const accounts = await getSalesAccounts(connection, companyId, invoiceRows[0].financial_year_id);
   const journalNo = `SINV-${companyId}-${invoiceId}`;
   const [journalResult] = await connection.query(
     `INSERT INTO journal_entries

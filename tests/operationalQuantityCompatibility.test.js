@@ -8,6 +8,7 @@ function controller() {
     "../services/financialYearService": { rejectClientFinancialYear() {}, requireFinancialYearForPosting: async () => ({ id: 1 }) },
     "../services/inventoryGlService": { transaction: async () => {}, preflightSale: async () => true },
     "../services/reportSchemaService": { assertReportSchemaReady: async () => {} }, "../services/inventoryValuationMath": math,
+    "../services/accountsReceivableResolver": { resolveAccountsReceivable: async () => ({ id: 32 }) },
   };
   vm.runInNewContext(fs.readFileSync(require.resolve("../controllers/invoiceController"), "utf8"), { exports, require: name => {
     if (name === "node:crypto") return require(name);

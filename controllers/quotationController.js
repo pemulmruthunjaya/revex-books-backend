@@ -461,6 +461,7 @@ exports.convertQuotationToInvoice = async (req, res) => {
     await ensureInvoiceConversionColumns(connection);
     await connection.beginTransaction();
     const financialYear = await requireFinancialYearForPosting(companyId, invoiceDate, connection);
+    await require("../services/accountsReceivableResolver").resolveAccountsReceivable(connection, companyId, financialYear.id);
 
     const [quotations] = await connection.query(
       `SELECT *
